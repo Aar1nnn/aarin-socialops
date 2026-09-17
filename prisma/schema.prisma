@@ -1,0 +1,719 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum ClientMode {
+  DEMO
+  DRAFT
+  LIVE
+}
+
+enum MembershipRole {
+  OWNER
+  OPERATOR
+  VIEWER
+}
+
+enum FactStatus {
+  CONFIRMED
+  PROPOSED
+  MISSING
+}
+
+enum AssetKind {
+  IMAGE
+  VIDEO
+  DOCUMENT
+}
+
+enum AssetVariant {
+  ORIGINAL
+  DERIVED
+}
+
+enum CapabilityStatus {
+  UNCONFIGURED
+  UNVERIFIED
+  VERIFIED
+  UNSUPPORTED
+}
+
+enum ContentStatus {
+  DRAFT
+  REVIEW_PENDING
+  APPROVED
+  CHANGES_REQUESTED
+  SCHEDULED
+  RUNNING
+  PUBLISHED
+  WAITING_CONFIGURATION
+  FAILED
+  UNKNOWN
+  CANCELLED
+}
+
+enum ApprovalDecision {
+  APPROVED
+  REJECTED
+}
+
+enum PublishJobStatus {
+  PENDING
+  RUNNING
+  RETRY
+  WAITING_CONFIGURATION
+  PUBLISHED
+  FAILED
+  UNKNOWN
+  CANCELLED
+}
+
+enum AttemptStatus {
+  DISPATCHING
+  SUCCEEDED
+  FAILED
+  UNKNOWN
+}
+
+enum DataAvailability {
+  AVAILABLE
+  NOT_FETCHED
+  UNSUPPORTED
+  READ_FAILED
+}
+
+enum DataKind {
+  REAL
+  MOCK
+}
+
+enum LeadCategory {
+  PROCUREMENT
+  WHOLESALE
+  INQUIRY
+  CATALOG_REQUEST
+  SUPPLY_REQUEST
+  GENERAL
+  SPAM
+}
+
+enum LeadPriority {
+  LOW
+  NORMAL
+  HIGH
+  URGENT
+}
+
+enum LeadHandoffStatus {
+  NEW
+  REPLIED
+  HANDED_OFF
+  WAITING_FEEDBACK
+  CLOSED
+  DISMISSED
+}
+
+enum ManualTaskStatus {
+  TODO
+  IN_PROGRESS
+  WAITING_EXTERNAL
+  COMPLETED
+  CANCELLED
+}
+
+enum ManualTaskPriority {
+  NORMAL
+  HIGH
+  URGENT
+}
+
+enum NotificationSeverity {
+  NORMAL
+  URGENT
+}
+
+enum IntegrationType {
+  TEXT_GENERATION
+  IMAGE_GENERATION
+  SOCIAL_PUBLISHING
+  METRICS
+  INTERACTIONS
+  NOTIFICATION
+  WORDPRESS
+  OBJECT_STORAGE
+}
+
+model User {
+  id           String             @id @default(cuid())
+  email        String             @unique
+  passwordHash String
+  displayName  String
+  createdAt    DateTime           @default(now())
+  updatedAt    DateTime           @updatedAt
+  memberships  ClientMembership[]
+  sessions     Session[]
+  approvals    Approval[]
+  auditLogs    AuditLog[]
+}
+
+model Session {
+  id             String   @id @default(cuid())
+  tokenHash      String   @unique
+  userId         String
+  activeClientId String
+  expiresAt      DateTime
+  createdAt      DateTime @default(now())
+  lastSeenAt     DateTime @default(now())
+  user           User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  activeClient   Client   @relation(fields: [activeClientId], references: [id], onDelete: Cascade)
+
+  @@index([userId, expiresAt])
+}
+
+model Client {
+  id                   String                @id @default(cuid())
+  slug                 String                @unique
+  name                 String
+  mode                 ClientMode            @default(DEMO)
+  timezone             String                @default("Asia/Shanghai")
+  targetMarkets        String[]              @default([])
+  productFocus         String?
+  brandGuidelines      String?
+  contactDetails       Json?
+  usageMonthlyLimit    Int                   @default(100000)
+  isDemo               Boolean               @default(false)
+  configurationStatus  String                @default("PENDING")
+  createdAt            DateTime              @default(now())
+  updatedAt            DateTime              @updatedAt
+  memberships          ClientMembership[]
+  sessions             Session[]
+  products             Product[]
+  assets               Asset[]
+  accounts             SocialAccount[]
+  platformPolicies     PlatformPolicy[]
+  contentPlans         ContentPlan[]
+  contentItems         ContentItem[]
+  contentVersions      ContentVersion[]
+  approvals            Approval[]
+  publishJobs          PublishJob[]
+  publishAttempts      PublishAttempt[]
+  metricSnapshots      MetricSnapshot[]
+  interactions         Interaction[]
+  leads                Lead[]
+  manualTasks          ManualTask[]
+  reports              OperationReport[]
+  experiments          Experiment[]
+  notificationChannels NotificationChannel[]
+  notifications        InAppNotification[]
+  integrations         IntegrationConfig[]
+  promptVersions       PromptVersion[]
+  auditLogs            AuditLog[]
+  usageLogs            UsageLog[]
+  researchRecords      ResearchRecord[]
+}
+
+model ResearchRecord {
+  id           String   @id @default(cuid())
+  clientId     String
+  kind         String
+  objective    String
+  sourceUrl    String?
+  observedAt   DateTime
+  observations Json
+  inferences   Json
+  experiments  Json
+  limitations  Json
+  createdAt    DateTime @default(now())
+  client       Client   @relation(fields: [clientId], references: [id], onDelete: Cascade)
+
+  @@index([clientId, kind, observedAt])
+}
+
+model ClientMembership {
+  id        String         @id @default(cuid())
+  userId    String
+  clientId  String
+  role      MembershipRole @default(OPERATOR)
+  createdAt DateTime       @default(now())
+  user      User           @relation(fields: [userId], references: [id], onDelete: Cascade)
+  client    Client         @relation(fields: [clientId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, clientId])
+  @@index([clientId])
+}
+
+model Product {
+  id          String         @id @default(cuid())
+  clientId    String
+  name        String
+  modelNumber String?
+  dataVersion Int            @default(1)
+  status      FactStatus     @default(PROPOSED)
+  createdAt   DateTime       @default(now())
+  updatedAt   DateTime       @updatedAt
+  client      Client         @relation(fields: [clientId], references: [id], onDelete: Cascade)
+  fields      ProductField[]
+  assetLinks  ProductAsset[]
+  plans       ContentPlan[]
+
+  @@index([clientId, updatedAt])
+}
+
+model ProductField {
+  id        String     @id @default(cuid())
+  clientId  String
+  productId String
+  key       String
+  value     String?
+  status    FactStatus
+  source    String?
+  createdAt DateTime   @default(now())
+  updatedAt DateTime   @updatedAt
+  product   Product    @relation(fields: [productId], references: [id], onDelete: Cascade)
+
+  @@unique([productId, key])
+  @@index([clientId, status])
+}
+
+model Asset {
+  id              String                @id @default(cuid())
+  clientId        String
+  parentAssetId   String?
+  kind            AssetKind
+  variant         AssetVariant          @default(ORIGINAL)
+  originalName    String
+  mimeType        String
+  byteSize        Int
+  storageProvider String                @default("local")
+  storageKey      String
+  checksum        String
+  metadata        Json?
+  createdAt       DateTime              @default(now())
+  client          Client                @relation(fields: [clientId], references: [id], onDelete: Cascade)
+  parentAsset     Asset?                @relation("AssetDerivatives", fields: [parentAssetId], references: [id], onDelete: SetNull)
+  derivatives     Asset[]               @relation("AssetDerivatives")
+  productLinks    ProductAsset[]
+  contentLinks    ContentVersionAsset[]
+
+  @@unique([clientId, checksum, storageKey])
+  @@index([clientId, createdAt])
+}
+
+model ProductAsset {
+  productId String
+  assetId   String
+  clientId  String
+  relation  String   @default("PRODUCT_MEDIA")
+  createdAt DateTime @default(now())
+  product   Product  @relation(fields: [productId], references: [id], onDelete: Cascade)
+  asset     Asset    @relation(fields: [assetId], references: [id], onDelete: Cascade)
+
+  @@id([productId, assetId])
+  @@index([clientId])
+}
+
+model SocialAccount {
+  id                 String           @id @default(cuid())
+  clientId           String
+  platform           String
+  displayName        String
+  externalAccountId  String?
+  credentialRef      String?
+  publishCapability  CapabilityStatus @default(UNCONFIGURED)
+  metricsCapability  CapabilityStatus @default(UNCONFIGURED)
+  commentsCapability CapabilityStatus @default(UNCONFIGURED)
+  messagesCapability CapabilityStatus @default(UNCONFIGURED)
+  groupsCapability   CapabilityStatus @default(UNCONFIGURED)
+  verifiedAt         DateTime?
+  createdAt          DateTime         @default(now())
+  updatedAt          DateTime         @updatedAt
+  client             Client           @relation(fields: [clientId], references: [id], onDelete: Cascade)
+  contentItems       ContentItem[]
+  approvals          Approval[]
+  publishJobs        PublishJob[]
+  metricSnapshots    MetricSnapshot[]
+  interactions       Interaction[]
+
+  @@unique([clientId, platform, displayName])
+  @@index([clientId, platform])
+}
+
+model PlatformPolicy {
+  id             String    @id @default(cuid())
+  clientId       String
+  platform       String
+  maxTextLength  Int?
+  allowedFormats String[]  @default([])
+  source         String
+  verifiedAt     DateTime?
+  config         Json?
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
+  client         Client    @relation(fields: [clientId], references: [id], onDelete: Cascade)
+
+  @@unique([clientId, platform])
+}
+
+model PromptVersion {
+  id              String           @id @default(cuid())
+  clientId        String
+  capability      String
+  version         String
+  instruction     String
+  schemaName      String
+  modelConfig     Json
+  active          Boolean          @default(true)
+  createdAt       DateTime         @default(now())
+  client          Client           @relation(fields: [clientId], references: [id], onDelete: Cascade)
+  contentVersions ContentVersion[]
+
+  @@unique([clientId, capability, version])
+}
+
+model ContentPlan {
+  id             String        @id @default(cuid())
+  clientId       String
+  productId      String?
+  theme          String
+  objective      String
+  channels       String[]
+  assetNeeds     String?
+  plannedAt      DateTime?
+  marketScope    String?
+  isGenericDraft Boolean       @default(false)
+  createdAt      DateTime      @default(now())
+  updatedAt      DateTime      @updatedAt
+  client         Client        @relation(fields: [clientId], references: [id], onDelete: Cascade)
+  product        Product?      @relation(fields: [productId], references: [id], onDelete: SetNull)
+  items          ContentItem[]
+
+  @@index([clientId, plannedAt])
+}
+
+model ContentItem {
+  id               String           @id @default(cuid())
+  clientId         String
+  planId           String
+  accountId        String
+  platform         String
+  currentVersionId String?          @unique
+  status           ContentStatus    @default(DRAFT)
+  scheduledAt      DateTime?
+  createdAt        DateTime         @default(now())
+  updatedAt        DateTime         @updatedAt
+  client           Client           @relation(fields: [clientId], references: [id], onDelete: Cascade)
+  plan             ContentPlan      @relation(fields: [planId], references: [id], onDelete: Cascade)
+  account          SocialAccount    @relation(fields: [accountId], references: [id], onDelete: Restrict)
+  versions         ContentVersion[] @relation("ItemVersions")
+  currentVersion   ContentVersion?  @relation("CurrentVersion", fields: [currentVersionId], references: [id], onDelete: SetNull)
+
+  @@unique([planId, accountId])
+  @@index([clientId, status])
+}
+
+model ContentVersion {
+  id                 String                @id @default(cuid())
+  clientId           String
+  contentItemId      String
+  version            Int
+  text               String
+  title              String?
+  productDataVersion Int?
+  promptVersionId    String
+  generator          String
+  simulated          Boolean               @default(false)
+  generationLabel    String
+  sourceFacts        Json
+  createdAt          DateTime              @default(now())
+  client             Client                @relation(fields: [clientId], references: [id], onDelete: Cascade)
+  item               ContentItem           @relation("ItemVersions", fields: [contentItemId], references: [id], onDelete: Cascade)
+  currentFor         ContentItem[]         @relation("CurrentVersion")
+  promptVersion      PromptVersion         @relation(fields: [promptVersionId], references: [id], onDelete: Restrict)
+  assetLinks         ContentVersionAsset[]
+  approvals          Approval[]
+  publishJobs        PublishJob[]
+
+  @@unique([contentItemId, version])
+  @@index([clientId, createdAt])
+}
+
+model ContentVersionAsset {
+  contentVersionId String
+  assetId          String
+  clientId         String
+  createdAt        DateTime       @default(now())
+  contentVersion   ContentVersion @relation(fields: [contentVersionId], references: [id], onDelete: Cascade)
+  asset            Asset          @relation(fields: [assetId], references: [id], onDelete: Restrict)
+
+  @@id([contentVersionId, assetId])
+  @@index([clientId])
+}
+
+model Approval {
+  id               String           @id @default(cuid())
+  clientId         String
+  contentVersionId String
+  accountId        String
+  reviewerId       String
+  decision         ApprovalDecision
+  note             String?
+  createdAt        DateTime         @default(now())
+  client           Client           @relation(fields: [clientId], references: [id], onDelete: Cascade)
+  contentVersion   ContentVersion   @relation(fields: [contentVersionId], references: [id], onDelete: Restrict)
+  account          SocialAccount    @relation(fields: [accountId], references: [id], onDelete: Restrict)
+  reviewer         User             @relation(fields: [reviewerId], references: [id], onDelete: Restrict)
+
+  @@index([clientId, contentVersionId, accountId, createdAt])
+}
+
+model PublishJob {
+  id               String           @id @default(cuid())
+  clientId         String
+  contentVersionId String
+  accountId        String
+  status           PublishJobStatus @default(PENDING)
+  idempotencyKey   String           @unique
+  adapter          String
+  simulated        Boolean          @default(false)
+  attemptCount     Int              @default(0)
+  maxAttempts      Int              @default(3)
+  nextAttemptAt    DateTime         @default(now())
+  lockedAt         DateTime?
+  lockedBy         String?
+  lastErrorCode    String?
+  lastErrorMessage String?
+  remotePostId     String?
+  remotePostUrl    String?
+  publishedAt      DateTime?
+  createdAt        DateTime         @default(now())
+  updatedAt        DateTime         @updatedAt
+  client           Client           @relation(fields: [clientId], references: [id], onDelete: Cascade)
+  contentVersion   ContentVersion   @relation(fields: [contentVersionId], references: [id], onDelete: Restrict)
+  account          SocialAccount    @relation(fields: [accountId], references: [id], onDelete: Restrict)
+  attempts         PublishAttempt[]
+  manualTasks      ManualTask[]
+
+  @@unique([clientId, contentVersionId, accountId])
+  @@index([status, nextAttemptAt])
+  @@index([clientId, createdAt])
+}
+
+model PublishAttempt {
+  id                 String        @id @default(cuid())
+  clientId           String
+  publishJobId       String
+  number             Int
+  status             AttemptStatus @default(DISPATCHING)
+  requestFingerprint String
+  errorCode          String?
+  errorMessage       String?
+  remotePostId       String?
+  remotePostUrl      String?
+  startedAt          DateTime      @default(now())
+  finishedAt         DateTime?
+  client             Client        @relation(fields: [clientId], references: [id], onDelete: Cascade)
+  publishJob         PublishJob    @relation(fields: [publishJobId], references: [id], onDelete: Cascade)
+
+  @@unique([publishJobId, number])
+  @@index([clientId, startedAt])
+}
+
+model MetricSnapshot {
+  id           String           @id @default(cuid())
+  clientId     String
+  accountId    String
+  metricKey    String
+  numericValue Decimal?
+  availability DataAvailability
+  dataKind     DataKind
+  periodStart  DateTime?
+  periodEnd    DateTime?
+  fetchedAt    DateTime
+  source       String
+  errorMessage String?
+  createdAt    DateTime         @default(now())
+  client       Client           @relation(fields: [clientId], references: [id], onDelete: Cascade)
+  account      SocialAccount    @relation(fields: [accountId], references: [id], onDelete: Cascade)
+
+  @@index([clientId, metricKey, fetchedAt])
+}
+
+model Interaction {
+  id               String         @id @default(cuid())
+  clientId         String
+  accountId        String?
+  platform         String
+  platformRecordId String
+  interactionType  String
+  authorHandle     String?
+  authorDisplay    String?
+  body             String
+  sourceUrl        String?
+  occurredAt       DateTime
+  importedAt       DateTime       @default(now())
+  rawPayload       Json?
+  client           Client         @relation(fields: [clientId], references: [id], onDelete: Cascade)
+  account          SocialAccount? @relation(fields: [accountId], references: [id], onDelete: SetNull)
+  lead             Lead?
+
+  @@unique([clientId, platform, platformRecordId])
+  @@index([clientId, occurredAt])
+}
+
+model Lead {
+  id                 String            @id @default(cuid())
+  clientId           String
+  interactionId      String            @unique
+  category           LeadCategory
+  priority           LeadPriority
+  rationale          String
+  relatedProductId   String?
+  verificationNeeded String?
+  handoffStatus      LeadHandoffStatus @default(NEW)
+  salesFeedback      String?
+  createdAt          DateTime          @default(now())
+  updatedAt          DateTime          @updatedAt
+  client             Client            @relation(fields: [clientId], references: [id], onDelete: Cascade)
+  interaction        Interaction       @relation(fields: [interactionId], references: [id], onDelete: Cascade)
+
+  @@index([clientId, priority, handoffStatus])
+}
+
+model ManualTask {
+  id                 String             @id @default(cuid())
+  clientId           String
+  contentItemId      String?
+  leadId             String?
+  accountId          String?
+  publishJobId       String?
+  triggerReason      String
+  priority           ManualTaskPriority @default(NORMAL)
+  suggestedDueAt     DateTime?
+  sourceMaterial     Json
+  requiredAction     String
+  completionCriteria String
+  continuationStep   String
+  status             ManualTaskStatus   @default(TODO)
+  completedAt        DateTime?
+  createdAt          DateTime           @default(now())
+  updatedAt          DateTime           @updatedAt
+  client             Client             @relation(fields: [clientId], references: [id], onDelete: Cascade)
+  publishJob         PublishJob?         @relation(fields: [publishJobId], references: [id], onDelete: SetNull)
+
+  @@index([clientId, status, priority])
+  @@index([clientId, publishJobId])
+}
+
+model OperationReport {
+  id              String   @id @default(cuid())
+  clientId        String
+  periodStart     DateTime
+  periodEnd       DateTime
+  facts           Json
+  dataLimitations Json
+  hypotheses      Json
+  recommendations Json
+  simulated       Boolean  @default(false)
+  generatedAt     DateTime @default(now())
+  client          Client   @relation(fields: [clientId], references: [id], onDelete: Cascade)
+
+  @@index([clientId, generatedAt])
+}
+
+model Experiment {
+  id         String    @id @default(cuid())
+  clientId   String
+  reportId   String?
+  hypothesis String
+  metric     String
+  status     String    @default("PROPOSED")
+  startsAt   DateTime?
+  endsAt     DateTime?
+  createdAt  DateTime  @default(now())
+  client     Client    @relation(fields: [clientId], references: [id], onDelete: Cascade)
+
+  @@index([clientId, status])
+}
+
+model NotificationChannel {
+  id            String           @id @default(cuid())
+  clientId      String
+  type          String
+  displayName   String
+  credentialRef String?
+  status        CapabilityStatus @default(UNCONFIGURED)
+  verifiedAt    DateTime?
+  createdAt     DateTime         @default(now())
+  updatedAt     DateTime         @updatedAt
+  client        Client           @relation(fields: [clientId], references: [id], onDelete: Cascade)
+
+  @@unique([clientId, type, displayName])
+}
+
+model InAppNotification {
+  id          String               @id @default(cuid())
+  clientId    String
+  severity    NotificationSeverity
+  title       String
+  body        String
+  relatedType String?
+  relatedId   String?
+  readAt      DateTime?
+  createdAt   DateTime             @default(now())
+  client      Client               @relation(fields: [clientId], references: [id], onDelete: Cascade)
+
+  @@index([clientId, severity, readAt])
+}
+
+model IntegrationConfig {
+  id            String           @id @default(cuid())
+  clientId      String
+  type          IntegrationType
+  provider      String
+  credentialRef String?
+  status        CapabilityStatus @default(UNCONFIGURED)
+  publicConfig  Json?
+  verifiedAt    DateTime?
+  lastError     String?
+  createdAt     DateTime         @default(now())
+  updatedAt     DateTime         @updatedAt
+  client        Client           @relation(fields: [clientId], references: [id], onDelete: Cascade)
+
+  @@unique([clientId, type, provider])
+}
+
+model AuditLog {
+  id         String   @id @default(cuid())
+  clientId   String
+  userId     String?
+  action     String
+  entityType String
+  entityId   String?
+  metadata   Json?
+  createdAt  DateTime @default(now())
+  client     Client   @relation(fields: [clientId], references: [id], onDelete: Cascade)
+  user       User?    @relation(fields: [userId], references: [id], onDelete: SetNull)
+
+  @@index([clientId, createdAt])
+}
+
+model UsageLog {
+  id            String   @id @default(cuid())
+  clientId      String
+  capability    String
+  provider      String
+  model         String?
+  inputUnits    Int      @default(0)
+  outputUnits   Int      @default(0)
+  estimatedCost Decimal?
+  simulated     Boolean  @default(false)
+  createdAt     DateTime @default(now())
+  client        Client   @relation(fields: [clientId], references: [id], onDelete: Cascade)
+
+  @@index([clientId, createdAt])
+}

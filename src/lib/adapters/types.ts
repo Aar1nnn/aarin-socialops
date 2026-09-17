@@ -1,0 +1,50 @@
+import type { ClientMode } from "@prisma/client";
+import type { GeneratedDrafts } from "../contracts";
+
+export type DraftGenerationInput = {
+  clientName: string;
+  mode: ClientMode;
+  targetMarkets: string[];
+  productFocus: string | null;
+  brandGuidelines: string | null;
+  productName: string;
+  objective: string;
+  theme: string;
+  confirmedFacts: Array<{ key: string; value: string; source: string }>;
+  missingFields: string[];
+  platforms: Array<"facebook" | "instagram" | "tiktok" | "linkedin">;
+  instruction: string;
+};
+
+export type DraftGenerationResult = {
+  output: GeneratedDrafts;
+  provider: string;
+  model: string | null;
+  simulated: boolean;
+  usage: { inputUnits: number; outputUnits: number };
+};
+
+export interface TextGenerationAdapter {
+  generate(input: DraftGenerationInput): Promise<DraftGenerationResult>;
+}
+
+export type PublishRequest = {
+  clientId: string;
+  platform: string;
+  accountExternalId: string | null;
+  text: string;
+  assetKeys: string[];
+  idempotencyKey: string;
+};
+
+export type PublishResult =
+  | { status: "published"; remotePostId: string; remotePostUrl: string | null; publishedAt: Date }
+  | { status: "failed"; code: string; message: string; retryable: boolean }
+  | { status: "unknown"; code: string; message: string };
+
+export interface SocialPublishAdapter {
+  readonly name: string;
+  readonly simulated: boolean;
+  publish(request: PublishRequest): Promise<PublishResult>;
+  queryByIdempotencyKey?(idempotencyKey: string): Promise<PublishResult | null>;
+}
