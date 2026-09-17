@@ -18,6 +18,10 @@ import { importInteraction } from "../src/services/interaction-service";
 import { claimNextJob, processPublishJob, reconcileUnknownPublish, recoverStaleJobs } from "../src/services/publish-worker-service";
 import { generateOperationReport } from "../src/services/report-service";
 import { createProduct, updateProductFacts, uploadAsset } from "../src/services/product-service";
+import { FacebookGraphAdapter } from "../src/lib/adapters/facebook-graph";
+import { syncFacebookComments, syncFacebookMetrics, syncFacebookPostMetrics } from "../src/services/facebook-service";
+import { releaseUsage, reserveUsage, settleUsage } from "../src/services/usage-service";
+import { checkLoginAllowed, clearLoginFailures, recordLoginFailure } from "../src/services/login-rate-limit-service";
 
 type Fixture = {
   client: Client;
@@ -321,6 +325,19 @@ describe("approval and persistent publishing", () => {
     await expect(processPublishJob(job.id, realAdapter)).rejects.toThrow("DEMO_MODE_REAL_ADAPTER_BLOCKED");
     expect(called).toBe(false);
   });
+
+  it("cancels a claimed task when the client mode changes before dispatch", async () => {
+    const item = await generatedItem();
+    await submitForReview(fixture.context, item.id);
+    await reviewContent(fixture.context, item.id, "APPROVED");
+    const job = await schedulePublication(fixture.context, item.id);
+    await claimNextJob("mode-change-worker");
+    await db.client.update({ where: { id: fixture.client.id }, data: { mode: "DRAFT" } });
+    let called = false;
+    const result = await processPublishJob(job.id, { name: "must-not-run", simulated: true, async publish() { called = true; return { status: "published", remotePostId: "forbidden", remotePostUrl: null, publishedAt: new Date() }; } });
+    expect(called).toBe(false);
+    expect(result).toMatchObject({ status: "CANCELLED", lastErrorCode: "MODE_ADAPTER_BOUNDARY_CLOSED" });
+  });
 });
 
 describe("tenant, interaction and evidence boundaries", () => {
@@ -451,5 +468,144 @@ describe("tenant, interaction and evidence boundaries", () => {
     ]);
     expect(schema).not.toMatch(/model\s+(OutboundReply|DirectMessage)/);
     expect(service).not.toMatch(/\.send(?:Reply|Message)\s*\(/);
+  });
+});
+
+async function enableLiveFacebook(metricKeys: string[] = []) {
+  const account = fixture.accounts.find((candidate) => candidate.platform === "facebook")!;
+  await db.$transaction([
+    db.client.update({ where: { id: fixture.client.id }, data: { mode: "LIVE", isDemo: false } }),
+    db.socialAccount.update({ where: { id: account.id }, data: { externalAccountId: "123456", publishCapability: "VERIFIED", metricsCapability: "VERIFIED", commentsCapability: "VERIFIED", verifiedAt: new Date() } }),
+    db.facebookPageConnection.create({ data: { clientId: fixture.client.id, accountId: account.id, pageId: "123456", pageName: "Dedicated Test Page", graphApiVersion: "v26.0", credentialRef: "env:FACEBOOK_TEST_PAGE_ACCESS_TOKEN", requiredPermissions: ["pages_manage_posts", "pages_read_engagement", "pages_read_user_content"], grantedPermissions: ["pages_manage_posts", "pages_read_engagement", "pages_read_user_content"], pageTasks: ["CREATE_CONTENT", "MODERATE", "ANALYZE"], metricKeys, tokenStatus: "VALID", connectionStatus: "VERIFIED", verifiedAt: new Date(), lastCheckedAt: new Date() } }),
+  ]);
+  return account;
+}
+
+async function approvedFacebookItem() {
+  const item = await generatedItem();
+  await submitForReview(fixture.context, item.id);
+  await reviewContent(fixture.context, item.id, "APPROVED");
+  return item;
+}
+
+describe("phase two Facebook LIVE boundaries", () => {
+  it("requires a verified Page before a LIVE task can enter the queue", async () => {
+    const item = await approvedFacebookItem();
+    await db.client.update({ where: { id: fixture.client.id }, data: { mode: "LIVE", isDemo: false } });
+    await expect(schedulePublication(fixture.context, item.id)).rejects.toMatchObject({ code: "LIVE_CONNECTION_REQUIRED" });
+    expect(await db.publishJob.count({ where: { clientId: fixture.client.id } })).toBe(0);
+  });
+
+  it("creates one LIVE task, publishes once, stores the real binding and supports duplicate scheduling", async () => {
+    const item = await approvedFacebookItem();
+    await enableLiveFacebook();
+    const first = await schedulePublication(fixture.context, item.id);
+    const second = await schedulePublication(fixture.context, item.id);
+    expect(first.id).toBe(second.id);
+    expect(first.environment).toBe("LIVE");
+    expect(first.simulated).toBe(false);
+    await claimNextJob("facebook-live-worker");
+    let calls = 0;
+    const adapter: SocialPublishAdapter = { name: "facebook-test", simulated: false, async publish() { calls += 1; return { status: "published", remotePostId: "123456_789", remotePostUrl: "https://www.facebook.com/123456/posts/789", publishedAt: new Date("2026-09-17T01:00:00Z") }; } };
+    const result = await processPublishJob(first.id, adapter);
+    expect(calls).toBe(1);
+    expect(result).toMatchObject({ status: "PUBLISHED", remotePostId: "123456_789", environment: "LIVE", simulated: false });
+    expect(await db.publishJob.count({ where: { clientId: fixture.client.id } })).toBe(1);
+  });
+
+  it("marks a LIVE timeout UNKNOWN and cannot claim it again", async () => {
+    const item = await approvedFacebookItem();
+    await enableLiveFacebook();
+    const job = await schedulePublication(fixture.context, item.id);
+    await claimNextJob("facebook-timeout-worker");
+    const adapter: SocialPublishAdapter = { name: "facebook-timeout", simulated: false, async publish() { return { status: "unknown", code: "NETWORK_TIMEOUT", message: "timed out" }; } };
+    const result = await processPublishJob(job.id, adapter);
+    expect(result.status).toBe("UNKNOWN");
+    expect(await claimNextJob("must-not-retry")).toBeNull();
+    expect(await db.manualTask.count({ where: { clientId: fixture.client.id, publishJobId: job.id, status: "TODO" } })).toBe(1);
+  });
+
+  it("revokes connection verification when Facebook reports an invalid token", async () => {
+    const item = await approvedFacebookItem();
+    const account = await enableLiveFacebook();
+    const job = await schedulePublication(fixture.context, item.id);
+    await claimNextJob("facebook-token-worker");
+    const adapter: SocialPublishAdapter = { name: "facebook-token", simulated: false, async publish() { return { status: "failed", code: "TOKEN_INVALID", message: "expired", retryable: false }; } };
+    const result = await processPublishJob(job.id, adapter);
+    expect(result.status).toBe("FAILED");
+    expect((await db.facebookPageConnection.findUniqueOrThrow({ where: { accountId: account.id } })).tokenStatus).toBe("EXPIRED");
+    expect((await db.socialAccount.findUniqueOrThrow({ where: { id: account.id } })).publishCapability).toBe("UNVERIFIED");
+  });
+
+  it("syncs a real zero metric and deduplicates a procurement comment into one lead", async () => {
+    const item = await approvedFacebookItem();
+    await enableLiveFacebook(["page_test_metric"]);
+    const job = await schedulePublication(fixture.context, item.id);
+    await claimNextJob("facebook-sync-worker");
+    await processPublishJob(job.id, { name: "facebook-live", simulated: false, async publish() { return { status: "published", remotePostId: "123456_999", remotePostUrl: "https://www.facebook.com/123456/posts/999", publishedAt: new Date() }; } });
+    const graph = new FacebookGraphAdapter({
+      pageId: "123456",
+      accessToken: "test-only",
+      apiVersion: "v26.0",
+      fetchImpl: async (input) => String(input).includes("/insights?")
+        ? new Response(JSON.stringify({ data: [{ name: "page_test_metric", values: [{ value: 0, end_time: "2026-09-17T00:00:00Z" }] }] }), { status: 200 })
+        : String(input).includes("fields=comments.limit")
+          ? new Response(JSON.stringify({ comments: { summary: { total_count: 0 } }, reactions: { summary: { total_count: 0 } } }), { status: 200 })
+          : new Response(JSON.stringify({ data: [{ id: "comment-test-1", message: "Please send your wholesale catalog and MOQ.", from: { id: "buyer-1", name: "Test Buyer" }, created_time: "2026-09-17T01:00:00Z", permalink_url: "https://facebook.test/comment-test-1" }] }), { status: 200 }),
+    });
+    const metrics = await syncFacebookMetrics(fixture.context, fixture.accounts[0].id, graph);
+    expect(metrics[0]).toMatchObject({ availability: "AVAILABLE", dataKind: "REAL" });
+    expect(metrics[0].numericValue?.toString()).toBe("0");
+    const postMetrics = await syncFacebookPostMetrics(fixture.context, job.id, graph);
+    expect(postMetrics).toHaveLength(2);
+    expect(postMetrics.every((metric) => metric.availability === "AVAILABLE" && metric.numericValue?.toString() === "0")).toBe(true);
+    const first = await syncFacebookComments(fixture.context, job.id, graph);
+    const second = await syncFacebookComments(fixture.context, job.id, graph);
+    expect(first.imported).toBe(1);
+    expect(second.duplicated).toBe(1);
+    expect(await db.lead.count({ where: { clientId: fixture.client.id } })).toBe(1);
+    expect(await db.manualTask.count({ where: { clientId: fixture.client.id, leadId: { not: null } } })).toBe(1);
+  });
+});
+
+describe("phase two usage and authentication safety", () => {
+  it("serializes concurrent usage reservations so the client budget cannot be oversubscribed", async () => {
+    await db.client.update({ where: { id: fixture.client.id }, data: { usageMonthlyLimit: 100 } });
+    const outcomes = await Promise.allSettled([
+      reserveUsage({ clientId: fixture.client.id, capability: "test", provider: "test", units: 80 }),
+      reserveUsage({ clientId: fixture.client.id, capability: "test", provider: "test", units: 80 }),
+    ]);
+    expect(outcomes.filter((outcome) => outcome.status === "fulfilled")).toHaveLength(1);
+    expect(outcomes.filter((outcome) => outcome.status === "rejected")).toHaveLength(1);
+    const active = await db.usageReservation.findFirst({ where: { clientId: fixture.client.id, status: "RESERVED" } });
+    expect(active?.reservedUnits).toBe(80);
+    if (active) await releaseUsage(active.id, fixture.client.id);
+  });
+
+  it("settles one reservation exactly once under concurrent completion", async () => {
+    await db.client.update({ where: { id: fixture.client.id }, data: { usageMonthlyLimit: 1000 } });
+    const reservation = await reserveUsage({ clientId: fixture.client.id, capability: "test-settle", provider: "test", units: 100 });
+    await Promise.all([
+      settleUsage({ reservationId: reservation.id, clientId: fixture.client.id, model: "test", inputUnits: 20, outputUnits: 30 }),
+      settleUsage({ reservationId: reservation.id, clientId: fixture.client.id, model: "test", inputUnits: 20, outputUnits: 30 }),
+    ]);
+    expect(await db.usageLog.count({ where: { clientId: fixture.client.id, capability: "test-settle" } })).toBe(1);
+    expect((await db.usageReservation.findUniqueOrThrow({ where: { id: reservation.id } })).settledUnits).toBe(50);
+  });
+
+  it("blocks a hashed login key after the configured number of failures and clears it on success", async () => {
+    const key = `test-${randomUUID()}`;
+    const oldMax = process.env.LOGIN_MAX_FAILURES;
+    process.env.LOGIN_MAX_FAILURES = "2";
+    try {
+      expect((await recordLoginFailure([key])).allowed).toBe(true);
+      expect((await recordLoginFailure([key])).allowed).toBe(false);
+      expect((await checkLoginAllowed([key])).allowed).toBe(false);
+      await clearLoginFailures([key]);
+      expect((await checkLoginAllowed([key])).allowed).toBe(true);
+    } finally {
+      if (oldMax === undefined) delete process.env.LOGIN_MAX_FAILURES; else process.env.LOGIN_MAX_FAILURES = oldMax;
+      await clearLoginFailures([key]);
+    }
   });
 });

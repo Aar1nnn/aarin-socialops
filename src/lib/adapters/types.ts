@@ -33,18 +33,23 @@ export type PublishRequest = {
   platform: string;
   accountExternalId: string | null;
   text: string;
-  assetKeys: string[];
+  assets: Array<{
+    storageKey: string;
+    mimeType: string;
+    originalName: string;
+  }>;
   idempotencyKey: string;
 };
 
 export type PublishResult =
   | { status: "published"; remotePostId: string; remotePostUrl: string | null; publishedAt: Date }
   | { status: "failed"; code: string; message: string; retryable: boolean }
-  | { status: "unknown"; code: string; message: string };
+  | { status: "unknown"; code: string; message: string; remotePostId?: string; remotePostUrl?: string | null };
 
 export interface SocialPublishAdapter {
   readonly name: string;
   readonly simulated: boolean;
   publish(request: PublishRequest): Promise<PublishResult>;
+  queryByRemotePostId?(remotePostId: string): Promise<PublishResult>;
   queryByIdempotencyKey?(idempotencyKey: string): Promise<PublishResult | null>;
 }

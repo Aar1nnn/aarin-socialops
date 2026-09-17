@@ -80,10 +80,33 @@ enum AttemptStatus {
   UNKNOWN
 }
 
+enum PublishEnvironment {
+  SIMULATED
+  LIVE
+}
+
+enum FacebookTokenStatus {
+  UNCONFIGURED
+  UNVERIFIED
+  VALID
+  EXPIRING
+  EXPIRED
+  REVOKED
+  UNKNOWN
+}
+
+enum UsageReservationStatus {
+  RESERVED
+  SETTLED
+  RELEASED
+  EXPIRED
+}
+
 enum DataAvailability {
   AVAILABLE
   NOT_FETCHED
   UNSUPPORTED
+  PERMISSION_DENIED
   READ_FAILED
 }
 
@@ -176,20 +199,20 @@ model Session {
 }
 
 model Client {
-  id                   String                @id @default(cuid())
-  slug                 String                @unique
+  id                   String                   @id @default(cuid())
+  slug                 String                   @unique
   name                 String
-  mode                 ClientMode            @default(DEMO)
-  timezone             String                @default("Asia/Shanghai")
-  targetMarkets        String[]              @default([])
+  mode                 ClientMode               @default(DEMO)
+  timezone             String                   @default("Asia/Shanghai")
+  targetMarkets        String[]                 @default([])
   productFocus         String?
   brandGuidelines      String?
   contactDetails       Json?
-  usageMonthlyLimit    Int                   @default(100000)
-  isDemo               Boolean               @default(false)
-  configurationStatus  String                @default("PENDING")
-  createdAt            DateTime              @default(now())
-  updatedAt            DateTime              @updatedAt
+  usageMonthlyLimit    Int                      @default(100000)
+  isDemo               Boolean                  @default(false)
+  configurationStatus  String                   @default("PENDING")
+  createdAt            DateTime                 @default(now())
+  updatedAt            DateTime                 @updatedAt
   memberships          ClientMembership[]
   sessions             Session[]
   products             Product[]
@@ -215,6 +238,8 @@ model Client {
   auditLogs            AuditLog[]
   usageLogs            UsageLog[]
   researchRecords      ResearchRecord[]
+  facebookConnections  FacebookPageConnection[]
+  usageReservations    UsageReservation[]
 }
 
 model ResearchRecord {
@@ -318,26 +343,27 @@ model ProductAsset {
 }
 
 model SocialAccount {
-  id                 String           @id @default(cuid())
+  id                 String                  @id @default(cuid())
   clientId           String
   platform           String
   displayName        String
   externalAccountId  String?
   credentialRef      String?
-  publishCapability  CapabilityStatus @default(UNCONFIGURED)
-  metricsCapability  CapabilityStatus @default(UNCONFIGURED)
-  commentsCapability CapabilityStatus @default(UNCONFIGURED)
-  messagesCapability CapabilityStatus @default(UNCONFIGURED)
-  groupsCapability   CapabilityStatus @default(UNCONFIGURED)
+  publishCapability  CapabilityStatus        @default(UNCONFIGURED)
+  metricsCapability  CapabilityStatus        @default(UNCONFIGURED)
+  commentsCapability CapabilityStatus        @default(UNCONFIGURED)
+  messagesCapability CapabilityStatus        @default(UNCONFIGURED)
+  groupsCapability   CapabilityStatus        @default(UNCONFIGURED)
   verifiedAt         DateTime?
-  createdAt          DateTime         @default(now())
-  updatedAt          DateTime         @updatedAt
-  client             Client           @relation(fields: [clientId], references: [id], onDelete: Cascade)
+  createdAt          DateTime                @default(now())
+  updatedAt          DateTime                @updatedAt
+  client             Client                  @relation(fields: [clientId], references: [id], onDelete: Cascade)
   contentItems       ContentItem[]
   approvals          Approval[]
   publishJobs        PublishJob[]
   metricSnapshots    MetricSnapshot[]
   interactions       Interaction[]
+  facebookConnection FacebookPageConnection?
 
   @@unique([clientId, platform, displayName])
   @@index([clientId, platform])
@@ -472,17 +498,18 @@ model Approval {
 }
 
 model PublishJob {
-  id               String           @id @default(cuid())
+  id               String             @id @default(cuid())
   clientId         String
   contentVersionId String
   accountId        String
-  status           PublishJobStatus @default(PENDING)
-  idempotencyKey   String           @unique
+  status           PublishJobStatus   @default(PENDING)
+  idempotencyKey   String             @unique
   adapter          String
-  simulated        Boolean          @default(false)
-  attemptCount     Int              @default(0)
-  maxAttempts      Int              @default(3)
-  nextAttemptAt    DateTime         @default(now())
+  simulated        Boolean            @default(false)
+  environment      PublishEnvironment @default(SIMULATED)
+  attemptCount     Int                @default(0)
+  maxAttempts      Int                @default(3)
+  nextAttemptAt    DateTime           @default(now())
   lockedAt         DateTime?
   lockedBy         String?
   lastErrorCode    String?
@@ -490,11 +517,12 @@ model PublishJob {
   remotePostId     String?
   remotePostUrl    String?
   publishedAt      DateTime?
-  createdAt        DateTime         @default(now())
-  updatedAt        DateTime         @updatedAt
-  client           Client           @relation(fields: [clientId], references: [id], onDelete: Cascade)
-  contentVersion   ContentVersion   @relation(fields: [contentVersionId], references: [id], onDelete: Restrict)
-  account          SocialAccount    @relation(fields: [accountId], references: [id], onDelete: Restrict)
+  lastQueriedAt    DateTime?
+  createdAt        DateTime           @default(now())
+  updatedAt        DateTime           @updatedAt
+  client           Client             @relation(fields: [clientId], references: [id], onDelete: Cascade)
+  contentVersion   ContentVersion     @relation(fields: [contentVersionId], references: [id], onDelete: Restrict)
+  account          SocialAccount      @relation(fields: [accountId], references: [id], onDelete: Restrict)
   attempts         PublishAttempt[]
   manualTasks      ManualTask[]
 
@@ -603,7 +631,7 @@ model ManualTask {
   createdAt          DateTime           @default(now())
   updatedAt          DateTime           @updatedAt
   client             Client             @relation(fields: [clientId], references: [id], onDelete: Cascade)
-  publishJob         PublishJob?         @relation(fields: [publishJobId], references: [id], onDelete: SetNull)
+  publishJob         PublishJob?        @relation(fields: [publishJobId], references: [id], onDelete: SetNull)
 
   @@index([clientId, status, priority])
   @@index([clientId, publishJobId])
@@ -716,4 +744,63 @@ model UsageLog {
   client        Client   @relation(fields: [clientId], references: [id], onDelete: Cascade)
 
   @@index([clientId, createdAt])
+}
+
+model FacebookPageConnection {
+  id                  String              @id @default(cuid())
+  clientId            String
+  accountId           String              @unique
+  pageId              String
+  pageName            String?
+  graphApiVersion     String              @default("v26.0")
+  credentialRef       String
+  requiredPermissions String[]            @default([])
+  grantedPermissions  String[]            @default([])
+  pageTasks           String[]            @default([])
+  metricKeys          String[]            @default([])
+  tokenStatus         FacebookTokenStatus @default(UNVERIFIED)
+  tokenExpiresAt      DateTime?
+  connectionStatus    CapabilityStatus    @default(UNVERIFIED)
+  verifiedAt          DateTime?
+  lastCheckedAt       DateTime?
+  metricsSyncedAt     DateTime?
+  commentsSyncedAt    DateTime?
+  commentsCursor      String?
+  lastErrorCategory   String?
+  lastErrorMessage    String?
+  createdAt           DateTime            @default(now())
+  updatedAt           DateTime            @updatedAt
+  client              Client              @relation(fields: [clientId], references: [id], onDelete: Cascade)
+  account             SocialAccount       @relation(fields: [accountId], references: [id], onDelete: Cascade)
+
+  @@unique([clientId, pageId])
+  @@index([clientId, connectionStatus])
+}
+
+model UsageReservation {
+  id            String                 @id @default(cuid())
+  clientId      String
+  requestKey    String                 @unique
+  capability    String
+  provider      String
+  reservedUnits Int
+  settledUnits  Int?
+  status        UsageReservationStatus @default(RESERVED)
+  expiresAt     DateTime
+  createdAt     DateTime               @default(now())
+  updatedAt     DateTime               @updatedAt
+  client        Client                 @relation(fields: [clientId], references: [id], onDelete: Cascade)
+
+  @@index([clientId, status, createdAt])
+}
+
+model LoginRateLimit {
+  keyHash       String    @id
+  failureCount  Int       @default(0)
+  windowStarted DateTime
+  blockedUntil  DateTime?
+  lastFailureAt DateTime?
+  updatedAt     DateTime  @updatedAt
+
+  @@index([blockedUntil])
 }

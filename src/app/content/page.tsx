@@ -4,17 +4,18 @@ import { db } from "@/lib/db";
 
 export default async function ContentPage() {
   const context = await requirePageContext();
-  const [products, items] = await Promise.all([
+  const [products, items, client] = await Promise.all([
     db.product.findMany({ where: { clientId: context.clientId }, include: { assetLinks: true }, orderBy: { updatedAt: "desc" } }),
     db.contentItem.findMany({
       where: { clientId: context.clientId },
       include: {
         plan: { include: { product: true } }, account: true,
-        currentVersion: { include: { approvals: { orderBy: { createdAt: "desc" } }, assetLinks: true } },
+        currentVersion: { include: { approvals: { orderBy: { createdAt: "desc" } }, assetLinks: true, publishJobs: { orderBy: { createdAt: "desc" }, include: { attempts: { orderBy: { number: "desc" } } } } } },
         versions: { select: { id: true, version: true, createdAt: true }, orderBy: { version: "desc" } },
       },
       orderBy: { updatedAt: "desc" },
     }),
+    db.client.findUniqueOrThrow({ where: { id: context.clientId } }),
   ]);
   return (
     <OperatorShell context={context}>
@@ -43,10 +44,11 @@ export default async function ContentPage() {
               <form action={`/api/content/${item.id}/submit`} method="post"><button className="secondary">提交审核</button></form>
               <form action={`/api/content/${item.id}/review`} method="post"><input type="hidden" name="decision" value="APPROVED" /><button>批准当前版本</button></form>
               <form action={`/api/content/${item.id}/review`} method="post"><input type="hidden" name="decision" value="REJECTED" /><button className="danger">拒绝</button></form>
-              <form action={`/api/content/${item.id}/schedule`} method="post"><button disabled={!validApproval}>排期/立即模拟发布</button></form>
+              <form action={`/api/content/${item.id}/schedule`} method="post"><button disabled={!validApproval}>排期{client.mode === "LIVE" ? "真实发布" : client.mode === "DEMO" ? "模拟发布" : "（草稿模式禁止发布）"}</button></form>
             </div>
             <div className={validApproval ? "warning" : "error"}>{validApproval ? `已批准 v${version?.version}，账号 ${item.account.displayName}` : "当前版本尚无有效批准，后端会阻止发布。"}</div>
             <small className="muted">历史版本：{item.versions.map((entry) => `v${entry.version}`).join("、")}</small>
+            {version?.publishJobs.map((job) => <div className="list-item stack" key={job.id}><div className="row"><span className={`badge ${job.environment === "SIMULATED" ? "mock" : "ok"}`}>{job.environment}</span><strong>{job.status}</strong><small>尝试 {job.attemptCount}/{job.maxAttempts}</small></div>{job.remotePostId && <small>远端 ID：{job.remotePostId}</small>}{job.remotePostUrl && <a href={job.remotePostUrl} target="_blank" rel="noreferrer">打开远端帖子</a>}{job.lastErrorCode && <div className="error">{job.lastErrorCode}：{job.lastErrorMessage}</div>}{job.environment === "LIVE" && job.remotePostId && <form action={`/api/publish-jobs/${job.id}/query`} method="post"><button className="secondary">查询 Facebook 远端状态</button></form>}</div>)}
           </article>;
         })}
       </div>

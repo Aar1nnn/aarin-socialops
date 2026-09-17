@@ -7,6 +7,8 @@ import type { SocialPublishAdapter } from "../lib/adapters/types";
 import { sha256 } from "../lib/security";
 import { AppError } from "../lib/errors";
 import { assertCanWrite, type RequestContext } from "../lib/context";
+import { getFacebookAdapterForJob } from "./facebook-service";
+import { FACEBOOK_ERROR_ADVICE, type FacebookErrorCategory } from "../lib/adapters/facebook-graph";
 
 export async function recoverStaleJobs(lockTimeoutSeconds: number) {
   const cutoff = new Date(Date.now() - lockTimeoutSeconds * 1000);
@@ -53,6 +55,16 @@ export async function claimNextJob(workerId: string): Promise<PublishJob | null>
   return rows[0] ?? null;
 }
 
+export async function claimPublishJob(jobId: string, workerId: string): Promise<PublishJob | null> {
+  const leaseToken = `${workerId}:${randomUUID()}`;
+  const rows = await db.$queryRaw<PublishJob[]>`
+    UPDATE "PublishJob" SET "status" = 'RUNNING'::"PublishJobStatus", "lockedAt" = NOW(), "lockedBy" = ${leaseToken}, "updatedAt" = NOW()
+    WHERE "id" = ${jobId} AND "status" IN ('PENDING'::"PublishJobStatus", 'RETRY'::"PublishJobStatus") AND "nextAttemptAt" <= NOW()
+    RETURNING *
+  `;
+  return rows[0] ?? null;
+}
+
 export async function processPublishJob(jobId: string, injectedAdapter?: SocialPublishAdapter) {
   const job = await db.publishJob.findUniqueOrThrow({
     where: { id: jobId },
@@ -79,13 +91,34 @@ export async function processPublishJob(jobId: string, injectedAdapter?: SocialP
     await cancelClaim(job.id, leaseToken, code);
     return db.publishJob.findUniqueOrThrow({ where: { id: job.id } });
   }
-  if (job.client.mode !== ClientMode.DEMO || !job.simulated || job.adapter !== "mock-social") {
-    await createFailureTask(job.clientId, job.contentVersion.item.id, job.id, "真实发布适配器未实现或未验证");
-    await db.publishJob.updateMany({ where: { id: job.id, status: PublishJobStatus.RUNNING, lockedBy: leaseToken }, data: { status: PublishJobStatus.WAITING_CONFIGURATION, lockedAt: null, lockedBy: null, lastErrorCode: "LIVE_ADAPTER_UNAVAILABLE" } });
+  let adapter: SocialPublishAdapter;
+  if (job.client.mode === ClientMode.DEMO && injectedAdapter && !injectedAdapter.simulated) {
+    throw new Error("DEMO_MODE_REAL_ADAPTER_BLOCKED");
+  }
+  if (job.client.mode === ClientMode.LIVE && injectedAdapter?.simulated) {
+    throw new Error("LIVE_MODE_SIMULATED_ADAPTER_BLOCKED");
+  }
+  const persistedBoundaryValid = job.client.mode === ClientMode.DEMO
+    ? job.simulated && job.environment === "SIMULATED" && job.adapter === "mock-social"
+    : job.client.mode === ClientMode.LIVE
+      ? !job.simulated && job.environment === "LIVE" && job.adapter === "facebook-graph" && job.account.platform === "facebook"
+      : false;
+  if (!persistedBoundaryValid) {
+    await cancelClaim(job.id, leaseToken, "MODE_ADAPTER_BOUNDARY_CLOSED", "客户运行模式或任务适配器环境已变化，执行已取消。 ");
     return db.publishJob.findUniqueOrThrow({ where: { id: job.id } });
   }
-  const adapter = injectedAdapter ?? new MockSocialPublishAdapter();
-  if (!adapter.simulated) throw new Error("DEMO_MODE_REAL_ADAPTER_BLOCKED");
+  try {
+    if (job.client.mode === ClientMode.DEMO) {
+      adapter = injectedAdapter ?? new MockSocialPublishAdapter();
+    } else {
+      adapter = injectedAdapter ?? await getFacebookAdapterForJob(job.clientId, job.accountId);
+    }
+  } catch (error) {
+    const code = error instanceof AppError ? error.code : error instanceof Error ? error.message : "LIVE_ADAPTER_UNAVAILABLE";
+    await createFailureTask(job.clientId, job.contentVersion.item.id, job.id, "发布连接在执行前不可用", code);
+    await db.publishJob.updateMany({ where: { id: job.id, status: PublishJobStatus.RUNNING, lockedBy: leaseToken }, data: { status: PublishJobStatus.WAITING_CONFIGURATION, lockedAt: null, lockedBy: null, lastErrorCode: code, lastErrorMessage: "发布适配器或账号连接在执行前不可用。" } });
+    return db.publishJob.findUniqueOrThrow({ where: { id: job.id } });
+  }
   const attemptNumber = job.attemptCount + 1;
   const requestFingerprint = sha256(JSON.stringify({ versionId: job.contentVersionId, accountId: job.accountId, text: job.contentVersion.text, assets: job.contentVersion.assetLinks.map((link) => link.asset.storageKey).sort() }));
   const attempt = await db.$transaction(async (tx) => {
@@ -112,7 +145,7 @@ export async function processPublishJob(jobId: string, injectedAdapter?: SocialP
 
   let result;
   try {
-    result = await adapter.publish({ clientId: job.clientId, platform: job.account.platform, accountExternalId: job.account.externalAccountId, text: job.contentVersion.text, assetKeys: job.contentVersion.assetLinks.map((link) => link.asset.storageKey), idempotencyKey: job.idempotencyKey });
+    result = await adapter.publish({ clientId: job.clientId, platform: job.account.platform, accountExternalId: job.account.externalAccountId, text: job.contentVersion.text, assets: job.contentVersion.assetLinks.map((link) => ({ storageKey: link.asset.storageKey, mimeType: link.asset.mimeType, originalName: link.asset.originalName })), idempotencyKey: job.idempotencyKey });
   } catch (error) {
     result = { status: "unknown" as const, code: "ADAPTER_THROW_AFTER_DISPATCH", message: error instanceof Error ? error.message : "适配器调用异常" };
   }
@@ -123,7 +156,7 @@ export async function processPublishJob(jobId: string, injectedAdapter?: SocialP
     const data = result.status === "published"
       ? { status: finalStatus, remotePostId: result.remotePostId, remotePostUrl: result.remotePostUrl, publishedAt: result.publishedAt, lockedAt: null, lockedBy: null }
       : result.status === "unknown"
-        ? { status: finalStatus, lockedAt: null, lockedBy: null, lastErrorCode: result.code, lastErrorMessage: result.message }
+        ? { status: finalStatus, remotePostId: result.remotePostId, remotePostUrl: result.remotePostUrl, lockedAt: null, lockedBy: null, lastErrorCode: result.code, lastErrorMessage: result.message }
         : { status: finalStatus, nextAttemptAt: finalStatus === PublishJobStatus.RETRY ? new Date(Date.now() + 5_000 * attemptNumber) : job.nextAttemptAt, lockedAt: null, lockedBy: null, lastErrorCode: result.code, lastErrorMessage: result.message };
     const held = await tx.publishJob.updateMany({ where: { id: job.id, status: PublishJobStatus.RUNNING, lockedBy: leaseToken }, data });
     if (held.count !== 1) return;
@@ -132,14 +165,30 @@ export async function processPublishJob(jobId: string, injectedAdapter?: SocialP
       data: result.status === "published"
         ? { status: AttemptStatus.SUCCEEDED, finishedAt: new Date(), remotePostId: result.remotePostId, remotePostUrl: result.remotePostUrl }
         : result.status === "unknown"
-          ? { status: AttemptStatus.UNKNOWN, finishedAt: new Date(), errorCode: result.code, errorMessage: result.message }
+          ? { status: AttemptStatus.UNKNOWN, finishedAt: new Date(), errorCode: result.code, errorMessage: result.message, remotePostId: result.remotePostId, remotePostUrl: result.remotePostUrl }
           : { status: AttemptStatus.FAILED, finishedAt: new Date(), errorCode: result.code, errorMessage: result.message },
     });
     await tx.contentItem.update({ where: { id: job.contentVersion.item.id }, data: { status: finalStatus === PublishJobStatus.PUBLISHED ? ContentStatus.PUBLISHED : finalStatus === PublishJobStatus.UNKNOWN ? ContentStatus.UNKNOWN : finalStatus === PublishJobStatus.FAILED ? ContentStatus.FAILED : ContentStatus.SCHEDULED } });
+    if (job.environment === "LIVE" && result.status !== "published" && (result.code === "TOKEN_INVALID" || result.code === "PERMISSION_DENIED")) {
+      await tx.facebookPageConnection.updateMany({
+        where: { clientId: job.clientId, accountId: job.accountId },
+        data: {
+          connectionStatus: "UNVERIFIED",
+          tokenStatus: result.code === "TOKEN_INVALID" ? "EXPIRED" : "VALID",
+          lastCheckedAt: new Date(),
+          lastErrorCategory: result.code,
+          lastErrorMessage: result.message,
+        },
+      });
+      await tx.socialAccount.update({ where: { id: job.accountId }, data: { publishCapability: "UNVERIFIED", metricsCapability: "UNVERIFIED", commentsCapability: "UNVERIFIED", verifiedAt: null } });
+    }
     if (finalStatus === PublishJobStatus.UNKNOWN) createTaskReason = "发布结果未知，需要远端查询对账，禁止盲目重发";
-    if (finalStatus === PublishJobStatus.FAILED) createTaskReason = "发布重试次数已用尽";
+    if (finalStatus === PublishJobStatus.FAILED) createTaskReason = result.status === "failed" ? `发布失败：${result.code}` : "发布重试次数已用尽";
   });
-  if (createTaskReason) await createFailureTask(job.clientId, job.contentVersion.item.id, job.id, createTaskReason);
+  if (createTaskReason) {
+    const code = result.status === "published" ? undefined : result.code;
+    await createFailureTask(job.clientId, job.contentVersion.item.id, job.id, createTaskReason, code);
+  }
   return db.publishJob.findUniqueOrThrow({ where: { id: job.id }, include: { attempts: true } });
 }
 
@@ -183,11 +232,11 @@ async function cancelClaim(jobId: string, leaseToken: string, code: string, mess
   return db.publishJob.updateMany({ where: { id: jobId, status: PublishJobStatus.RUNNING, lockedBy: leaseToken }, data: { status: PublishJobStatus.CANCELLED, lockedAt: null, lockedBy: null, lastErrorCode: code, lastErrorMessage: message } });
 }
 
-async function createFailureTask(clientId: string, contentItemId: string, publishJobId: string, reason: string) {
+async function createFailureTask(clientId: string, contentItemId: string, publishJobId: string, reason: string, errorCode?: string) {
   const existing = await db.manualTask.findFirst({ where: { clientId, publishJobId, triggerReason: reason, status: { in: ["TODO", "IN_PROGRESS", "WAITING_EXTERNAL"] } } });
   if (!existing) {
     await db.$transaction([
-      db.manualTask.create({ data: { clientId, contentItemId, publishJobId, triggerReason: reason, priority: "URGENT", sourceMaterial: { contentItemId, publishJobId }, requiredAction: "检查远端平台、账号连接和执行记录；确认结果后人工对账。", completionCriteria: "远端帖子状态已确认，并在系统记录远端 ID 或失败原因。", continuationStep: "确认成功则标记发布；确认失败后由运营者决定是否创建新任务。" } }),
+      db.manualTask.create({ data: { clientId, contentItemId, publishJobId, triggerReason: reason, priority: "URGENT", sourceMaterial: { contentItemId, publishJobId, errorCode: errorCode || null }, requiredAction: errorCode && errorCode in FACEBOOK_ERROR_ADVICE ? FACEBOOK_ERROR_ADVICE[errorCode as FacebookErrorCategory] : "检查远端平台、账号连接和执行记录；确认结果后人工对账。", completionCriteria: "远端帖子状态已确认，并在系统记录远端 ID 或失败原因。", continuationStep: "确认成功则标记发布；确认失败后由运营者决定是否创建新任务。" } }),
       db.inAppNotification.create({ data: { clientId, severity: "URGENT", title: "发布任务需要人工处理", body: reason, relatedType: "ContentItem", relatedId: contentItemId } }),
     ]);
   }

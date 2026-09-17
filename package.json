@@ -16,7 +16,8 @@
     "db:migrate": "prisma migrate deploy",
     "db:migrate:dev": "prisma migrate dev",
     "db:seed": "tsx prisma/seed.ts",
-    "demo:e2e": "tsx scripts/demo-e2e.ts"
+    "demo:e2e": "tsx scripts/demo-e2e.ts",
+    "facebook:live:e2e": "tsx scripts/facebook-live-e2e.ts"
   },
   "dependencies": {
     "@prisma/client": "6.19.3",

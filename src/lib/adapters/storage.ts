@@ -27,6 +27,15 @@ function safeSegment(value: string): string {
   return value.replace(/[^a-zA-Z0-9._-]/g, "_").slice(0, 120) || "asset";
 }
 
+export function resolveLocalAssetPath(storageKey: string): string {
+  const root = path.resolve(/* turbopackIgnore: true */ process.env.STORAGE_LOCAL_ROOT || "./storage");
+  const absolute = path.resolve(root, storageKey);
+  if (!absolute.startsWith(`${root}${path.sep}`)) {
+    throw new AppError("素材存储路径无效。", 400, "INVALID_STORAGE_PATH");
+  }
+  return absolute;
+}
+
 export async function storeLocalAsset(clientId: string, file: File): Promise<StoredAsset> {
   const maxBytes = Number(process.env.MAX_UPLOAD_BYTES || 200 * 1024 * 1024);
   if (file.size > maxBytes) throw new AppError(`素材超过上传上限 ${maxBytes} bytes。`, 413, "ASSET_TOO_LARGE");

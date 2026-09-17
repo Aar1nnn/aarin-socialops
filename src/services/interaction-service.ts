@@ -30,7 +30,11 @@ export function classifyIntent(body: string): {
   return { category: "GENERAL", priority: "LOW", rationale: "未发现采购、批发、询价、目录或供货等明确意向", isLead: false };
 }
 
-export async function importInteraction(context: RequestContext, raw: unknown) {
+export async function importInteraction(
+  context: RequestContext,
+  raw: unknown,
+  options?: { source: "facebook-graph"; rawPayload: Record<string, unknown> },
+) {
   assertCanWrite(context);
   const input = interactionImportSchema.parse(raw);
   if (input.accountId) {
@@ -52,11 +56,11 @@ export async function importInteraction(context: RequestContext, raw: unknown) {
           body: input.body,
           sourceUrl: input.sourceUrl || null,
           occurredAt: input.occurredAt,
-          rawPayload: { importedManually: true },
+          rawPayload: (options ? { importSource: options.source, payload: options.rawPayload } : { importedManually: true }) as Prisma.InputJsonValue,
         },
       });
       const lead = classification.isLead ? await createLeadBundle(tx, context.clientId, interaction, classification) : null;
-      await tx.auditLog.create({ data: { clientId: context.clientId, userId: context.userId, action: "INTERACTION_IMPORTED", entityType: "Interaction", entityId: interaction.id, metadata: { isLead: classification.isLead, platform: input.platform } } });
+      await tx.auditLog.create({ data: { clientId: context.clientId, userId: context.userId, action: "INTERACTION_IMPORTED", entityType: "Interaction", entityId: interaction.id, metadata: { isLead: classification.isLead, platform: input.platform, source: options?.source || "manual" } } });
       return { interaction, lead };
     });
     return { ...created, classification, duplicated: false };

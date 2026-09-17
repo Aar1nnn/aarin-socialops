@@ -1,4 +1,4 @@
-# 海外社媒 AI 运营工作台（第一阶段）
+# 海外社媒 AI 运营工作台（第二阶段：Facebook Page）
 
 面向中国企业海外内容运营的本地优先工作台。一个逻辑运营负责人调用模块化能力，确定性程序负责客户隔离、内容版本、人工审批、发布任务、幂等、重试、指标和线索交接。
 
@@ -30,7 +30,7 @@ pnpm worker
 3. 在“内容审核”生成四平台草稿、提交审核、批准并排期。
 4. worker 只调用模拟发布适配器，远端 URL 使用 `mock://` 且任务有 `simulated=true`。
 5. 在“线索与复盘”人工导入互动，系统识别明确采购意向并创建紧急站内通知和交接任务。
-6. 生成模拟指标和报告；页面持续标注“模拟”，缺失/不支持/读取失败不会显示为 0。
+6. 生成模拟指标和报告；页面持续标注“模拟”，缺失/不支持/权限不足/读取失败不会显示为 0。
 
 也可以运行完整演示脚本：
 
@@ -49,6 +49,10 @@ pnpm demo:e2e
 - 人工互动导入、平台记录 ID 去重、意向分类、人工回复/转交状态。
 - 指标可用性、真实/模拟数据类型、程序计算事实和基于缺口的报告。
 - 站内普通任务、紧急通知、操作日志和模型使用量记录。
+- Facebook Page 非敏感连接配置、Page/权限/任务验证、令牌状态和错误建议；令牌只通过服务器 `env:FACEBOOK_...` 引用读取。
+- Facebook Page 纯文字、单张 PNG/JPEG、单个 MP4/QuickTime 真实发布，远端 ID/链接/发布时间保存和状态查询。
+- Facebook 帖子评论/回应真实计数、配置化 Page Insights，以及公开评论导入现有互动/线索/人工交接流程。
+- 真实模型调用的事务性用量预占、成功结算和失败释放；登录失败按哈希后的邮箱/IP 键限速。
 
 ## 当前模拟
 
@@ -57,9 +61,15 @@ pnpm demo:e2e
 - 演示客户的指标快照。
 - 演示产品只存在于演示客户；吕总客户没有继承这些数据。
 
-## 尚未验证/未实现的真实连接
+## 已实现但仍需专用测试 Page 做外部验收
 
-- Facebook、Instagram、TikTok、LinkedIn 真实账号、发布、结果查询、指标、评论和私信接口。
+- Facebook Page 真实连接、发布、查询、帖子指标和公开评论读取已经实现并通过本地 stub/数据库测试；在提供专用测试 Page 凭据前，不声称已完成 Meta 外部连接验收。
+- Page Insights 名称由设置页配置。Meta 会弃用或限制指标，系统只把 API 成功返回的数字（包括 0）保存为 `AVAILABLE/REAL`。
+
+## 尚未实现的真实连接
+
+- Instagram、TikTok、LinkedIn 真实账号、发布、结果查询、指标和评论接口。
+- Facebook 私信自动采集、自动回复、自动私信和自动报价。
 - Facebook 群组自动检索、入群或发帖；当前只能创建人工任务。
 - 紧急外部通知；未配置时只保存站内通知和任务，不声称已送达。
 - 图片生成、WordPress 草稿写入、对象存储；已有明确的受限适配器接口和配置状态。
@@ -73,9 +83,46 @@ pnpm demo:e2e
 - 网站与 WhatsApp 地址；至少一个紧急通知通道。
 - 决定使用的文本模型凭据；凭据只放服务器环境或密钥系统，数据库仅保存引用名。
 
-## 下一阶段首个真实连接
+## Facebook Page 服务器配置
 
-优先建立一个测试 Facebook Page，并用 Postiz API 作为候选适配器完成“小范围、人工批准、可查询结果”的沙盒验证。验收必须同时覆盖：账号能力探测、上传素材、创建帖子、超时后按本地幂等键/远端记录对账、拉取真实指标。通过后再扩展其他平台；Postiz 的 AGPL 部署义务需同时复核。
+在服务器 `.env` 中设置专用测试 Page，而不是吕总正式 Page：
+
+```powershell
+FACEBOOK_GRAPH_API_VERSION="v26.0"
+FACEBOOK_TEST_PAGE_ID="1234567890"
+FACEBOOK_TEST_PAGE_ACCESS_TOKEN="" # 只在服务器注入真实值，不提交 Git
+FACEBOOK_GRAPH_BASE_URL="https://graph.facebook.com"
+FACEBOOK_REQUEST_TIMEOUT_MS="30000"
+```
+
+登录设置页，选择 `facebook` 账号，保存 `Page ID` 与 `env:FACEBOOK_TEST_PAGE_ACCESS_TOKEN` 引用，然后点击“连接并验证 Page”。默认校验 `pages_manage_posts`、`pages_read_engagement`、`pages_read_user_content` 和 Page 的 `CREATE_CONTENT` 任务；指标和评论能力还分别显示 `ANALYZE`、`MODERATE` 的验证结果。
+
+只有客户模式为 `LIVE`、连接和令牌有效、当前内容版本已批准且产品资料版本未变化时，worker 才会调用 Graph API。请求超时或 5xx 无法确认结果时写入 `UNKNOWN`，禁止自动重发；有远端 ID 时可查询，没有远端 ID 时只能人工对账。
+
+## 专用测试 Page 真实验收
+
+真实发帖有显式保护，并固定使用独立数据库客户 `facebook-phase2-test`，不会使用演示客户或吕总客户：
+
+```powershell
+$env:FACEBOOK_LIVE_E2E_CONFIRM="YES_PUBLISH_TO_DEDICATED_TEST_PAGE"
+$env:FACEBOOK_LIVE_E2E_STAGE="publish"
+pnpm facebook:live:e2e
+```
+
+脚本创建并上传一张本地生成的测试 PNG，生成带 `[PHASE2 TEST]` 的草稿、人工批准记录、真实发布一次、重复排期校验、远端状态查询和帖子真实计数读取。成功后，在输出的测试帖下由人工评论：
+
+```text
+[PHASE2 TEST] Please send your wholesale catalog and MOQ.
+```
+
+再运行：
+
+```powershell
+$env:FACEBOOK_LIVE_E2E_STAGE="complete"
+pnpm facebook:live:e2e
+```
+
+第二步只读取公开评论，创建现有线索和人工任务，并把该测试任务记录为人工交接完成。系统没有自动回复、私信或报价路径。
 
 ## 常用验证命令
 
@@ -85,9 +132,10 @@ pnpm test
 pnpm build
 pnpm worker:once
 pnpm demo:e2e
+pnpm facebook:live:e2e # 仅在专用测试 Page + 显式确认后
 ```
 
-上传格式仅允许经文件签名字节识别的 PNG、JPEG、WebP、MP4 和 QuickTime；声明的浏览器 MIME 不作为信任依据。`JOB_LOCK_TIMEOUT_SECONDS` 应高于发布适配器自身 30 秒超时，本地默认 60 秒。
+上传格式仅允许经文件签名字节识别的 PNG、JPEG、WebP、MP4 和 QuickTime；声明的浏览器 MIME 不作为信任依据。Facebook LIVE 进一步限制为 PNG、JPEG、MP4 或 QuickTime 单文件。`JOB_LOCK_TIMEOUT_SECONDS` 应高于发布适配器自身 30 秒超时，本地默认 60 秒。
 
 ## 已执行验收（2026-09-16）
 
@@ -102,3 +150,5 @@ pnpm demo:e2e
 本次主机的 Docker Desktop daemon 因其用户目录内既有的损坏 reparse point 无法启动，因此 Compose 路径没有在本机完成运行验证；同一迁移、种子、测试、构建和 HTTP 验收均改用独立的 PostgreSQL 17.11 临时实例完成。该限制不影响已提交的 Compose 配置，但不能表述为“Compose 已验证”。
 
 详细上游核查见 [docs/upstream-audit.md](docs/upstream-audit.md)，架构决策见 [docs/decisions/0001-architecture.md](docs/decisions/0001-architecture.md)。
+
+第二阶段执行状态见 [docs/exec-plans/active/phase-2-facebook-page.md](docs/exec-plans/active/phase-2-facebook-page.md)，Facebook 边界决策见 [docs/decisions/0002-facebook-live-boundary.md](docs/decisions/0002-facebook-live-boundary.md)，Meta 接口依据见 [docs/facebook-graph-reference.md](docs/facebook-graph-reference.md)。

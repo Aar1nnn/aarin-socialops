@@ -12,6 +12,7 @@ import { AppError } from "../lib/errors";
 import { getTextGenerationAdapter } from "../lib/adapters/text-generation";
 import { sha256 } from "../lib/security";
 import { assertCanWrite, type RequestContext } from "../lib/context";
+import { releaseUsage, reserveUsage, settleUsage } from "./usage-service";
 
 const platforms = ["facebook", "instagram", "tiktok", "linkedin"] as const;
 const generateInputSchema = z.object({
@@ -61,28 +62,7 @@ export async function generateContentPlan(context: RequestContext, raw: unknown)
     .filter((field) => field.status !== "CONFIRMED" || !field.value)
     .map((field) => field.key);
   const configuredProvider = textIntegration?.provider === "openai-compatible" ? "openai-compatible" : "mock";
-  if (configuredProvider === "openai-compatible") {
-    const monthStart = new Date();
-    monthStart.setUTCDate(1);
-    monthStart.setUTCHours(0, 0, 0, 0);
-    const used = await db.usageLog.aggregate({
-      where: { clientId: context.clientId, createdAt: { gte: monthStart }, simulated: false },
-      _sum: { inputUnits: true, outputUnits: true },
-    });
-    const usedUnits = (used._sum.inputUnits ?? 0) + (used._sum.outputUnits ?? 0);
-    const reservedOutputUnits = Number(process.env.TEXT_MODEL_MAX_OUTPUT_UNITS || 2000);
-    if (usedUnits + reservedOutputUnits > client.usageMonthlyLimit) {
-      await ensureManualTask(
-        context.clientId,
-        null,
-        "文本模型月度使用量上限已触达",
-        "检查本月用量并由运营者决定是否调整客户上限。",
-      );
-      throw new AppError("本次真实模型调用会超过客户月度使用量上限。", 429, "USAGE_LIMIT_EXCEEDED");
-    }
-  }
-  const adapter = getTextGenerationAdapter(configuredProvider);
-  const generated = await adapter.generate({
+  const modelInput = {
     clientName: client.name,
     mode: client.mode,
     targetMarkets: client.targetMarkets,
@@ -95,7 +75,19 @@ export async function generateContentPlan(context: RequestContext, raw: unknown)
     missingFields,
     platforms: input.platforms,
     instruction: prompt.instruction,
-  });
+  };
+  const reservation = configuredProvider === "openai-compatible"
+    ? await reserveUsage({ clientId: context.clientId, capability: "multi_platform_content", provider: configuredProvider, units: Math.ceil(JSON.stringify(modelInput).length / 4) + Number(process.env.TEXT_MODEL_MAX_OUTPUT_UNITS || 2000) })
+    : null;
+  let generated;
+  try {
+    const adapter = getTextGenerationAdapter(configuredProvider);
+    generated = await adapter.generate(modelInput);
+    if (reservation) await settleUsage({ reservationId: reservation.id, clientId: context.clientId, model: generated.model, inputUnits: generated.usage.inputUnits, outputUnits: generated.usage.outputUnits });
+  } catch (error) {
+    if (reservation) await releaseUsage(reservation.id, context.clientId);
+    throw error;
+  }
   if (generated.output.drafts.length !== input.platforms.length) {
     throw new AppError("生成结果未覆盖全部平台。", 502, "INCOMPLETE_MODEL_OUTPUT");
   }
@@ -158,7 +150,7 @@ export async function generateContentPlan(context: RequestContext, raw: unknown)
       });
       items.push({ ...item, currentVersionId: version.id, currentVersion: version });
     }
-    await tx.usageLog.create({
+    if (!reservation) await tx.usageLog.create({
       data: {
         clientId: context.clientId,
         capability: "multi_platform_content",
@@ -360,21 +352,27 @@ export async function schedulePublication(context: RequestContext, contentItemId
     } },
   });
   const isDemo = client.mode === ClientMode.DEMO;
-  const readyForLive = item.account.publishCapability === CapabilityStatus.VERIFIED;
-  const status = isDemo
-    ? PublishJobStatus.PENDING
-    : readyForLive
-      ? PublishJobStatus.WAITING_CONFIGURATION
-      : PublishJobStatus.WAITING_CONFIGURATION;
+  const facebookConnection = item.account.facebookConnection;
+  const readyForLive = client.mode === ClientMode.LIVE
+    && item.platform === "facebook"
+    && item.account.publishCapability === CapabilityStatus.VERIFIED
+    && facebookConnection?.connectionStatus === CapabilityStatus.VERIFIED
+    && facebookConnection.tokenStatus === "VALID"
+    && item.account.externalAccountId === facebookConnection.pageId;
+  if (!isDemo && !readyForLive) {
+    await ensureManualTask(context.clientId, item.id, "Facebook Page 真实连接尚未验证", "在设置页配置服务器密钥引用，并完成 Page、权限和令牌验证。" );
+    throw new AppError("正式模式只允许已验证的 Facebook Page 进入真实发布队列。", 409, "LIVE_CONNECTION_REQUIRED");
+  }
+  const status = PublishJobStatus.PENDING;
   if (existing) {
     if (existing.status === PublishJobStatus.CANCELLED && existing.attemptCount === 0) {
       const revived = await db.publishJob.update({
         where: { id: existing.id },
-        data: { status, nextAttemptAt: scheduledAt || new Date(), lastErrorCode: null, lastErrorMessage: null },
+        data: { status, adapter: isDemo ? "mock-social" : "facebook-graph", simulated: isDemo, environment: isDemo ? "SIMULATED" : "LIVE", nextAttemptAt: scheduledAt || new Date(), lastErrorCode: null, lastErrorMessage: null },
       });
       await db.contentItem.update({
         where: { id: item.id },
-        data: { scheduledAt: scheduledAt || new Date(), status: isDemo ? ContentStatus.SCHEDULED : ContentStatus.WAITING_CONFIGURATION },
+        data: { scheduledAt: scheduledAt || new Date(), status: ContentStatus.SCHEDULED },
       });
       return revived;
     }
@@ -389,8 +387,9 @@ export async function schedulePublication(context: RequestContext, contentItemId
         accountId: item.accountId,
         idempotencyKey,
         status,
-        adapter: isDemo ? "mock-social" : "unconfigured",
+        adapter: isDemo ? "mock-social" : "facebook-graph",
         simulated: isDemo,
+        environment: isDemo ? "SIMULATED" : "LIVE",
         nextAttemptAt: scheduledAt || new Date(),
       },
     });
@@ -406,17 +405,9 @@ export async function schedulePublication(context: RequestContext, contentItemId
     where: { id: item.id },
     data: {
       scheduledAt: scheduledAt || new Date(),
-      status: isDemo ? ContentStatus.SCHEDULED : ContentStatus.WAITING_CONFIGURATION,
+      status: ContentStatus.SCHEDULED,
     },
   });
-  if (!isDemo) {
-    await ensureManualTask(
-      context.clientId,
-      item.id,
-      "正式发布适配器尚未验证",
-      "配置并验证真实发布连接；完成沙盒发布、结果查询和超时对账后再启用。",
-    );
-  }
   await db.auditLog.create({
     data: { clientId: context.clientId, userId: context.userId, action: "PUBLICATION_SCHEDULED", entityType: "PublishJob", entityId: job.id, metadata: { simulated: job.simulated } },
   });
@@ -498,7 +489,7 @@ async function getScopedItem(context: RequestContext, contentItemId: string) {
   const item = await db.contentItem.findFirst({
     where: { id: contentItemId, clientId: context.clientId },
     include: {
-      account: true,
+      account: { include: { facebookConnection: true } },
       plan: { include: { product: { include: { fields: true } } } },
       currentVersion: {
         include: { assetLinks: { include: { asset: { include: { productLinks: true } } } } },
