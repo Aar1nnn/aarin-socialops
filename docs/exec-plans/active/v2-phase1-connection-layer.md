@@ -38,8 +38,9 @@
 - [x] worker heartbeat、统一重试安全类别、UTC 排期与 IANA timezone 转换。
 - [x] Local/S3-compatible StorageAdapter、流式发布、ffprobe 媒体元数据。
 - [x] 必要连接 UI、CI workflow、三份 ADR、外部验收清单和 README。
-- [x] `pnpm db:generate`、Prisma schema validate、5 个 migration、双次幂等 seed、`pnpm typecheck`、11 个测试文件 79 项测试和 `pnpm build`。
+- [x] `pnpm db:generate`、Prisma schema validate、5 个 migration、双次幂等 seed、`pnpm typecheck`、12 个测试文件 82 项测试和 `pnpm build`。
 - [x] OAuth state、客户隔离、双 Facebook 账号目标、worker heartbeat、有限重试与 `UNKNOWN` 安全规则已在 PostgreSQL 集成测试中通过。
+- [x] 默认登录客户选择已改为 deterministic：`demo-furniture-export` 优先，其他 demo 和最终 fallback 均稳定排序，测试 fixture 不再依赖数据库返回顺序。
 - [x] GitHub Actions CI：Push CI 与 PR CI 均已在 GitHub 托管 runner 和 PostgreSQL service 上运行并通过；后续 push 继续以最新 run 为验收依据。
 - [ ] Meta 真实外部验收：没有专用 App credentials/测试 Page，状态为 `IMPLEMENTED_NOT_EXTERNALLY_VERIFIED`。
 - [ ] S3 真实外部验收：没有目标对象存储凭据，状态为 `IMPLEMENTED_NOT_EXTERNALLY_VERIFIED`。
