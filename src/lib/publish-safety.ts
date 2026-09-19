@@ -29,15 +29,19 @@ export function classifyPublishFailure(code: string, phase: PublishFailurePhase)
 }
 
 export function decidePublishRetry(input: {
-  phase: PublishFailurePhase;
+  phase?: PublishFailurePhase;
   category: PublishFailureCategory;
   attempt: number;
   maxAttempts: number;
   adapterRetryable?: boolean;
 }): RetryDecision {
-  if (input.phase === "PRE_DISPATCH" && input.category === "ADAPTER_UNAVAILABLE") return "WAITING_CONFIGURATION";
-  if (input.phase === "POST_DISPATCH" && ["NETWORK_POST_DISPATCH", "REMOTE_UNKNOWN", "SERVER_POST_DISPATCH"].includes(input.category)) return "UNKNOWN";
+  const phase = input.phase ?? "POST_DISPATCH";
+  if (phase === "POST_DISPATCH") {
+    if (["NETWORK_POST_DISPATCH", "REMOTE_UNKNOWN", "SERVER_POST_DISPATCH"].includes(input.category)) return "UNKNOWN";
+    return "FAILED";
+  }
+  if (input.category === "ADAPTER_UNAVAILABLE") return "WAITING_CONFIGURATION";
   if (["AUTH", "PERMISSION", "VALIDATION", "CONTENT_REJECTED", "MEDIA"].includes(input.category)) return "FAILED";
-  if (input.adapterRetryable === false || input.attempt >= input.maxAttempts) return "FAILED";
+  if (input.adapterRetryable !== true || input.attempt >= input.maxAttempts) return "FAILED";
   return "RETRY";
 }
