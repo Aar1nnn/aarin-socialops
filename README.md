@@ -68,7 +68,7 @@ pnpm demo:e2e
 
 ## 已实现但仍需专用测试 Page 做外部验收
 
-- Facebook Page 真实连接、发布、查询、帖子指标和公开评论读取代码已经实现；纯单元 stub 已通过，数据库集成测试代码已补齐但当前主机 PostgreSQL 不可用，尚未重新执行。在提供专用测试 Page 凭据前，不声称已完成 Meta 外部连接验收。
+- Facebook Page 真实连接、发布、查询、帖子指标和公开评论读取代码已经实现；本地纯单元与 PostgreSQL 集成测试已通过。在提供专用测试 Page 凭据前，不声称已完成 Meta 外部连接验收。
 - Page Insights 名称由设置页配置。Meta 会弃用或限制指标，系统只把 API 成功返回的数字（包括 0）保存为 `AVAILABLE/REAL`。
 
 ## 尚未实现的真实连接
@@ -182,6 +182,8 @@ pnpm facebook:live:e2e # 仅在专用测试 Page + 显式确认后
 
 `.github/workflows/ci.yml` 在 PR、`main` 和 `feat/**` push 上使用临时 PostgreSQL，依次执行迁移、typecheck、测试和 build。CI 只使用不可用于任何外部系统的测试占位值，不依赖仓库 Secret 才能验证本地边界。
 
+V2 Phase 1 本地验证（2026-09-20）：5 个 migration 在全新 PostgreSQL 17-alpine 数据库成功应用，seed 连续执行两次成功，`pnpm test` 的 10 个测试文件共 74 项通过，`pnpm typecheck` 与 `pnpm build` 通过。GitHub Actions 仍需在分支推送后单独确认，Meta 和 S3 外部边界仍未验证。
+
 ## V1 历史验收（2026-09-16）
 
 - PostgreSQL 17.11：三份迁移成功应用，种子连续执行两次无重复记录。
@@ -192,7 +194,7 @@ pnpm facebook:live:e2e # 仅在专用测试 Page + 显式确认后
 - production server：在 `http://localhost:3015` 实测登录页 200、登录后工作台 200，返回 CSP、`DENY` frame 和 `nosniff` 安全头。
 - `pnpm audit --prod`：npm 漏洞数据库返回无已知漏洞。
 
-以上是 V1 baseline 的历史结果，不代表当前 V2 分支已重新通过全部项目。当前主机的 Docker Desktop daemon 尚未启动，因此 V2 PostgreSQL 迁移和数据库集成测试仍需由 CI 或恢复后的本机数据库验证。
+以上是 V1 baseline 的历史结果；当前 V2 分支的本地迁移、测试、typecheck 与 build 结果见上一节。它们不代表 GitHub Actions、Meta 或 S3 外部验收已经通过。
 
 详细上游核查见 [docs/upstream-audit.md](docs/upstream-audit.md)，架构决策见 [docs/decisions/0001-architecture.md](docs/decisions/0001-architecture.md)。
 

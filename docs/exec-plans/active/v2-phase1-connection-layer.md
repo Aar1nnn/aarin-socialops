@@ -31,15 +31,15 @@
 - [x] V1 核心服务、数据库模型、worker、Facebook 适配器、路由和测试已审计。
 - [x] 当前分支文件已匿名化；baseline Git 历史仍含旧客户称呼，不重写历史以保留审计基线，仓库保持 Private。
 - [x] 基线 `pnpm typecheck` 通过。
-- [ ] 数据库集成测试：本机 Docker daemon 未运行，等待 CI 或恢复后的 PostgreSQL。
+- [x] Docker Desktop 与 PostgreSQL 17-alpine 已恢复；全新数据库健康检查通过。
 - [x] `PlatformConnection`、`OAuthState`、账号级加密 token 与向前 migration。
 - [x] Meta OAuth adapter、一次性 state、账号发现/选择、断开和不支持 refresh 的明确边界。
 - [x] account target、Adapter Registry、V1 fallback、远端查询/指标/评论复用。
 - [x] worker heartbeat、统一重试安全类别、UTC 排期与 IANA timezone 转换。
 - [x] Local/S3-compatible StorageAdapter、流式发布、ffprobe 媒体元数据。
 - [x] 必要连接 UI、CI workflow、三份 ADR、外部验收清单和 README。
-- [x] `pnpm db:generate`、Prisma schema validate、`pnpm typecheck`、29 项纯单元测试、`pnpm build`。
-- [ ] `pnpm db:migrate` 与数据库集成测试：受本机 PostgreSQL 不可用阻塞。
+- [x] `pnpm db:generate`、Prisma schema validate、5 个 migration、双次幂等 seed、`pnpm typecheck`、10 个测试文件 74 项测试、`pnpm build`。
+- [x] OAuth state、客户隔离、双 Facebook 账号目标、worker heartbeat、有限重试与 `UNKNOWN` 安全规则已在 PostgreSQL 集成测试中通过。
 - [ ] GitHub Actions CI：workflow 已实现，分支未获授权 push，因此尚无远端运行结果。
 - [ ] Meta 真实外部验收：没有专用 App credentials/测试 Page，状态为 `IMPLEMENTED_NOT_EXTERNALLY_VERIFIED`。
 
@@ -63,6 +63,6 @@ git diff --check
 ## 已知风险
 
 - baseline Git 历史含客户称呼。为保持 `v0.1-baseline` 可审计，本阶段不改写历史；仓库保持 Private。若未来公开，必须在明确授权下清洗历史并重新建立 tag。
-- 当前本机 Docker daemon 尚未就绪，数据库集成测试暂时无法执行。
+- 本地数据库验证已通过，但尚未在非本机的 PostgreSQL 环境执行兼容性验证。
 - Meta 官方文档直连受 429 限制；实现采用可配置 API 版本，并把真实平台行为列入外部验收。
 - S3-compatible 预签名实现已通过静态/单元边界检查，但没有目标对象存储凭据，尚未做外部兼容性验收。

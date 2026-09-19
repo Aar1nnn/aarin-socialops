@@ -14,4 +14,9 @@ describe("publish retry safety", () => {
   it("routes missing adapters to configuration instead of simulation", () => {
     expect(decidePublishRetry({ phase: "PRE_DISPATCH", category: "ADAPTER_UNAVAILABLE", attempt: 0, maxAttempts: 3 })).toBe("WAITING_CONFIGURATION");
   });
+
+  it("retries only an explicitly pre-dispatch server failure within the cap", () => {
+    expect(decidePublishRetry({ phase: "PRE_DISPATCH", category: "SERVER_PRE_DISPATCH", attempt: 1, maxAttempts: 3, adapterRetryable: true })).toBe("RETRY");
+    expect(decidePublishRetry({ phase: "PRE_DISPATCH", category: "SERVER_PRE_DISPATCH", attempt: 3, maxAttempts: 3, adapterRetryable: true })).toBe("FAILED");
+  });
 });

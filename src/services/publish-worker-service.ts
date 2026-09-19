@@ -173,7 +173,13 @@ export async function processPublishJob(jobId: string, injectedAdapter?: SocialP
   let createTaskReason: string | null = null;
   await db.$transaction(async (tx) => {
     const retryDecision = result.status === "failed"
-      ? decidePublishRetry({ phase: "POST_DISPATCH", category: classifyPublishFailure(result.code, "POST_DISPATCH"), attempt: attemptNumber, maxAttempts: job.maxAttempts, adapterRetryable: result.retryable })
+      ? decidePublishRetry({
+          phase: result.failurePhase ?? "POST_DISPATCH",
+          category: classifyPublishFailure(result.code, result.failurePhase ?? "POST_DISPATCH"),
+          attempt: attemptNumber,
+          maxAttempts: job.maxAttempts,
+          adapterRetryable: result.retryable,
+        })
       : null;
     const finalStatus = result.status === "published"
       ? PublishJobStatus.PUBLISHED
