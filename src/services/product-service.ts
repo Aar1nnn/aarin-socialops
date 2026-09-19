@@ -2,8 +2,9 @@ import { AssetKind, ContentStatus, FactStatus, Prisma, PublishJobStatus } from "
 import { db } from "../lib/db";
 import { AppError } from "../lib/errors";
 import { createProductSchema } from "../lib/contracts";
-import { storeLocalAsset } from "../lib/adapters/storage";
+import { getStorageAdapter, storeAsset } from "../lib/adapters/storage";
 import { assertCanWrite, type RequestContext } from "../lib/context";
+import { inspectVideo } from "../lib/media-inspector";
 
 export async function createProduct(context: RequestContext, raw: unknown) {
   assertCanWrite(context);
@@ -49,7 +50,7 @@ export async function uploadAsset(
     ? await db.product.findFirst({ where: { id: input.productId, clientId: context.clientId } })
     : null;
   if (input.productId && !product) throw new AppError("产品不存在或无权访问。", 404, "PRODUCT_NOT_FOUND");
-  const stored = await storeLocalAsset(context.clientId, input.file);
+  const stored = await storeAsset(context.clientId, input.file);
   const kind = stored.mimeType.startsWith("image/")
     ? AssetKind.IMAGE
     : stored.mimeType.startsWith("video/")
@@ -58,6 +59,9 @@ export async function uploadAsset(
   if (kind === AssetKind.DOCUMENT) {
     throw new AppError("第一阶段只接受图片和已剪辑视频。", 400, "UNSUPPORTED_ASSET_TYPE");
   }
+  const inspection = kind === AssetKind.VIDEO
+    ? await inspectVideo(stored.storageProvider, stored.storageKey)
+    : { status: "AVAILABLE", source: "magic-bytes" };
   try {
     return await db.asset.create({
       data: {
@@ -65,6 +69,7 @@ export async function uploadAsset(
         kind,
         originalName: input.file.name,
         ...stored,
+        metadata: { inspection },
         productLinks: product
           ? { create: { clientId: context.clientId, productId: product.id } }
           : undefined,
@@ -72,6 +77,7 @@ export async function uploadAsset(
       include: { productLinks: true },
     });
   } catch (error) {
+    await getStorageAdapter(stored.storageProvider).delete(stored.storageKey).catch(() => undefined);
     if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === "P2002") {
       throw new AppError("同一素材已上传。", 409, "DUPLICATE_ASSET");
     }

@@ -34,6 +34,7 @@ export type PublishRequest = {
   accountExternalId: string | null;
   text: string;
   assets: Array<{
+    storageProvider?: string;
     storageKey: string;
     mimeType: string;
     originalName: string;
