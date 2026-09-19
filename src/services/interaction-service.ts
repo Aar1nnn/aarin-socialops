@@ -103,7 +103,7 @@ async function createLeadBundle(
   classification: ReturnType<typeof classifyIntent>,
 ) {
   const lead = await tx.lead.create({ data: { clientId, interactionId: interaction.id, category: classification.category, priority: classification.priority, rationale: classification.rationale, verificationNeeded: "跨平台身份未经验证；不得按相似用户名自动合并。" } });
-  await tx.manualTask.create({ data: { clientId, leadId: lead.id, triggerReason: "发现明确采购相关意向", priority: classification.priority === "HIGH" || classification.priority === "URGENT" ? "URGENT" : "HIGH", suggestedDueAt: new Date(Date.now() + 4 * 60 * 60 * 1000), sourceMaterial: { originalText: interaction.body, platform: interaction.platform, sourceUrl: interaction.sourceUrl, authorHandle: interaction.authorHandle }, requiredAction: "人工核实意向、准备回复，并按需转交吕总；系统不会自动发送任何回复。", completionCriteria: "线索状态记录为已回复、已转交、等待反馈或已关闭。", continuationStep: "结合销售反馈更新线索状态并纳入复盘。" } });
+  await tx.manualTask.create({ data: { clientId, leadId: lead.id, triggerReason: "发现明确采购相关意向", priority: classification.priority === "HIGH" || classification.priority === "URGENT" ? "URGENT" : "HIGH", suggestedDueAt: new Date(Date.now() + 4 * 60 * 60 * 1000), sourceMaterial: { originalText: interaction.body, platform: interaction.platform, sourceUrl: interaction.sourceUrl, authorHandle: interaction.authorHandle }, requiredAction: "人工核实意向、准备回复，并按需转交客户负责人；系统不会自动发送任何回复。", completionCriteria: "线索状态记录为已回复、已转交、等待反馈或已关闭。", continuationStep: "结合销售反馈更新线索状态并纳入复盘。" } });
   await tx.inAppNotification.create({ data: { clientId, severity: "URGENT", title: "发现重要采购意向", body: `${classification.rationale}：${interaction.body.slice(0, 160)}`, relatedType: "Lead", relatedId: lead.id } });
   return lead;
 }
