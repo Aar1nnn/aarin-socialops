@@ -1,6 +1,7 @@
 import { OperatorShell } from "@/components/operator-shell";
 import { requirePageContext } from "@/lib/auth";
 import { db } from "@/lib/db";
+import Link from "next/link";
 
 const facebookAdvice: Record<string, string> = {
   TOKEN_INVALID: "更新服务器中的 Page token 环境变量，然后重新验证。",
@@ -42,7 +43,7 @@ export default async function SettingsPage() {
           <button disabled={context.role !== "OWNER"}>保存设置</button>
         </form></section>
         <section className="card span-5"><h2>使用量</h2><div className="metric">{(usage._sum.inputUnits || 0) + (usage._sum.outputUnits || 0)}</div><p className="muted">输入与输出单位合计；上限 {client.usageMonthlyLimit}。真实调用会先事务性预占，成功结算，失败释放。</p><div className="warning">切换到正式模式不会绕过适配器验证。只有已验证 Facebook Page 可进入 LIVE 队列。</div></section>
-        <section className="card span-12"><h2>Facebook Page 真实连接</h2>{facebookAccount ? <div className="grid">
+        <section className="card span-12"><h2>Facebook Page 手工连接（V1 fallback）</h2><p className="muted">新连接请优先使用 <Link href="/connections">平台连接</Link> 的 Meta OAuth。此处只保留迁移兼容和专用测试 Page 的环境变量引用方式。</p>{facebookAccount ? <div className="grid">
           <form action="/api/facebook/connection" method="post" className="stack span-7">
             <input type="hidden" name="accountId" value={facebookAccount.id} />
             <div className="row"><label>Page ID<input name="pageId" required defaultValue={facebook?.pageId || ""} placeholder="仅数字" /></label><label>Graph API 版本<input name="graphApiVersion" required defaultValue={facebook?.graphApiVersion || process.env.FACEBOOK_GRAPH_API_VERSION || "v26.0"} /></label></div>

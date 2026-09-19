@@ -12,28 +12,24 @@ const platforms = ["facebook", "instagram", "tiktok", "linkedin"] as const;
 
 async function seedClientBasics(clientId: string, demo: boolean) {
   for (const platform of platforms) {
-    await prisma.socialAccount.upsert({
-      where: {
-        clientId_platform_displayName: {
+    const displayName = demo ? `[演示] ${platform}` : `[待建立] ${platform}`;
+    const existingAccount = await prisma.socialAccount.findFirst({ where: { clientId, platform, displayName } });
+    if (!existingAccount) {
+      await prisma.socialAccount.create({
+        data: {
           clientId,
           platform,
-          displayName: demo ? `[演示] ${platform}` : `[待建立] ${platform}`,
+          displayName,
+          credentialRef: demo ? `mock://${platform}` : null,
+          publishCapability: demo ? CapabilityStatus.VERIFIED : CapabilityStatus.UNCONFIGURED,
+          metricsCapability: demo ? CapabilityStatus.VERIFIED : CapabilityStatus.UNCONFIGURED,
+          commentsCapability: demo ? CapabilityStatus.VERIFIED : CapabilityStatus.UNCONFIGURED,
+          messagesCapability: CapabilityStatus.UNSUPPORTED,
+          groupsCapability: CapabilityStatus.UNSUPPORTED,
+          verifiedAt: demo ? new Date() : null,
         },
-      },
-      update: {},
-      create: {
-        clientId,
-        platform,
-        displayName: demo ? `[演示] ${platform}` : `[待建立] ${platform}`,
-        credentialRef: demo ? `mock://${platform}` : null,
-        publishCapability: demo ? CapabilityStatus.VERIFIED : CapabilityStatus.UNCONFIGURED,
-        metricsCapability: demo ? CapabilityStatus.VERIFIED : CapabilityStatus.UNCONFIGURED,
-        commentsCapability: demo ? CapabilityStatus.VERIFIED : CapabilityStatus.UNCONFIGURED,
-        messagesCapability: CapabilityStatus.UNSUPPORTED,
-        groupsCapability: CapabilityStatus.UNSUPPORTED,
-        verifiedAt: demo ? new Date() : null,
-      },
-    });
+      });
+    }
     await prisma.platformPolicy.upsert({
       where: { clientId_platform: { clientId, platform } },
       update: {},
@@ -139,23 +135,30 @@ async function main() {
       productFocus: "仅用于演示的常规家具产品",
     },
   });
-  const lv = await prisma.client.upsert({
-    where: { slug: "foshan-lv-furniture" },
-    update: {},
-    create: {
-      slug: "foshan-lv-furniture",
-      name: "吕总｜佛山家居企业（待配置）",
-      mode: ClientMode.DRAFT,
-      isDemo: false,
-      configurationStatus: "PENDING_PRODUCT_MARKET_ACCOUNTS",
-      targetMarkets: [],
-      productFocus: "常规产品；具体主推产品待确认",
-      brandGuidelines: null,
-    },
+  const existingLiveClient = await prisma.client.findFirst({
+    where: { isDemo: false },
+    orderBy: { createdAt: "asc" },
   });
+  const liveClient = existingLiveClient
+    ? await prisma.client.update({
+        where: { id: existingLiveClient.id },
+        data: { slug: "live-client-a", name: "正式客户 A（待配置）" },
+      })
+    : await prisma.client.create({
+        data: {
+          slug: "live-client-a",
+          name: "正式客户 A（待配置）",
+          mode: ClientMode.DRAFT,
+          isDemo: false,
+          configurationStatus: "PENDING_PRODUCT_MARKET_ACCOUNTS",
+          targetMarkets: [],
+          productFocus: "常规产品；具体主推产品待确认",
+          brandGuidelines: null,
+        },
+      });
 
   await seedClientBasics(demo.id, true);
-  await seedClientBasics(lv.id, false);
+  await seedClientBasics(liveClient.id, false);
 
   const demoProduct = await prisma.product.upsert({
     where: { id: "demo-chair-product" },
@@ -183,13 +186,16 @@ async function main() {
         key,
         value,
         status: key === "dimensions" ? FactStatus.MISSING : FactStatus.CONFIRMED,
-        source: "演示种子数据，不属于吕总产品库",
+        source: "演示种子数据，不属于正式客户产品库",
       },
     });
   }
 
   const operatorEmail = process.env.SEED_OPERATOR_EMAIL || "operator@example.local";
   const operatorPassword = process.env.SEED_OPERATOR_PASSWORD || "change-this-local-password";
+  if (process.env.NODE_ENV === "production" && (!process.env.SEED_OPERATOR_PASSWORD || operatorPassword === "change-this-local-password")) {
+    throw new Error("生产环境拒绝使用默认 seed 密码；请显式配置 SEED_OPERATOR_PASSWORD。");
+  }
   const operator = await prisma.user.upsert({
     where: { email: operatorEmail },
     update: {},
@@ -199,7 +205,7 @@ async function main() {
       passwordHash: await hashPassword(operatorPassword),
     },
   });
-  for (const clientId of [demo.id, lv.id]) {
+  for (const clientId of [demo.id, liveClient.id]) {
     await prisma.clientMembership.upsert({
       where: { userId_clientId: { userId: operator.id, clientId } },
       update: {},
@@ -207,21 +213,21 @@ async function main() {
     });
   }
 
-  const taskCount = await prisma.manualTask.count({ where: { clientId: lv.id } });
+  const taskCount = await prisma.manualTask.count({ where: { clientId: liveClient.id } });
   if (taskCount === 0) {
     await prisma.manualTask.createMany({
       data: [
         {
-          clientId: lv.id,
+          clientId: liveClient.id,
           triggerReason: "主推产品与产品资料尚未确认",
           priority: "HIGH",
           sourceMaterial: { known: ["推广常规产品", "客户类型为经销商和批发商"] },
-          requiredAction: "向吕总收集主推产品、型号、材质、尺寸、供货范围及对应素材。",
+          requiredAction: "向客户负责人收集主推产品、型号、材质、尺寸、供货范围及对应素材。",
           completionCriteria: "至少一个产品的关键字段有来源并被标为已确认。",
           continuationStep: "生成首轮四平台通用或目标市场内容计划。",
         },
         {
-          clientId: lv.id,
+          clientId: liveClient.id,
           triggerReason: "目标国家和品牌表达规范尚未确认",
           priority: "NORMAL",
           sourceMaterial: { warning: "不得以既有案例推断目标市场" },
@@ -230,7 +236,7 @@ async function main() {
           continuationStep: "将通用草稿升级为目标市场版本并重新审核。",
         },
         {
-          clientId: lv.id,
+          clientId: liveClient.id,
           triggerReason: "四个平台账号、通知渠道及凭据未建立或未验证",
           priority: "HIGH",
           sourceMaterial: { platforms },

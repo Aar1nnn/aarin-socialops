@@ -85,6 +85,24 @@ enum PublishEnvironment {
   LIVE
 }
 
+enum Provider {
+  META
+  LINKEDIN
+  TIKTOK
+  GOOGLE
+}
+
+enum PlatformConnectionStatus {
+  CONNECTING
+  CONNECTED
+  TOKEN_EXPIRING
+  TOKEN_EXPIRED
+  PERMISSION_MISSING
+  REVIEW_REQUIRED
+  DISCONNECTED
+  ERROR
+}
+
 enum FacebookTokenStatus {
   UNCONFIGURED
   UNVERIFIED
@@ -172,16 +190,18 @@ enum IntegrationType {
 }
 
 model User {
-  id           String             @id @default(cuid())
-  email        String             @unique
-  passwordHash String
-  displayName  String
-  createdAt    DateTime           @default(now())
-  updatedAt    DateTime           @updatedAt
-  memberships  ClientMembership[]
-  sessions     Session[]
-  approvals    Approval[]
-  auditLogs    AuditLog[]
+  id                  String               @id @default(cuid())
+  email               String               @unique
+  passwordHash        String
+  displayName         String
+  createdAt           DateTime             @default(now())
+  updatedAt           DateTime             @updatedAt
+  memberships         ClientMembership[]
+  sessions            Session[]
+  approvals           Approval[]
+  auditLogs           AuditLog[]
+  platformConnections PlatformConnection[]
+  oauthStates         OAuthState[]
 }
 
 model Session {
@@ -240,6 +260,8 @@ model Client {
   researchRecords      ResearchRecord[]
   facebookConnections  FacebookPageConnection[]
   usageReservations    UsageReservation[]
+  platformConnections  PlatformConnection[]
+  oauthStates          OAuthState[]
 }
 
 model ResearchRecord {
@@ -343,30 +365,96 @@ model ProductAsset {
 }
 
 model SocialAccount {
-  id                 String                  @id @default(cuid())
-  clientId           String
-  platform           String
-  displayName        String
-  externalAccountId  String?
-  credentialRef      String?
-  publishCapability  CapabilityStatus        @default(UNCONFIGURED)
-  metricsCapability  CapabilityStatus        @default(UNCONFIGURED)
-  commentsCapability CapabilityStatus        @default(UNCONFIGURED)
-  messagesCapability CapabilityStatus        @default(UNCONFIGURED)
-  groupsCapability   CapabilityStatus        @default(UNCONFIGURED)
-  verifiedAt         DateTime?
-  createdAt          DateTime                @default(now())
-  updatedAt          DateTime                @updatedAt
-  client             Client                  @relation(fields: [clientId], references: [id], onDelete: Cascade)
-  contentItems       ContentItem[]
-  approvals          Approval[]
-  publishJobs        PublishJob[]
-  metricSnapshots    MetricSnapshot[]
-  interactions       Interaction[]
-  facebookConnection FacebookPageConnection?
+  id                    String                  @id @default(cuid())
+  clientId              String
+  platform              String
+  displayName           String
+  externalAccountId     String?
+  credentialRef         String?
+  platformConnectionId  String?
+  accountType           String?
+  username              String?
+  metadata              Json?
+  providerCapabilities  Json?
+  isSelected            Boolean                 @default(true)
+  accessTokenCiphertext String?
+  accessTokenIv         String?
+  accessTokenAuthTag    String?
+  accessTokenExpiresAt  DateTime?
+  publishCapability     CapabilityStatus        @default(UNCONFIGURED)
+  metricsCapability     CapabilityStatus        @default(UNCONFIGURED)
+  commentsCapability    CapabilityStatus        @default(UNCONFIGURED)
+  messagesCapability    CapabilityStatus        @default(UNCONFIGURED)
+  groupsCapability      CapabilityStatus        @default(UNCONFIGURED)
+  verifiedAt            DateTime?
+  createdAt             DateTime                @default(now())
+  updatedAt             DateTime                @updatedAt
+  client                Client                  @relation(fields: [clientId], references: [id], onDelete: Cascade)
+  contentItems          ContentItem[]
+  approvals             Approval[]
+  publishJobs           PublishJob[]
+  metricSnapshots       MetricSnapshot[]
+  interactions          Interaction[]
+  facebookConnection    FacebookPageConnection?
+  platformConnection    PlatformConnection?     @relation(fields: [platformConnectionId, clientId], references: [id, clientId], onDelete: Restrict)
 
-  @@unique([clientId, platform, displayName])
+  @@unique([clientId, platform, externalAccountId])
+  @@unique([id, clientId])
   @@index([clientId, platform])
+  @@index([platformConnectionId])
+}
+
+model PlatformConnection {
+  id                     String                   @id @default(cuid())
+  clientId               String
+  provider               Provider
+  externalPrincipalId    String?
+  accessTokenCiphertext  String?
+  accessTokenIv          String?
+  accessTokenAuthTag     String?
+  refreshTokenCiphertext String?
+  refreshTokenIv         String?
+  refreshTokenAuthTag    String?
+  tokenKeyVersion        String                   @default("v1")
+  accessTokenExpiresAt   DateTime?
+  refreshTokenExpiresAt  DateTime?
+  scopes                 String[]                 @default([])
+  status                 PlatformConnectionStatus @default(CONNECTING)
+  connectedByUserId      String
+  connectedAt            DateTime?
+  lastRefreshedAt        DateTime?
+  lastErrorCode          String?
+  lastErrorMessage       String?
+  createdAt              DateTime                 @default(now())
+  updatedAt              DateTime                 @updatedAt
+  client                 Client                   @relation(fields: [clientId], references: [id], onDelete: Cascade)
+  connectedBy            User                     @relation(fields: [connectedByUserId], references: [id], onDelete: Restrict)
+  accounts               SocialAccount[]
+
+  @@unique([id, clientId])
+  @@unique([clientId, provider, externalPrincipalId])
+  @@index([clientId, provider, status])
+}
+
+model OAuthState {
+  id                     String    @id @default(cuid())
+  stateHash              String    @unique
+  provider               Provider
+  clientId               String
+  userId                 String
+  redirectUri            String
+  returnTo               String?
+  codeVerifierCiphertext String?
+  codeVerifierIv         String?
+  codeVerifierAuthTag    String?
+  expiresAt              DateTime
+  consumedAt             DateTime?
+  createdAt              DateTime  @default(now())
+  client                 Client    @relation(fields: [clientId], references: [id], onDelete: Cascade)
+  user                   User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([clientId, provider, expiresAt])
+  @@index([userId, expiresAt])
 }
 
 model PlatformPolicy {
@@ -502,6 +590,8 @@ model PublishJob {
   clientId         String
   contentVersionId String
   accountId        String
+  provider         Provider?
+  platform         String?
   status           PublishJobStatus   @default(PENDING)
   idempotencyKey   String             @unique
   adapter          String
