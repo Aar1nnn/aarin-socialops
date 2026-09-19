@@ -17,3 +17,34 @@ prisma/*.db
 prisma/*.db-journal
 .DS_Store
 Thumbs.db
+
+# Local secrets and environment overrides
+.env.*
+!.env.example
+
+# Build output
+dist/
+build/
+
+# Private keys and certificates
+*.pem
+*.key
+*.p12
+*.pfx
+
+# Runtime uploads and temporary data
+uploads/
+tmp/
+temp/
+
+# Local databases
+*.db
+*.db-journal
+*.sqlite
+*.sqlite3
+
+# Local service volumes and caches
+postgres-data/
+pgdata/
+redis-data/
+.cache/
