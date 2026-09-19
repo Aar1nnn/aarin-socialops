@@ -1,5 +1,6 @@
 import { db } from "./lib/db";
 import { claimNextJob, processPublishJob, recoverStaleJobs } from "./services/publish-worker-service";
+import { safeErrorMessage } from "./lib/token-vault";
 
 const once = process.argv.includes("--once");
 const workerId = process.env.WORKER_ID || `worker-${process.pid}`;
@@ -26,7 +27,7 @@ async function main() {
 
 main()
   .catch((error) => {
-    console.error("worker failed", error instanceof Error ? error.message : error);
+    console.error("worker failed", safeErrorMessage(error));
     process.exitCode = 1;
   })
   .finally(async () => {

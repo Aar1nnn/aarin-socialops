@@ -11,6 +11,7 @@ import { db } from "../lib/db";
 import { AppError } from "../lib/errors";
 import { getTextGenerationAdapter } from "../lib/adapters/text-generation";
 import { sha256 } from "../lib/security";
+import { zonedLocalDateTimeToUtc } from "../lib/timezone";
 import { assertCanWrite, type RequestContext } from "../lib/context";
 import { releaseUsage, reserveUsage, settleUsage } from "./usage-service";
 
@@ -19,14 +20,18 @@ const generateInputSchema = z.object({
   productId: z.string().min(1),
   theme: z.string().min(1),
   objective: z.string().min(1),
-  platforms: z.array(z.enum(platforms)).min(1),
+  accountIds: z.array(z.string().min(1)).optional(),
+  platforms: z.array(z.enum(platforms)).optional(),
   assetIds: z.array(z.string()).default([]),
   plannedAt: z.coerce.date().optional(),
+}).refine((value) => Boolean(value.accountIds?.length || value.platforms?.length), {
+  message: "至少选择一个具体账号。",
 });
 
 export async function generateContentPlan(context: RequestContext, raw: unknown) {
   assertCanWrite(context);
   const input = generateInputSchema.parse(raw);
+  const requestedAccountIds = input.accountIds ? [...new Set(input.accountIds)] : undefined;
   const product = await db.product.findFirst({
     where: { id: input.productId, clientId: context.clientId },
     include: { fields: true, assetLinks: true },
@@ -40,10 +45,12 @@ export async function generateContentPlan(context: RequestContext, raw: unknown)
   if (accessibleAssets.length !== new Set(assetIds).size) {
     throw new AppError("包含不存在或其他客户的素材。", 403, "ASSET_SCOPE_VIOLATION");
   }
-  const [client, accounts, prompt, textIntegration] = await Promise.all([
+  const [client, candidateAccounts, prompt, textIntegration] = await Promise.all([
     db.client.findUniqueOrThrow({ where: { id: context.clientId } }),
     db.socialAccount.findMany({
-      where: { clientId: context.clientId, platform: { in: input.platforms } },
+      where: requestedAccountIds?.length
+        ? { clientId: context.clientId, id: { in: requestedAccountIds } }
+        : { clientId: context.clientId, platform: { in: input.platforms } },
     }),
     db.promptVersion.findFirst({
       where: { clientId: context.clientId, capability: "multi_platform_content", active: true },
@@ -54,6 +61,30 @@ export async function generateContentPlan(context: RequestContext, raw: unknown)
       orderBy: { verifiedAt: "desc" },
     }),
   ]);
+  let accounts = candidateAccounts;
+  if (requestedAccountIds?.length) {
+    if (accounts.length !== requestedAccountIds.length) {
+      throw new AppError("包含不存在或其他客户的目标账号。", 403, "ACCOUNT_SCOPE_VIOLATION");
+    }
+    const accountById = new Map(accounts.map((account) => [account.id, account]));
+    accounts = requestedAccountIds.map((id) => accountById.get(id)!);
+    if (accounts.some((account) => !account.isSelected)) {
+      throw new AppError("目标账号尚未由运营者选择启用。", 409, "ACCOUNT_NOT_SELECTED");
+    }
+  } else {
+    accounts = (input.platforms || []).map((platform) => {
+      const matches = candidateAccounts.filter((account) => account.platform === platform && account.isSelected);
+      if (matches.length !== 1) {
+        throw new AppError(`平台 ${platform} 必须明确选择一个账号，当前可用 ${matches.length} 个。`, 409, "ACCOUNT_TARGET_AMBIGUOUS");
+      }
+      return matches[0];
+    });
+  }
+  const platformValues = [...new Set(accounts.map((account) => account.platform))];
+  if (platformValues.some((platform) => !platforms.includes(platform as (typeof platforms)[number]))) {
+    throw new AppError("目标账号的平台尚不支持内容生成。", 409, "PLATFORM_NOT_SUPPORTED");
+  }
+  const targetPlatforms = platformValues as Array<(typeof platforms)[number]>;
   if (!prompt) throw new AppError("内容生成 prompt 未配置。", 500, "PROMPT_NOT_CONFIGURED");
   const confirmedFacts = product.fields
     .filter((field) => field.status === "CONFIRMED" && field.value)
@@ -73,7 +104,7 @@ export async function generateContentPlan(context: RequestContext, raw: unknown)
     theme: input.theme,
     confirmedFacts,
     missingFields,
-    platforms: input.platforms,
+    platforms: targetPlatforms,
     instruction: prompt.instruction,
   };
   const reservation = configuredProvider === "openai-compatible"
@@ -88,7 +119,7 @@ export async function generateContentPlan(context: RequestContext, raw: unknown)
     if (reservation) await releaseUsage(reservation.id, context.clientId);
     throw error;
   }
-  if (generated.output.drafts.length !== input.platforms.length) {
+  if (generated.output.drafts.length !== targetPlatforms.length) {
     throw new AppError("生成结果未覆盖全部平台。", 502, "INCOMPLETE_MODEL_OUTPUT");
   }
 
@@ -99,7 +130,7 @@ export async function generateContentPlan(context: RequestContext, raw: unknown)
         productId: product.id,
         theme: input.theme,
         objective: input.objective,
-        channels: input.platforms,
+        channels: targetPlatforms,
         assetNeeds: assetIds.length ? null : "尚未关联素材",
         plannedAt: input.plannedAt,
         marketScope: client.targetMarkets.length ? client.targetMarkets.join(", ") : null,
@@ -107,9 +138,9 @@ export async function generateContentPlan(context: RequestContext, raw: unknown)
       },
     });
     const items = [];
-    for (const draft of generated.output.drafts) {
-      const account = accounts.find((candidate) => candidate.platform === draft.platform);
-      if (!account) throw new AppError(`平台账号配置缺失：${draft.platform}`, 409, "ACCOUNT_NOT_CONFIGURED");
+    for (const account of accounts) {
+      const draft = generated.output.drafts.find((candidate) => candidate.platform === account.platform);
+      if (!draft) throw new AppError(`平台生成结果缺失：${account.platform}`, 502, "INCOMPLETE_MODEL_OUTPUT");
       const item = await tx.contentItem.create({
         data: {
           clientId: context.clientId,
@@ -168,7 +199,7 @@ export async function generateContentPlan(context: RequestContext, raw: unknown)
         action: "CONTENT_PLAN_GENERATED",
         entityType: "ContentPlan",
         entityId: plan.id,
-        metadata: { simulated: generated.simulated, platforms: input.platforms },
+        metadata: { simulated: generated.simulated, platforms: targetPlatforms, accountIds: accounts.map((account) => account.id) },
       },
     });
     return { plan, items };
@@ -319,7 +350,13 @@ export async function reviewContent(
   });
 }
 
-export async function schedulePublication(context: RequestContext, contentItemId: string, scheduledAt?: Date) {
+type SchedulePublicationInput = Date | {
+  publishMode: "NOW" | "SCHEDULED";
+  localDateTime?: string;
+  timezone?: string;
+};
+
+export async function schedulePublication(context: RequestContext, contentItemId: string, scheduleInput?: SchedulePublicationInput) {
   assertCanWrite(context);
   const item = await getScopedItem(context, contentItemId);
   if (!item.currentVersion) throw new AppError("内容版本缺失。", 409, "VERSION_MISSING");
@@ -339,6 +376,7 @@ export async function schedulePublication(context: RequestContext, contentItemId
     throw new AppError("当前平台、账号和内容版本没有有效批准。", 409, "APPROVAL_REQUIRED");
   }
   const client = await db.client.findUniqueOrThrow({ where: { id: context.clientId } });
+  const scheduledAt = resolveScheduledAt(scheduleInput, client.timezone);
   if (client.mode === ClientMode.DRAFT) {
     await ensureManualTask(context.clientId, item.id, "草稿模式禁止对外发布", "切换正式模式前验证发布适配器与账号能力。" );
     throw new AppError("草稿模式只能生成和审核内容，不能发布。", 409, "DRAFT_MODE_PUBLISH_BLOCKED");
@@ -353,12 +391,20 @@ export async function schedulePublication(context: RequestContext, contentItemId
   });
   const isDemo = client.mode === ClientMode.DEMO;
   const facebookConnection = item.account.facebookConnection;
+  const platformConnection = item.account.platformConnection;
+  const readyWithOAuth = client.mode === ClientMode.LIVE
+    && item.platform === "facebook"
+    && item.account.isSelected
+    && item.account.publishCapability === CapabilityStatus.VERIFIED
+    && platformConnection?.provider === "META"
+    && platformConnection.status === "CONNECTED"
+    && Boolean(item.account.accessTokenCiphertext && item.account.accessTokenIv && item.account.accessTokenAuthTag);
   const readyForLive = client.mode === ClientMode.LIVE
     && item.platform === "facebook"
     && item.account.publishCapability === CapabilityStatus.VERIFIED
-    && facebookConnection?.connectionStatus === CapabilityStatus.VERIFIED
-    && facebookConnection.tokenStatus === "VALID"
-    && item.account.externalAccountId === facebookConnection.pageId;
+    && (readyWithOAuth || (facebookConnection?.connectionStatus === CapabilityStatus.VERIFIED
+      && facebookConnection.tokenStatus === "VALID"
+      && item.account.externalAccountId === facebookConnection.pageId));
   if (!isDemo && !readyForLive) {
     await ensureManualTask(context.clientId, item.id, "Facebook Page 真实连接尚未验证", "在设置页配置服务器密钥引用，并完成 Page、权限和令牌验证。" );
     throw new AppError("正式模式只允许已验证的 Facebook Page 进入真实发布队列。", 409, "LIVE_CONNECTION_REQUIRED");
@@ -368,7 +414,7 @@ export async function schedulePublication(context: RequestContext, contentItemId
     if (existing.status === PublishJobStatus.CANCELLED && existing.attemptCount === 0) {
       const revived = await db.publishJob.update({
         where: { id: existing.id },
-        data: { status, adapter: isDemo ? "mock-social" : "facebook-graph", simulated: isDemo, environment: isDemo ? "SIMULATED" : "LIVE", nextAttemptAt: scheduledAt || new Date(), lastErrorCode: null, lastErrorMessage: null },
+        data: { status, provider: providerForPlatform(item.platform), platform: item.platform, adapter: isDemo ? "mock-social" : readyWithOAuth ? "meta-facebook" : "facebook-graph", simulated: isDemo, environment: isDemo ? "SIMULATED" : "LIVE", nextAttemptAt: scheduledAt || new Date(), lastErrorCode: null, lastErrorMessage: null },
       });
       await db.contentItem.update({
         where: { id: item.id },
@@ -385,9 +431,11 @@ export async function schedulePublication(context: RequestContext, contentItemId
         clientId: context.clientId,
         contentVersionId: item.currentVersion.id,
         accountId: item.accountId,
+        provider: providerForPlatform(item.platform),
+        platform: item.platform,
         idempotencyKey,
         status,
-        adapter: isDemo ? "mock-social" : "facebook-graph",
+        adapter: isDemo ? "mock-social" : readyWithOAuth ? "meta-facebook" : "facebook-graph",
         simulated: isDemo,
         environment: isDemo ? "SIMULATED" : "LIVE",
         nextAttemptAt: scheduledAt || new Date(),
@@ -412,6 +460,21 @@ export async function schedulePublication(context: RequestContext, contentItemId
     data: { clientId: context.clientId, userId: context.userId, action: "PUBLICATION_SCHEDULED", entityType: "PublishJob", entityId: job.id, metadata: { simulated: job.simulated } },
   });
   return job;
+}
+
+function resolveScheduledAt(input: SchedulePublicationInput | undefined, clientTimezone: string) {
+  if (input instanceof Date) {
+    if (Number.isNaN(input.getTime())) throw new AppError("排期时间无效。", 400, "INVALID_SCHEDULE_TIME");
+    return input;
+  }
+  if (!input || input.publishMode === "NOW") return new Date();
+  if (input.timezone && input.timezone !== clientTimezone) {
+    throw new AppError("排期时区与客户配置不一致，请刷新页面。", 409, "SCHEDULE_TIMEZONE_MISMATCH");
+  }
+  if (!input.localDateTime) throw new AppError("请选择计划发布时间。", 400, "SCHEDULE_TIME_REQUIRED");
+  const result = zonedLocalDateTimeToUtc(input.localDateTime, clientTimezone);
+  if (result.getTime() <= Date.now()) throw new AppError("计划发布时间必须晚于当前时间。", 400, "SCHEDULE_TIME_IN_PAST");
+  return result;
 }
 
 export async function checkContent(context: RequestContext, contentItemId: string) {
@@ -489,7 +552,7 @@ async function getScopedItem(context: RequestContext, contentItemId: string) {
   const item = await db.contentItem.findFirst({
     where: { id: contentItemId, clientId: context.clientId },
     include: {
-      account: { include: { facebookConnection: true } },
+      account: { include: { facebookConnection: true, platformConnection: true } },
       plan: { include: { product: { include: { fields: true } } } },
       currentVersion: {
         include: { assetLinks: { include: { asset: { include: { productLinks: true } } } } },
@@ -498,6 +561,13 @@ async function getScopedItem(context: RequestContext, contentItemId: string) {
   });
   if (!item) throw new AppError("内容不存在或无权访问。", 404, "CONTENT_NOT_FOUND");
   return item;
+}
+
+function providerForPlatform(platform: string) {
+  if (platform === "facebook" || platform === "instagram") return "META" as const;
+  if (platform === "linkedin") return "LINKEDIN" as const;
+  if (platform === "tiktok") return "TIKTOK" as const;
+  return null;
 }
 
 async function ensureManualTask(clientId: string, contentItemId: string | null, reason: string, action: string) {

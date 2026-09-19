@@ -22,6 +22,9 @@ import { FacebookGraphAdapter } from "../src/lib/adapters/facebook-graph";
 import { syncFacebookComments, syncFacebookMetrics, syncFacebookPostMetrics } from "../src/services/facebook-service";
 import { releaseUsage, reserveUsage, settleUsage } from "../src/services/usage-service";
 import { checkLoginAllowed, clearLoginFailures, recordLoginFailure } from "../src/services/login-rate-limit-service";
+import type { PlatformAuthAdapter } from "../src/lib/adapters/platform-auth";
+import { TokenVault } from "../src/lib/token-vault";
+import { completePlatformConnection, selectPlatformAccounts, startPlatformConnection } from "../src/services/platform-connection-service";
 
 type Fixture = {
   client: Client;
@@ -156,6 +159,26 @@ describe("approval and persistent publishing", () => {
     expect(await db.publishJob.count({ where: { clientId: fixture.client.id } })).toBe(1);
   });
 
+  it("targets two Facebook accounts explicitly instead of choosing by platform", async () => {
+    const secondFacebook = await db.socialAccount.create({
+      data: {
+        clientId: fixture.client.id,
+        platform: "facebook",
+        displayName: "Test facebook secondary",
+        publishCapability: "VERIFIED",
+      },
+    });
+    const result = await generateContentPlan(fixture.context, {
+      productId: fixture.product.id,
+      theme: "Account-specific test",
+      objective: "Verify targeting",
+      accountIds: [fixture.accounts[0].id, secondFacebook.id],
+      assetIds: [],
+    });
+    expect(result.items).toHaveLength(2);
+    expect(new Set(result.items.map((item) => item.accountId))).toEqual(new Set([fixture.accounts[0].id, secondFacebook.id]));
+  });
+
   it("uses the latest approval decision and revokes queued publication", async () => {
     const item = await generatedItem();
     await submitForReview(fixture.context, item.id);
@@ -264,6 +287,34 @@ describe("approval and persistent publishing", () => {
     expect(recoveredDuringDispatch).toBe(0);
     expect(result.status).toBe("PUBLISHED");
     expect(await db.publishAttempt.count({ where: { publishJobId: job.id } })).toBe(1);
+  });
+
+  it("keeps a long-running job leased through heartbeat", async () => {
+    const item = await generatedItem();
+    await submitForReview(fixture.context, item.id);
+    await reviewContent(fixture.context, item.id, "APPROVED");
+    const job = await schedulePublication(fixture.context, item.id);
+    await claimNextJob("heartbeat-worker");
+    const previous = process.env.WORKER_HEARTBEAT_MS;
+    process.env.WORKER_HEARTBEAT_MS = "1000";
+    let recoveredDuringDispatch = -1;
+    try {
+      const adapter: SocialPublishAdapter = {
+        name: "heartbeat-mock",
+        simulated: true,
+        async publish() {
+          await new Promise((resolve) => setTimeout(resolve, 1_200));
+          recoveredDuringDispatch = await recoverStaleJobs(1);
+          return { status: "published", remotePostId: "heartbeat-safe", remotePostUrl: null, publishedAt: new Date() };
+        },
+      };
+      const result = await processPublishJob(job.id, adapter);
+      expect(recoveredDuringDispatch).toBe(0);
+      expect(result.status).toBe("PUBLISHED");
+    } finally {
+      if (previous === undefined) delete process.env.WORKER_HEARTBEAT_MS;
+      else process.env.WORKER_HEARTBEAT_MS = previous;
+    }
   });
 
   it("caps retryable failures and creates an urgent manual task", async () => {
@@ -607,5 +658,97 @@ describe("phase two usage and authentication safety", () => {
       if (oldMax === undefined) delete process.env.LOGIN_MAX_FAILURES; else process.env.LOGIN_MAX_FAILURES = oldMax;
       await clearLoginFailures([key]);
     }
+  });
+});
+
+describe("v2 connection layer boundaries", () => {
+  it("consumes OAuth state once, stores only encrypted tokens and requires explicit account selection", async () => {
+    const previousRedirect = process.env.META_REDIRECT_URI;
+    process.env.META_REDIRECT_URI = "https://app.example.test/api/connections/meta/callback";
+    const adapter: PlatformAuthAdapter = {
+      provider: "META",
+      buildAuthorizationUrl(request) {
+        return new URL(`https://www.facebook.com/dialog/oauth?state=${encodeURIComponent(request.state)}`);
+      },
+      async exchangeCode() {
+        return { accessToken: "user-secret-token", scopes: ["pages_show_list"] };
+      },
+      async discoverAccounts() {
+        return {
+          externalPrincipalId: "person-test",
+          grantedScopes: ["pages_show_list", "pages_manage_posts", "pages_read_engagement"],
+          accounts: [
+            {
+              externalAccountId: "page-test",
+              platform: "facebook",
+              accountType: "FACEBOOK_PAGE",
+              displayName: "Test Page",
+              accessToken: "page-secret-token",
+              capabilities: { canPublish: true, canReadMetrics: true, canReadComments: false },
+              metadata: { source: "test" },
+            },
+            {
+              externalAccountId: "page-test-two",
+              platform: "facebook",
+              accountType: "FACEBOOK_PAGE",
+              displayName: "Test Page Two",
+              accessToken: "page-secret-token-two",
+              capabilities: { canPublish: true, canReadMetrics: false, canReadComments: false },
+              metadata: { source: "test" },
+            },
+          ],
+        };
+      },
+    };
+    const vault = new TokenVault(new Map([["test-v1", Buffer.alloc(32, 9)]]), "test-v1");
+    try {
+      const start = await startPlatformConnection(fixture.context, "META", "/connections", adapter);
+      const state = new URL(start.authorizationUrl).searchParams.get("state")!;
+      const completed = await completePlatformConnection(fixture.context, "META", { code: "one-time", state }, { adapter, vault });
+      const connection = await db.platformConnection.findFirstOrThrow({ where: { id: completed.connectionId, clientId: fixture.client.id }, include: { accounts: true } });
+      expect(connection.accessTokenCiphertext).not.toContain("user-secret-token");
+      expect(connection.accounts[0].accessTokenCiphertext).not.toContain("page-secret-token");
+      expect(connection.accounts).toHaveLength(2);
+      expect(connection.accounts.every((account) => !account.isSelected)).toBe(true);
+      const selected = await selectPlatformAccounts(fixture.context, connection.id, [connection.accounts[0].id]);
+      expect(selected.accounts[0].isSelected).toBe(true);
+      expect(selected.accounts[0].publishCapability).toBe("VERIFIED");
+      expect(JSON.stringify(selected)).not.toMatch(/Ciphertext|AuthTag|page-secret-token|user-secret-token/);
+      await expect(completePlatformConnection(fixture.context, "META", { code: "replay", state }, { adapter, vault })).rejects.toMatchObject({ code: "OAUTH_STATE_INVALID" });
+    } finally {
+      if (previousRedirect === undefined) delete process.env.META_REDIRECT_URI;
+      else process.env.META_REDIRECT_URI = previousRedirect;
+    }
+  });
+
+  it("rejects expired and cross-client OAuth states", async () => {
+    const previousRedirect = process.env.META_REDIRECT_URI;
+    process.env.META_REDIRECT_URI = "https://app.example.test/api/connections/meta/callback";
+    const adapter: PlatformAuthAdapter = {
+      provider: "META",
+      buildAuthorizationUrl(request) { return new URL(`https://www.facebook.com/dialog/oauth?state=${request.state}`); },
+      async exchangeCode() { throw new Error("must not exchange invalid state"); },
+      async discoverAccounts() { throw new Error("must not discover invalid state"); },
+    };
+    try {
+      const expiredStart = await startPlatformConnection(fixture.context, "META", "/connections", adapter);
+      const expiredState = new URL(expiredStart.authorizationUrl).searchParams.get("state")!;
+      await db.oAuthState.updateMany({ where: { clientId: fixture.client.id, consumedAt: null }, data: { expiresAt: new Date(0) } });
+      await expect(completePlatformConnection(fixture.context, "META", { code: "never", state: expiredState }, { adapter })).rejects.toMatchObject({ code: "OAUTH_STATE_INVALID" });
+
+      const scopedStart = await startPlatformConnection(fixture.context, "META", "/connections", adapter);
+      const scopedState = new URL(scopedStart.authorizationUrl).searchParams.get("state")!;
+      const second = await makeFixture();
+      await expect(completePlatformConnection(second.context, "META", { code: "never", state: scopedState }, { adapter })).rejects.toMatchObject({ code: "OAUTH_STATE_INVALID" });
+    } finally {
+      if (previousRedirect === undefined) delete process.env.META_REDIRECT_URI;
+      else process.env.META_REDIRECT_URI = previousRedirect;
+    }
+  });
+
+  it("does not let another client select accounts from a foreign connection", async () => {
+    const second = await makeFixture();
+    const connection = await db.platformConnection.create({ data: { clientId: fixture.client.id, provider: "META", connectedByUserId: fixture.context.userId } });
+    await expect(selectPlatformAccounts(second.context, connection.id, [fixture.accounts[0].id])).rejects.toMatchObject({ code: "PLATFORM_CONNECTION_NOT_FOUND" });
   });
 });
