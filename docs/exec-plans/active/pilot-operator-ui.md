@@ -2,11 +2,12 @@
 
 ## Status
 
-- Phase: implementation
+- Phase: final verification and remote review
 - Branch: `feat/pilot-operator-ui`
 - Baseline: `v0.3-meta-facebook-verified` / `main` at `859d7f0`
 - Working objective: redesign the operator-facing UI without changing core business behavior
 - Baseline verification target: preserve all existing tests (83 tests before this work)
+- Current verification: 15 test files / 112 tests passing; typecheck, production build, and diff check passing
 
 ## Goal
 
@@ -211,15 +212,15 @@ No production dependency will be added unless an unavoidable need is demonstrate
 - [x] Confirm clean `main` baseline and create `feat/pilot-operator-ui`.
 - [x] Audit shell, global styling, login, and all primary workspace pages.
 - [x] Record design direction, IA, constraints, and acceptance criteria.
-- [ ] Establish design tokens, reusable primitives, shell, responsive navigation, and login.
-- [ ] Redesign Overview.
-- [ ] Redesign Content operations.
-- [ ] Redesign Connections.
-- [ ] Redesign Products and assets.
-- [ ] Redesign Leads & Data.
-- [ ] Reorganize Settings.
-- [ ] Verify responsive behavior, accessibility, and operator copy.
-- [ ] Run the complete test/typecheck/build/diff verification set.
+- [x] Establish design tokens, reusable primitives, shell, responsive navigation, and login.
+- [x] Redesign Overview.
+- [x] Redesign Content operations.
+- [x] Redesign Connections.
+- [x] Redesign Products and assets.
+- [x] Redesign Leads & Data.
+- [x] Reorganize Settings.
+- [x] Verify responsive behavior, accessibility, and operator copy through implementation review and an independent quality gate.
+- [x] Run the complete test/typecheck/build/diff verification set.
 - [ ] Commit, push, wait for CI, and create an unmerged PR.
 
 ## Known risks and controls
@@ -230,6 +231,16 @@ No production dependency will be added unless an unavoidable need is demonstrate
 - Removing visible development credentials may affect local convenience, but it must not change the login API or authentication behavior.
 - Page-level query changes are avoided unless required to display already-supported real records; any such change must remain presentation-scoped and tested.
 
+## Verification record
+
+- `pnpm typecheck`: PASS.
+- `pnpm test`: PASS — 15 files, 112 tests.
+- `pnpm build`: PASS — Next.js production build and route generation completed.
+- `git diff --check`: PASS; Git emitted only the existing Windows LF-to-CRLF conversion warnings.
+- UI contract coverage now protects Meta OAuth return paths, account selection, disconnect confirmation, content generation/review/scheduling/query fields, Insights permission/capability gates, and Settings owner gates.
+- Independent quality review found no core business-semantics regression. Its blocking table-semantics and narrow lead-detail issues were corrected before final verification.
+- Browser-level human visual review remains the purpose of the unmerged PR; no real Meta publish, OAuth, metrics, comments, or disconnect operation was executed during this UI-only phase.
+
 ## Next step
 
-Implement the global token system, compact UI primitives, server-safe operator shell, responsive primary navigation, and production-appropriate login page; then run an early typecheck before proceeding to page redesigns.
+Create the remaining logical commits, push `feat/pilot-operator-ui`, wait for GitHub Actions, and open the unmerged visual-review PR.
