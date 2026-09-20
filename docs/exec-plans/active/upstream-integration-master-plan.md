@@ -121,7 +121,7 @@ The detailed source-area and local-use records live in `docs/upstreams/`.
 - [x] `pnpm test` — 15 files / 99 tests
 - [x] `pnpm build`
 - [x] `git diff --check`
-- [ ] Working tree clean after commit
-- [ ] Push CI passes
-- [ ] PR CI passes
-- [ ] Independent PR remains unmerged
+- [x] Working tree clean after commit
+- [x] Push CI passes
+- [x] PR CI passes
+- [x] Independent PR remains unmerged (`#4`)
