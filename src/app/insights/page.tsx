@@ -225,7 +225,7 @@ export default async function InsightsPage() {
                         </td>
                         <td><StatusIndicator value={lead.handoffStatus} compact /></td>
                         <td className="number">{formatDateTime(lead.createdAt, "—", client.timezone)}</td>
-                        <td><a className="text-link" href={`#lead-details-${lead.id}`}>查看与处理</a></td>
+                        <td><span className="cell-meta">下方可展开</span></td>
                       </tr>
                       <tr className="lead-detail-row">
                         <td colSpan={7}>
