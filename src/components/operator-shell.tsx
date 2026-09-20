@@ -1,40 +1,56 @@
-import Link from "next/link";
 import type { RequestContext } from "@/lib/context";
 import { db } from "@/lib/db";
+import { PrimaryNav } from "@/components/primary-nav";
+import { StatusIndicator } from "@/components/ui";
 
 export async function OperatorShell({ context, children }: { context: RequestContext; children: React.ReactNode }) {
   const [client, memberships] = await Promise.all([
     db.client.findUniqueOrThrow({ where: { id: context.clientId } }),
     db.clientMembership.findMany({ where: { userId: context.userId }, include: { client: true } }),
   ]);
-  const modeName = { DEMO: "演示模式", DRAFT: "草稿模式", LIVE: "正式模式" }[client.mode];
+  const activeMembership = memberships.find((membership) => membership.clientId === context.clientId);
+  const roleName = { OWNER: "所有者", OPERATOR: "运营者", VIEWER: "只读成员" }[activeMembership?.role ?? context.role];
   return (
     <div className="shell">
+      <a className="skip-link" href="#main-content">跳到主要内容</a>
       <aside className="sidebar">
-        <div className="brand">海外社媒 AI<br />运营工作台</div>
-        <span className="mode">{modeName}</span>
-        <p>{client.name}</p>
-        <nav>
-          <Link href="/">工作台</Link>
-          <Link href="/products">产品与素材</Link>
-          <Link href="/content">内容审核</Link>
-          <Link href="/connections">平台连接</Link>
-          <Link href="/insights">线索与复盘</Link>
-          <Link href="/settings">设置</Link>
-        </nav>
-        {memberships.length > 1 && (
-          <form action="/api/auth/switch-client" method="post" className="stack">
-            <select name="clientId" defaultValue={context.clientId} aria-label="切换客户">
-              {memberships.map(({ client: option }) => <option key={option.id} value={option.id}>{option.name}</option>)}
-            </select>
-            <button type="submit" className="secondary">切换客户</button>
+        <div className="sidebar-top">
+          <div className="brand" aria-label="Aarin SocialOps">
+            <span>Aarin</span>
+            <strong>SocialOps</strong>
+          </div>
+          <div className="workspace-context">
+            <span className="sidebar-label">当前工作区</span>
+            <strong title={client.name}>{client.name}</strong>
+            <StatusIndicator value={client.mode} compact />
+          </div>
+        </div>
+        <PrimaryNav />
+        <div className="sidebar-footer">
+          {memberships.length > 1 ? (
+            <form action="/api/auth/switch-client" method="post" className="workspace-switcher">
+              <label htmlFor="workspace-client">切换工作区</label>
+              <div className="workspace-switcher-controls">
+                <select id="workspace-client" name="clientId" defaultValue={context.clientId}>
+                  {memberships.map(({ client: option }) => <option key={option.id} value={option.id}>{option.name}</option>)}
+                </select>
+                <button type="submit" className="button button-ghost button-sm">切换</button>
+              </div>
+            </form>
+          ) : null}
+          <div className="user-summary">
+            <div className="user-avatar" aria-hidden="true">{roleName.slice(0, 1)}</div>
+            <div>
+              <strong>{roleName}</strong>
+              <span>{client.name}</span>
+            </div>
+          </div>
+          <form action="/api/auth/logout" method="post">
+            <button type="submit" className="button button-ghost button-sm sidebar-logout">退出登录</button>
           </form>
-        )}
-        <form action="/api/auth/logout" method="post" style={{ marginTop: "1rem" }}>
-          <button type="submit" className="secondary">退出登录</button>
-        </form>
+        </div>
       </aside>
-      <main className="main">{children}</main>
+      <main className="main" id="main-content">{children}</main>
     </div>
   );
 }

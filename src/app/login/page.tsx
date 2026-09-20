@@ -1,21 +1,33 @@
 import { getRequestContext } from "@/lib/auth";
+import { Button, FormField } from "@/components/ui";
 import { redirect } from "next/navigation";
 
 export default async function LoginPage() {
   if (await getRequestContext()) redirect("/");
   return (
-    <main className="login">
-      <section className="card stack">
-        <div>
-          <h1>运营者登录</h1>
-          <p className="muted">会话使用 HttpOnly cookie；客户范围由服务端 membership 校验。</p>
+    <main className="login-shell">
+      <section className="login-brand" aria-label="Aarin SocialOps">
+        <div className="login-brand-lockup">
+          <span>Aarin</span>
+          <strong>SocialOps</strong>
         </div>
-        <form action="/api/auth/login" method="post" className="stack">
-          <label>邮箱<input name="email" type="email" defaultValue="operator@example.local" required /></label>
-          <label>密码<input name="password" type="password" defaultValue="change-this-local-password" required /></label>
-          <button type="submit">登录演示客户</button>
+        <p>Social operations workspace</p>
+      </section>
+      <section className="login-panel" aria-labelledby="login-title">
+        <div className="login-copy">
+          <p className="eyebrow">Aarin SocialOps</p>
+          <h1 id="login-title">登录工作区</h1>
+          <p>使用你的运营账号继续。</p>
+        </div>
+        <form action="/api/auth/login" method="post" className="form-stack">
+          <FormField label="邮箱" htmlFor="login-email">
+            <input id="login-email" name="email" type="email" autoComplete="username" required />
+          </FormField>
+          <FormField label="密码" htmlFor="login-password">
+            <input id="login-password" name="password" type="password" autoComplete="current-password" required />
+          </FormField>
+          <Button type="submit">继续</Button>
         </form>
-        <div className="warning">本地默认密码仅用于开发。正式部署前必须通过环境变量修改并重新创建账号。</div>
       </section>
     </main>
   );
