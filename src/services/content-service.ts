@@ -14,6 +14,7 @@ import { sha256 } from "../lib/security";
 import { zonedLocalDateTimeToUtc } from "../lib/timezone";
 import { assertCanWrite, type RequestContext } from "../lib/context";
 import { releaseUsage, reserveUsage, settleUsage } from "./usage-service";
+import { getPlatformRegistry, resolveLivePublishingTarget } from "./platform-registry-service";
 
 const platforms = ["facebook", "instagram", "tiktok", "linkedin"] as const;
 const generateInputSchema = z.object({
@@ -390,31 +391,44 @@ export async function schedulePublication(context: RequestContext, contentItemId
     } },
   });
   const isDemo = client.mode === ClientMode.DEMO;
-  const facebookConnection = item.account.facebookConnection;
   const platformConnection = item.account.platformConnection;
-  const readyWithOAuth = client.mode === ClientMode.LIVE
-    && item.platform === "facebook"
-    && item.account.isSelected
-    && item.account.publishCapability === CapabilityStatus.VERIFIED
-    && platformConnection?.provider === "META"
-    && platformConnection.status === "CONNECTED"
-    && Boolean(item.account.accessTokenCiphertext && item.account.accessTokenIv && item.account.accessTokenAuthTag);
-  const readyForLive = client.mode === ClientMode.LIVE
-    && item.platform === "facebook"
-    && item.account.publishCapability === CapabilityStatus.VERIFIED
-    && (readyWithOAuth || (facebookConnection?.connectionStatus === CapabilityStatus.VERIFIED
-      && facebookConnection.tokenStatus === "VALID"
-      && item.account.externalAccountId === facebookConnection.pageId));
-  if (!isDemo && !readyForLive) {
-    await ensureManualTask(context.clientId, item.id, "Facebook Page 真实连接尚未验证", "在设置页配置服务器密钥引用，并完成 Page、权限和令牌验证。" );
-    throw new AppError("正式模式只允许已验证的 Facebook Page 进入真实发布队列。", 409, "LIVE_CONNECTION_REQUIRED");
+  const registration = getPlatformRegistry().getByPlatform(item.platform);
+  const liveTarget = client.mode === ClientMode.LIVE
+    ? resolveLivePublishingTarget({
+        platform: item.platform,
+        accountType: item.account.accountType,
+        isSelected: item.account.isSelected,
+        publishCapability: item.account.publishCapability,
+        externalAccountId: item.account.externalAccountId,
+        hasEncryptedAccessToken: Boolean(
+          item.account.accessTokenCiphertext &&
+          item.account.accessTokenIv &&
+          item.account.accessTokenAuthTag
+        ),
+        connection: platformConnection
+          ? { provider: platformConnection.provider, status: platformConnection.status }
+          : null,
+        legacyFacebook: item.account.facebookConnection
+          ? {
+              connectionStatus: item.account.facebookConnection.connectionStatus,
+              tokenStatus: item.account.facebookConnection.tokenStatus,
+              pageId: item.account.facebookConnection.pageId,
+            }
+          : null,
+      })
+    : null;
+  if (!registration || (!isDemo && !liveTarget)) {
+    await ensureManualTask(context.clientId, item.id, "社媒账号真实连接尚未验证", "在平台连接页完成 OAuth、账号选择和发布能力验证。" );
+    throw new AppError("正式模式只允许已验证且已选择的社媒账号进入真实发布队列。", 409, "LIVE_CONNECTION_REQUIRED");
   }
+  const provider = registration.definition.provider;
+  const adapterName = isDemo ? "mock-social" : liveTarget!.adapterName;
   const status = PublishJobStatus.PENDING;
   if (existing) {
     if (existing.status === PublishJobStatus.CANCELLED && existing.attemptCount === 0) {
       const revived = await db.publishJob.update({
         where: { id: existing.id },
-        data: { status, provider: providerForPlatform(item.platform), platform: item.platform, adapter: isDemo ? "mock-social" : readyWithOAuth ? "meta-facebook" : "facebook-graph", simulated: isDemo, environment: isDemo ? "SIMULATED" : "LIVE", nextAttemptAt: scheduledAt || new Date(), lastErrorCode: null, lastErrorMessage: null },
+        data: { status, provider, platform: item.platform, adapter: adapterName, simulated: isDemo, environment: isDemo ? "SIMULATED" : "LIVE", nextAttemptAt: scheduledAt || new Date(), lastErrorCode: null, lastErrorMessage: null },
       });
       await db.contentItem.update({
         where: { id: item.id },
@@ -431,11 +445,11 @@ export async function schedulePublication(context: RequestContext, contentItemId
         clientId: context.clientId,
         contentVersionId: item.currentVersion.id,
         accountId: item.accountId,
-        provider: providerForPlatform(item.platform),
+        provider,
         platform: item.platform,
         idempotencyKey,
         status,
-        adapter: isDemo ? "mock-social" : readyWithOAuth ? "meta-facebook" : "facebook-graph",
+        adapter: adapterName,
         simulated: isDemo,
         environment: isDemo ? "SIMULATED" : "LIVE",
         nextAttemptAt: scheduledAt || new Date(),
@@ -561,13 +575,6 @@ async function getScopedItem(context: RequestContext, contentItemId: string) {
   });
   if (!item) throw new AppError("内容不存在或无权访问。", 404, "CONTENT_NOT_FOUND");
   return item;
-}
-
-function providerForPlatform(platform: string) {
-  if (platform === "facebook" || platform === "instagram") return "META" as const;
-  if (platform === "linkedin") return "LINKEDIN" as const;
-  if (platform === "tiktok") return "TIKTOK" as const;
-  return null;
 }
 
 async function ensureManualTask(clientId: string, contentItemId: string | null, reason: string, action: string) {
