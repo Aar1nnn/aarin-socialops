@@ -79,6 +79,8 @@ h2 { font-size: 1.15rem; margin-bottom: 1rem; }
 table { width: 100%; border-collapse: collapse; font-size: .86rem; }
 th, td { text-align: left; padding: .55rem; border-bottom: 1px solid var(--line); vertical-align: top; }
 code { overflow-wrap: anywhere; }
+.account-option { display: flex; align-items: flex-start; gap: .75rem; padding: .75rem; border: 1px solid var(--line); border-radius: 8px; }
+.account-option input { width: auto; margin-top: .2rem; }
 
 @media (max-width: 900px) {
   .shell { grid-template-columns: 1fr; }

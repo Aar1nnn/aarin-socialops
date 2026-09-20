@@ -1,0 +1,59 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main, "feat/**"]
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: socialops
+          POSTGRES_PASSWORD: socialops-ci
+          POSTGRES_DB: socialops
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U socialops -d socialops"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      DATABASE_URL: postgresql://socialops:socialops-ci@localhost:5432/socialops?schema=public
+      APP_BASE_URL: http://localhost:3000
+      SESSION_COOKIE_NAME: socialops_session
+      SESSION_TTL_HOURS: "1"
+      COOKIE_SECURE: "false"
+      STORAGE_PROVIDER: local
+      STORAGE_LOCAL_ROOT: ./storage-ci
+      TOKEN_ENCRYPTION_KEY: AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=
+      TOKEN_ENCRYPTION_KEY_VERSION: v1
+      META_APP_ID: ci-meta-app
+      META_APP_SECRET: ci-only-placeholder
+      META_REDIRECT_URI: http://localhost:3000/api/connections/meta/callback
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.19.0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm db:generate
+      - run: pnpm db:migrate
+      - run: pnpm db:seed
+      - run: pnpm db:seed
+      - run: npx prisma migrate status
+      - run: pnpm typecheck
+      - run: pnpm test
+      - run: pnpm build

@@ -1,6 +1,7 @@
-import { readFile } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
 import { basename } from "node:path";
-import { resolveLocalAssetPath } from "./storage";
+import { Readable } from "node:stream";
+import { getStorageAdapter } from "./storage";
 import type { PublishRequest, PublishResult, SocialPublishAdapter } from "./types";
 
 export type FacebookErrorCategory =
@@ -142,12 +143,15 @@ export class FacebookGraphAdapter implements SocialPublishAdapter {
         if (!["image/png", "image/jpeg", "video/mp4", "video/quicktime"].includes(asset.mimeType)) {
           return { status: "failed", code: "MEDIA_INVALID", message: "Facebook LIVE 仅接受已验证的 PNG、JPEG、MP4 或 QuickTime 单文件素材。", retryable: false };
         }
-        const bytes = await readFile(resolveLocalAssetPath(asset.storageKey));
-        const form = new FormData();
-        form.set("source", new Blob([bytes], { type: asset.mimeType }), asset.originalName || basename(asset.storageKey));
         const isVideo = asset.mimeType.startsWith("video/");
-        form.set(isVideo ? "description" : "caption", request.text);
-        created = await this.request(`${this.config.pageId}/${isVideo ? "videos" : "photos"}`, { method: "POST", body: form });
+        const storage = getStorageAdapter(asset.storageProvider || "local");
+        const multipart = await createMultipartBody(storage, asset.storageKey, asset.originalName, asset.mimeType, isVideo ? "description" : "caption", request.text);
+        created = await this.request(`${this.config.pageId}/${isVideo ? "videos" : "photos"}`, {
+          method: "POST",
+          headers: multipart.headers,
+          body: multipart.body as unknown as BodyInit,
+          duplex: "half",
+        } as RequestInit & { duplex: "half" });
       }
       const remotePostId = created.post_id || created.id;
       if (!remotePostId) return { status: "unknown", code: "REMOTE_RESULT_UNKNOWN", message: "Facebook 返回成功响应但没有远端帖子 ID。" };
@@ -256,4 +260,30 @@ export class FacebookGraphAdapter implements SocialPublishAdapter {
   private safeMessage(message: string) {
     return message.replaceAll(this.config.accessToken, "[REDACTED]");
   }
+}
+
+async function createMultipartBody(
+  storage: ReturnType<typeof getStorageAdapter>,
+  storageKey: string,
+  originalName: string,
+  mimeType: string,
+  copyField: string,
+  text: string,
+) {
+  const boundary = `socialops-${randomUUID()}`;
+  const safeName = (originalName || basename(storageKey)).replace(/["\r\n]/g, "_");
+  const copy = Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="${copyField}"\r\n\r\n${text}\r\n`);
+  const fileHeader = Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="source"; filename="${safeName}"\r\nContent-Type: ${mimeType}\r\n\r\n`);
+  const footer = Buffer.from(`\r\n--${boundary}--\r\n`);
+  const metadata = await storage.metadata(storageKey);
+  const source = await storage.getStream(storageKey);
+  const body = Readable.from((async function* () {
+    yield copy;
+    yield fileHeader;
+    for await (const chunk of source) yield chunk;
+    yield footer;
+  })());
+  const headers = new Headers({ "content-type": `multipart/form-data; boundary=${boundary}` });
+  if (metadata.contentLength !== null) headers.set("content-length", String(copy.length + fileHeader.length + metadata.contentLength + footer.length));
+  return { body, headers };
 }

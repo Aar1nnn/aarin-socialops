@@ -64,7 +64,7 @@ describe("FacebookGraphAdapter", () => {
     ["video", "video/mp4", "test.mp4", "videos", "description"],
   ])("publishes one %s with copy", async (_kind, mimeType, originalName, endpoint, copyField) => {
     await writeFile(join(storageRoot, originalName), Buffer.from("test-media"));
-    let multipart: FormData | null = null;
+    let multipart = "";
     const adapter = new FacebookGraphAdapter({
       pageId: "123",
       accessToken: "secret",
@@ -72,7 +72,9 @@ describe("FacebookGraphAdapter", () => {
       fetchImpl: async (input, init) => {
         if (init?.method === "POST") {
           expect(String(input)).toContain(`/123/${endpoint}`);
-          multipart = init.body as FormData;
+          const chunks: Buffer[] = [];
+          for await (const chunk of init.body as unknown as AsyncIterable<Uint8Array>) chunks.push(Buffer.from(chunk));
+          multipart = Buffer.concat(chunks).toString("utf8");
           return jsonResponse(endpoint === "photos" ? { id: "photo", post_id: "123_789" } : { id: "video789" });
         }
         return jsonResponse({ id: endpoint === "photos" ? "123_789" : "video789", is_published: true });
@@ -80,9 +82,10 @@ describe("FacebookGraphAdapter", () => {
     });
     const result = await adapter.publish({ clientId: "c1", platform: "facebook", accountExternalId: "123", text: "[TEST] media", assets: [{ storageKey: originalName, mimeType, originalName }], idempotencyKey: endpoint });
     expect(result.status).toBe("published");
-    expect(multipart).not.toBeNull();
-    expect(multipart!.get(copyField)).toBe("[TEST] media");
-    expect(multipart!.get("source")).toBeInstanceOf(Blob);
+    expect(multipart).toContain(`name="${copyField}"`);
+    expect(multipart).toContain("[TEST] media");
+    expect(multipart).toContain('name="source"');
+    expect(multipart).toContain("test-media");
   });
 
   it("returns UNKNOWN on a timeout and never turns it into a retryable failure", async () => {
@@ -104,7 +107,13 @@ describe("FacebookGraphAdapter", () => {
       pageId: "123",
       accessToken: "secret",
       apiVersion: "v26.0",
-      fetchImpl: async (_input, init) => init?.method === "POST" ? jsonResponse({ id: "video-processing-1" }) : jsonResponse({ id: "video-processing-1", is_published: false }),
+      fetchImpl: async (_input, init) => {
+        if (init?.method === "POST") {
+          for await (const _chunk of init.body as unknown as AsyncIterable<Uint8Array>) { /* consume the upload stream */ }
+          return jsonResponse({ id: "video-processing-1" });
+        }
+        return jsonResponse({ id: "video-processing-1", is_published: false });
+      },
     });
     const result = await adapter.publish({ clientId: "c1", platform: "facebook", accountExternalId: "123", text: "[TEST] processing", assets: [{ storageKey: "processing.mp4", mimeType: "video/mp4", originalName: "processing.mp4" }], idempotencyKey: "processing" });
     expect(result).toMatchObject({ status: "unknown", remotePostId: "video-processing-1", code: "REMOTE_NOT_PUBLISHED" });

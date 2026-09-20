@@ -12,7 +12,9 @@ import { assertCanWrite, type RequestContext } from "../lib/context";
 import { db } from "../lib/db";
 import { AppError } from "../lib/errors";
 import { maskSecret, resolveFacebookSecret } from "../lib/secrets";
+import { TokenVault } from "../lib/token-vault";
 import { importInteraction } from "./interaction-service";
+import { hasMetaCapability, normalizePageTasks } from "../lib/adapters/meta-auth";
 
 const defaultPermissions = ["pages_manage_posts", "pages_read_engagement", "pages_read_user_content"];
 const connectionInput = z.object({
@@ -90,8 +92,9 @@ export async function validateFacebookPage(context: RequestContext, accountId: s
     token = adapterOverride ? "" : resolveFacebookSecret(connection.credentialRef);
     const adapter = adapterOverride || createAdapter(connection.pageId, token, connection.graphApiVersion);
     const probe = await adapter.validateConnection();
+    const pageTasks = normalizePageTasks(probe.pageTasks);
     const missingPermissions = connection.requiredPermissions.filter((permission) => !probe.grantedPermissions.includes(permission));
-    const canPublish = probe.pageTasks.includes("CREATE_CONTENT");
+    const canPublish = hasMetaCapability(pageTasks, "CREATE_CONTENT");
     if (!canPublish || missingPermissions.length) {
       const details = [!canPublish ? "Page 任务缺少 CREATE_CONTENT" : null, missingPermissions.length ? `缺少权限：${missingPermissions.join(", ")}` : null].filter(Boolean).join("；");
       throw new FacebookGraphError("PERMISSION_DENIED", details, false);
@@ -102,7 +105,7 @@ export async function validateFacebookPage(context: RequestContext, accountId: s
         where: { id: connection.id },
         data: {
           pageName: probe.pageName,
-          pageTasks: probe.pageTasks,
+          pageTasks,
           grantedPermissions: probe.grantedPermissions,
           tokenStatus: FacebookTokenStatus.VALID,
           connectionStatus: CapabilityStatus.VERIFIED,
@@ -118,12 +121,12 @@ export async function validateFacebookPage(context: RequestContext, accountId: s
           displayName: probe.pageName,
           externalAccountId: probe.pageId,
           publishCapability: CapabilityStatus.VERIFIED,
-          metricsCapability: probe.pageTasks.includes("ANALYZE") ? CapabilityStatus.VERIFIED : CapabilityStatus.UNVERIFIED,
-          commentsCapability: probe.pageTasks.includes("MODERATE") ? CapabilityStatus.VERIFIED : CapabilityStatus.UNVERIFIED,
+          metricsCapability: hasMetaCapability(pageTasks, "ANALYZE") ? CapabilityStatus.VERIFIED : CapabilityStatus.UNVERIFIED,
+          commentsCapability: hasMetaCapability(pageTasks, "MODERATE") ? CapabilityStatus.VERIFIED : CapabilityStatus.UNVERIFIED,
           verifiedAt: now,
         },
       });
-      await tx.auditLog.create({ data: { clientId: context.clientId, userId: context.userId, action: "FACEBOOK_PAGE_VERIFIED", entityType: "FacebookPageConnection", entityId: connection.id, metadata: { pageId: probe.pageId, permissionCount: probe.grantedPermissions.length, pageTasks: probe.pageTasks } } });
+      await tx.auditLog.create({ data: { clientId: context.clientId, userId: context.userId, action: "FACEBOOK_PAGE_VERIFIED", entityType: "FacebookPageConnection", entityId: connection.id, metadata: { pageId: probe.pageId, permissionCount: probe.grantedPermissions.length, pageTasks } } });
       return updated;
     });
   } catch (error) {
@@ -139,40 +142,47 @@ export async function validateFacebookPage(context: RequestContext, accountId: s
 
 export async function syncFacebookMetrics(context: RequestContext, accountId: string, adapterOverride?: FacebookGraphAdapter) {
   assertCanWrite(context);
-  const connection = await requireVerifiedConnection(context.clientId, accountId);
-  if (!connection.metricKeys.length) throw new AppError("请先配置至少一个经 Meta 文档或接口验证的指标名称。", 409, "FACEBOOK_METRICS_NOT_CONFIGURED");
-  const token = adapterOverride ? "" : resolveFacebookSecret(connection.credentialRef);
-  const adapter = adapterOverride || createAdapter(connection.pageId, token, connection.graphApiVersion);
+  const account = await getScopedFacebookAccount(context.clientId, accountId);
+  if (account.metricsCapability !== CapabilityStatus.VERIFIED) throw new AppError("Facebook 指标读取能力尚未验证。", 409, "FACEBOOK_METRICS_UNVERIFIED");
+  const metricKeys = account.facebookConnection?.metricKeys.length
+    ? account.facebookConnection.metricKeys
+    : (process.env.META_PAGE_METRIC_KEYS || "").split(",").map((item) => item.trim()).filter(Boolean);
+  if (!metricKeys.length) throw new AppError("请先配置至少一个经 Meta 文档或接口验证的指标名称。", 409, "FACEBOOK_METRICS_NOT_CONFIGURED");
+  const resolved = adapterOverride ? null : await resolveFacebookAdapter(context.clientId, accountId);
+  const token = resolved?.token || "";
+  const adapter = adapterOverride || resolved!.adapter;
+  const source = resolved?.source || "facebook-graph:test-override";
   const snapshots = [];
-  for (const metricKey of connection.metricKeys) {
+  for (const metricKey of metricKeys) {
     const fetchedAt = new Date();
     try {
       const values = await adapter.readMetrics([metricKey]);
       const value = values.find((candidate) => candidate.metricKey === metricKey);
       snapshots.push(await db.metricSnapshot.create({
         data: value
-          ? { clientId: context.clientId, accountId, metricKey, numericValue: value.value, availability: DataAvailability.AVAILABLE, dataKind: "REAL", periodStart: value.periodStart, periodEnd: value.periodEnd, fetchedAt, source: `facebook-graph:${connection.graphApiVersion}` }
-          : { clientId: context.clientId, accountId, metricKey, numericValue: null, availability: DataAvailability.UNSUPPORTED, dataKind: "REAL", fetchedAt, source: `facebook-graph:${connection.graphApiVersion}`, errorMessage: "接口未返回该指标；可能不适用于此 Page 或已弃用。" },
+          ? { clientId: context.clientId, accountId, metricKey, numericValue: value.value, availability: DataAvailability.AVAILABLE, dataKind: "REAL", periodStart: value.periodStart, periodEnd: value.periodEnd, fetchedAt, source }
+          : { clientId: context.clientId, accountId, metricKey, numericValue: null, availability: DataAvailability.UNSUPPORTED, dataKind: "REAL", fetchedAt, source, errorMessage: "接口未返回该指标；可能不适用于此 Page 或已弃用。" },
       }));
     } catch (error) {
       const normalized = normalizeFacebookFailure(error, token);
-      snapshots.push(await db.metricSnapshot.create({ data: { clientId: context.clientId, accountId, metricKey, numericValue: null, availability: normalized.category === "PERMISSION_DENIED" || normalized.category === "TOKEN_INVALID" ? DataAvailability.PERMISSION_DENIED : DataAvailability.READ_FAILED, dataKind: "REAL", fetchedAt, source: `facebook-graph:${connection.graphApiVersion}`, errorMessage: `${normalized.category}: ${normalized.message}` } }));
-      if (normalized.category === "TOKEN_INVALID") await markConnectionInvalid(connection.id, accountId, normalized);
+      snapshots.push(await db.metricSnapshot.create({ data: { clientId: context.clientId, accountId, metricKey, numericValue: null, availability: normalized.category === "PERMISSION_DENIED" || normalized.category === "TOKEN_INVALID" ? DataAvailability.PERMISSION_DENIED : DataAvailability.READ_FAILED, dataKind: "REAL", fetchedAt, source, errorMessage: `${normalized.category}: ${normalized.message}` } }));
+      if (normalized.category === "TOKEN_INVALID") await markAccountConnectionInvalid(account, normalized);
     }
   }
-  await db.facebookPageConnection.update({ where: { id: connection.id }, data: { metricsSyncedAt: new Date() } });
+  if (account.facebookConnection) await db.facebookPageConnection.update({ where: { id: account.facebookConnection.id }, data: { metricsSyncedAt: new Date() } });
   return snapshots;
 }
 
 export async function syncFacebookComments(context: RequestContext, publishJobId: string, adapterOverride?: FacebookGraphAdapter) {
   assertCanWrite(context);
-  const job = await db.publishJob.findFirst({ where: { id: publishJobId, clientId: context.clientId }, include: { account: { include: { facebookConnection: true } } } });
+  const job = await db.publishJob.findFirst({ where: { id: publishJobId, clientId: context.clientId }, include: { account: { include: { facebookConnection: true, platformConnection: true } } } });
   if (!job || job.account.clientId !== context.clientId) throw new AppError("发布任务不存在或无权访问。", 404, "PUBLISH_JOB_NOT_FOUND");
-  if (job.environment !== "LIVE" || job.adapter !== "facebook-graph" || !job.remotePostId) throw new AppError("只有已保存远端 ID 的 Facebook LIVE 帖子可同步评论。", 409, "FACEBOOK_POST_NOT_QUERYABLE");
+  if (job.environment !== "LIVE" || !["facebook-graph", "meta-facebook"].includes(job.adapter) || !job.remotePostId) throw new AppError("只有已保存远端 ID 的 Facebook LIVE 帖子可同步评论。", 409, "FACEBOOK_POST_NOT_QUERYABLE");
   const connection = job.account.facebookConnection;
-  if (!connection || connection.connectionStatus !== CapabilityStatus.VERIFIED || job.account.commentsCapability !== CapabilityStatus.VERIFIED) throw new AppError("Facebook 评论读取能力尚未验证。", 409, "FACEBOOK_COMMENTS_UNVERIFIED");
-  const token = adapterOverride ? "" : resolveFacebookSecret(connection.credentialRef);
-  const adapter = adapterOverride || createAdapter(connection.pageId, token, connection.graphApiVersion);
+  if (job.account.commentsCapability !== CapabilityStatus.VERIFIED) throw new AppError("Facebook 评论读取能力尚未验证。", 409, "FACEBOOK_COMMENTS_UNVERIFIED");
+  const resolved = adapterOverride ? null : await resolveFacebookAdapter(context.clientId, job.accountId, job.adapter === "meta-facebook" ? "oauth" : "legacy");
+  const token = resolved?.token || "";
+  const adapter = adapterOverride || resolved!.adapter;
   try {
     const page = await adapter.readComments(job.remotePostId);
     const results = [];
@@ -189,48 +199,48 @@ export async function syncFacebookComments(context: RequestContext, publishJobId
         occurredAt: comment.createdAt,
       }, { source: "facebook-graph", rawPayload: comment.raw }));
     }
-    await db.facebookPageConnection.update({ where: { id: connection.id }, data: { commentsSyncedAt: new Date(), commentsCursor: page.nextCursor } });
+    if (connection) await db.facebookPageConnection.update({ where: { id: connection.id }, data: { commentsSyncedAt: new Date(), commentsCursor: page.nextCursor } });
     return { imported: results.filter((item) => !item.duplicated).length, duplicated: results.filter((item) => item.duplicated).length, nextCursor: page.nextCursor };
   } catch (error) {
     const normalized = normalizeFacebookFailure(error, token);
-    if (normalized.category === "TOKEN_INVALID") await markConnectionInvalid(connection.id, job.accountId, normalized);
+    if (normalized.category === "TOKEN_INVALID") await markAccountConnectionInvalid(job.account, normalized);
     throw new AppError(`${normalized.message} 处理建议：${FACEBOOK_ERROR_ADVICE[normalized.category]}`, 409, normalized.category);
   }
 }
 
 export async function syncFacebookPostMetrics(context: RequestContext, publishJobId: string, adapterOverride?: FacebookGraphAdapter) {
   assertCanWrite(context);
-  const job = await db.publishJob.findFirst({ where: { id: publishJobId, clientId: context.clientId }, include: { account: { include: { facebookConnection: true } } } });
+  const job = await db.publishJob.findFirst({ where: { id: publishJobId, clientId: context.clientId }, include: { account: { include: { facebookConnection: true, platformConnection: true } } } });
   if (!job || job.account.clientId !== context.clientId) throw new AppError("发布任务不存在或无权访问。", 404, "PUBLISH_JOB_NOT_FOUND");
-  if (job.environment !== "LIVE" || job.adapter !== "facebook-graph" || !job.remotePostId) throw new AppError("只有带远端 ID 的 Facebook LIVE 帖子可同步帖子指标。", 409, "FACEBOOK_POST_NOT_QUERYABLE");
+  if (job.environment !== "LIVE" || !["facebook-graph", "meta-facebook"].includes(job.adapter) || !job.remotePostId) throw new AppError("只有带远端 ID 的 Facebook LIVE 帖子可同步帖子指标。", 409, "FACEBOOK_POST_NOT_QUERYABLE");
   const connection = job.account.facebookConnection;
-  if (!connection || connection.connectionStatus !== CapabilityStatus.VERIFIED || job.account.metricsCapability !== CapabilityStatus.VERIFIED) throw new AppError("Facebook 指标能力尚未验证。", 409, "FACEBOOK_METRICS_UNVERIFIED");
-  const token = adapterOverride ? "" : resolveFacebookSecret(connection.credentialRef);
-  const adapter = adapterOverride || createAdapter(connection.pageId, token, connection.graphApiVersion);
+  if (job.account.metricsCapability !== CapabilityStatus.VERIFIED) throw new AppError("Facebook 指标能力尚未验证。", 409, "FACEBOOK_METRICS_UNVERIFIED");
+  const resolved = adapterOverride ? null : await resolveFacebookAdapter(context.clientId, job.accountId, job.adapter === "meta-facebook" ? "oauth" : "legacy");
+  const token = resolved?.token || "";
+  const adapter = adapterOverride || resolved!.adapter;
+  const source = resolved?.source || "facebook-graph:test-override";
   const fetchedAt = new Date();
   try {
     const values = await adapter.readPostMetrics(job.remotePostId);
     if (!values.length) {
-      return [await db.metricSnapshot.create({ data: { clientId: context.clientId, accountId: job.accountId, metricKey: `post_engagement:${job.remotePostId}`, numericValue: null, availability: DataAvailability.UNSUPPORTED, dataKind: "REAL", fetchedAt, source: `facebook-graph:${connection.graphApiVersion}`, errorMessage: "接口未返回评论或回应汇总。" } })];
+      return [await db.metricSnapshot.create({ data: { clientId: context.clientId, accountId: job.accountId, metricKey: `post_engagement:${job.remotePostId}`, numericValue: null, availability: DataAvailability.UNSUPPORTED, dataKind: "REAL", fetchedAt, source, errorMessage: "接口未返回评论或回应汇总。" } })];
     }
-    return db.$transaction(values.map((value) => db.metricSnapshot.create({ data: { clientId: context.clientId, accountId: job.accountId, metricKey: `${value.metricKey}:${job.remotePostId}`, numericValue: value.value, availability: DataAvailability.AVAILABLE, dataKind: "REAL", fetchedAt, source: `facebook-graph:${connection.graphApiVersion}` } })));
+    return db.$transaction(values.map((value) => db.metricSnapshot.create({ data: { clientId: context.clientId, accountId: job.accountId, metricKey: `${value.metricKey}:${job.remotePostId}`, numericValue: value.value, availability: DataAvailability.AVAILABLE, dataKind: "REAL", fetchedAt, source } })));
   } catch (error) {
     const normalized = normalizeFacebookFailure(error, token);
-    if (normalized.category === "TOKEN_INVALID") await markConnectionInvalid(connection.id, job.accountId, normalized);
-    return [await db.metricSnapshot.create({ data: { clientId: context.clientId, accountId: job.accountId, metricKey: `post_engagement:${job.remotePostId}`, numericValue: null, availability: normalized.category === "PERMISSION_DENIED" || normalized.category === "TOKEN_INVALID" ? DataAvailability.PERMISSION_DENIED : DataAvailability.READ_FAILED, dataKind: "REAL", fetchedAt, source: `facebook-graph:${connection.graphApiVersion}`, errorMessage: `${normalized.category}: ${normalized.message}` } })];
+    if (normalized.category === "TOKEN_INVALID") await markAccountConnectionInvalid(job.account, normalized);
+    return [await db.metricSnapshot.create({ data: { clientId: context.clientId, accountId: job.accountId, metricKey: `post_engagement:${job.remotePostId}`, numericValue: null, availability: normalized.category === "PERMISSION_DENIED" || normalized.category === "TOKEN_INVALID" ? DataAvailability.PERMISSION_DENIED : DataAvailability.READ_FAILED, dataKind: "REAL", fetchedAt, source, errorMessage: `${normalized.category}: ${normalized.message}` } })];
   }
 }
 
 export async function queryFacebookPublish(context: RequestContext, publishJobId: string, adapterOverride?: FacebookGraphAdapter) {
   assertCanWrite(context);
-  const job = await db.publishJob.findFirst({ where: { id: publishJobId, clientId: context.clientId }, include: { account: { include: { facebookConnection: true } }, contentVersion: { select: { contentItemId: true } } } });
+  const job = await db.publishJob.findFirst({ where: { id: publishJobId, clientId: context.clientId }, include: { account: { include: { facebookConnection: true, platformConnection: true } }, contentVersion: { select: { contentItemId: true } } } });
   if (!job || job.account.clientId !== context.clientId) throw new AppError("发布任务不存在或无权访问。", 404, "PUBLISH_JOB_NOT_FOUND");
-  if (job.environment !== "LIVE" || job.adapter !== "facebook-graph") throw new AppError("此任务不是真实 Facebook 发布。", 409, "NOT_FACEBOOK_LIVE_JOB");
+  if (job.environment !== "LIVE" || !["facebook-graph", "meta-facebook"].includes(job.adapter)) throw new AppError("此任务不是真实 Facebook 发布。", 409, "NOT_FACEBOOK_LIVE_JOB");
   if (!job.remotePostId) throw new AppError("任务没有远端帖子 ID，无法自动查询；请在 Meta 后台人工对账。", 409, "REMOTE_POST_ID_MISSING");
-  const connection = job.account.facebookConnection;
-  if (!connection) throw new AppError("Facebook 连接不存在。", 409, "FACEBOOK_CONNECTION_MISSING");
-  const token = adapterOverride ? "" : resolveFacebookSecret(connection.credentialRef);
-  const adapter = adapterOverride || createAdapter(connection.pageId, token, connection.graphApiVersion);
+  const resolved = adapterOverride ? null : await resolveFacebookAdapter(context.clientId, job.accountId, job.adapter === "meta-facebook" ? "oauth" : "legacy");
+  const adapter = adapterOverride || resolved!.adapter;
   const result = await adapter.queryByRemotePostId(job.remotePostId);
   const queriedAt = new Date();
   if (result.status === "published") {
@@ -243,23 +253,73 @@ export async function queryFacebookPublish(context: RequestContext, publishJobId
     });
   }
   const failure = result.status === "failed" ? result : { code: result.code, message: result.message };
-  if (failure.code === "TOKEN_INVALID") await markConnectionInvalid(connection.id, job.accountId, { category: "TOKEN_INVALID", message: failure.message });
+  if (failure.code === "TOKEN_INVALID") await markAccountConnectionInvalid(job.account, { category: "TOKEN_INVALID", message: failure.message });
   return db.publishJob.update({ where: { id: job.id }, data: { lastQueriedAt: queriedAt, lastErrorCode: failure.code, lastErrorMessage: failure.message } });
 }
 
-export async function getFacebookAdapterForJob(clientId: string, accountId: string) {
-  const connection = await requireVerifiedConnection(clientId, accountId);
-  return createAdapter(connection.pageId, resolveFacebookSecret(connection.credentialRef), connection.graphApiVersion);
+export async function getFacebookAdapterForJob(clientId: string, accountId: string, mode: "oauth" | "legacy" | "auto" = "auto") {
+  return (await resolveFacebookAdapter(clientId, accountId, mode)).adapter;
 }
 
-function createAdapter(pageId: string, accessToken: string, apiVersion: string) {
+async function resolveFacebookAdapter(clientId: string, accountId: string, mode: "oauth" | "legacy" | "auto" = "auto") {
+  const account = await getScopedFacebookAccount(clientId, accountId);
+  const oauth = account.platformConnection;
+  if (oauth?.accessTokenExpiresAt && oauth.accessTokenExpiresAt <= new Date()) {
+    await db.platformConnection.update({
+      where: { id: oauth.id },
+      data: { status: "TOKEN_EXPIRED", lastErrorCode: "TOKEN_EXPIRED", lastErrorMessage: "授权 token 已到期，请重新连接。" },
+    });
+    throw new AppError("Meta 授权 token 已到期，请重新连接。", 409, "TOKEN_EXPIRED");
+  }
+  if (mode !== "legacy" &&
+    oauth?.provider === "META"
+    && oauth.status === "CONNECTED"
+    && account.isSelected
+    && account.externalAccountId
+    && account.accessTokenCiphertext
+    && account.accessTokenIv
+    && account.accessTokenAuthTag
+  ) {
+    const token = TokenVault.fromEnvironment().decrypt({
+      ciphertext: account.accessTokenCiphertext,
+      iv: account.accessTokenIv,
+      authTag: account.accessTokenAuthTag,
+      keyVersion: oauth.tokenKeyVersion,
+    });
+    const apiVersion = process.env.META_GRAPH_API_VERSION || process.env.FACEBOOK_GRAPH_API_VERSION || "v26.0";
+    return {
+      adapter: createAdapter(account.externalAccountId, token, apiVersion, true),
+      token,
+      source: `meta-oauth:${apiVersion}`,
+    };
+  }
+  if (mode === "oauth") throw new AppError("Meta OAuth 账号连接未验证或加密凭据不可用。", 409, "META_CONNECTION_UNAVAILABLE");
+  const legacy = await requireVerifiedConnection(clientId, accountId);
+  const token = resolveFacebookSecret(legacy.credentialRef);
+  return {
+    adapter: createAdapter(legacy.pageId, token, legacy.graphApiVersion),
+    token,
+    source: `facebook-graph:${legacy.graphApiVersion}`,
+  };
+}
+
+function createAdapter(pageId: string, accessToken: string, apiVersion: string, oauth = false) {
   return new FacebookGraphAdapter({
     pageId,
     accessToken,
     apiVersion,
-    baseUrl: process.env.FACEBOOK_GRAPH_BASE_URL,
-    timeoutMs: Number(process.env.FACEBOOK_REQUEST_TIMEOUT_MS || 30_000),
+    baseUrl: oauth ? process.env.META_GRAPH_BASE_URL || process.env.FACEBOOK_GRAPH_BASE_URL : process.env.FACEBOOK_GRAPH_BASE_URL,
+    timeoutMs: Number(oauth ? process.env.META_REQUEST_TIMEOUT_MS || process.env.FACEBOOK_REQUEST_TIMEOUT_MS || 30_000 : process.env.FACEBOOK_REQUEST_TIMEOUT_MS || 30_000),
   });
+}
+
+async function getScopedFacebookAccount(clientId: string, accountId: string) {
+  const account = await db.socialAccount.findFirst({
+    where: { id: accountId, clientId, platform: "facebook" },
+    include: { facebookConnection: true, platformConnection: true },
+  });
+  if (!account || account.clientId !== clientId) throw new AppError("Facebook 账号不存在或无权访问。", 404, "FACEBOOK_ACCOUNT_NOT_FOUND");
+  return account;
 }
 
 async function getScopedConnection(clientId: string, accountId: string) {
@@ -285,4 +345,29 @@ async function markConnectionInvalid(connectionId: string, accountId: string, er
     db.facebookPageConnection.update({ where: { id: connectionId }, data: { connectionStatus: CapabilityStatus.UNVERIFIED, tokenStatus: FacebookTokenStatus.EXPIRED, lastCheckedAt: new Date(), lastErrorCategory: error.category, lastErrorMessage: error.message } }),
     db.socialAccount.update({ where: { id: accountId }, data: { publishCapability: CapabilityStatus.UNVERIFIED, metricsCapability: CapabilityStatus.UNVERIFIED, commentsCapability: CapabilityStatus.UNVERIFIED, verifiedAt: null } }),
   ]);
+}
+
+async function markAccountConnectionInvalid(
+  account: Awaited<ReturnType<typeof getScopedFacebookAccount>>,
+  error: { category: FacebookErrorCategory; message: string },
+) {
+  if (account.platformConnection) {
+    await db.$transaction([
+      db.platformConnection.update({
+        where: { id: account.platformConnection.id },
+        data: { status: "TOKEN_EXPIRED", lastErrorCode: error.category, lastErrorMessage: error.message },
+      }),
+      db.socialAccount.update({
+        where: { id: account.id },
+        data: {
+          publishCapability: CapabilityStatus.UNVERIFIED,
+          metricsCapability: CapabilityStatus.UNVERIFIED,
+          commentsCapability: CapabilityStatus.UNVERIFIED,
+          verifiedAt: null,
+        },
+      }),
+    ]);
+    return;
+  }
+  if (account.facebookConnection) await markConnectionInvalid(account.facebookConnection.id, account.id, error);
 }

@@ -4,7 +4,7 @@ import { db } from "@/lib/db";
 
 export default async function ContentPage() {
   const context = await requirePageContext();
-  const [products, items, client] = await Promise.all([
+  const [products, items, client, accounts] = await Promise.all([
     db.product.findMany({ where: { clientId: context.clientId }, include: { assetLinks: true }, orderBy: { updatedAt: "desc" } }),
     db.contentItem.findMany({
       where: { clientId: context.clientId },
@@ -16,15 +16,19 @@ export default async function ContentPage() {
       orderBy: { updatedAt: "desc" },
     }),
     db.client.findUniqueOrThrow({ where: { id: context.clientId } }),
+    db.socialAccount.findMany({
+      where: { clientId: context.clientId, isSelected: true },
+      orderBy: [{ platform: "asc" }, { displayName: "asc" }],
+    }),
   ]);
   return (
     <OperatorShell context={context}>
       <div className="page-title"><div><h1>内容审核</h1><p className="muted">每个平台独立成品；批准绑定当前账号和不可变版本。</p></div></div>
-      <section className="card" style={{ marginBottom: "1rem" }}><h2>生成四平台草稿</h2><form action="/api/content/generate" method="post" className="stack">
+      <section className="card" style={{ marginBottom: "1rem" }}><h2>按账号生成平台草稿</h2><form action="/api/content/generate" method="post" className="stack">
         <div className="row"><label>产品<select name="productId" required><option value="">请选择</option>{products.map((product) => <option value={product.id} key={product.id}>{product.name}（素材 {product.assetLinks.length}）</option>)}</select></label><label>主题<input name="theme" placeholder="例如：经销商选品要点" required /></label><label>业务目的<input name="objective" defaultValue="获得经销商或批发商的有效询盘" required /></label></div>
-        <input type="hidden" name="platforms" value="facebook,instagram,tiktok,linkedin" />
+        <div className="stack"><strong>目标账号</strong>{accounts.map((account) => <label className="account-option" key={account.id}><input type="checkbox" name="accountIds" value={account.id} defaultChecked /><span>{account.platform.toUpperCase()} · {account.displayName}<br /><small className="muted">发布能力：{account.publishCapability}</small></span></label>)}</div>
         <div className="warning">目标市场为空时只生成带标识的通用草稿，不自动批准市场方案。无模型凭据时输出会标为“模拟生成”。</div>
-        <button disabled={products.length === 0}>生成草稿</button>
+        <button disabled={products.length === 0 || accounts.length === 0}>生成草稿</button>
       </form></section>
       <div className="grid">
         {items.length === 0 && <section className="card span-12"><p className="muted">尚无内容。先录入产品，再生成草稿。</p></section>}
@@ -44,7 +48,7 @@ export default async function ContentPage() {
               <form action={`/api/content/${item.id}/submit`} method="post"><button className="secondary">提交审核</button></form>
               <form action={`/api/content/${item.id}/review`} method="post"><input type="hidden" name="decision" value="APPROVED" /><button>批准当前版本</button></form>
               <form action={`/api/content/${item.id}/review`} method="post"><input type="hidden" name="decision" value="REJECTED" /><button className="danger">拒绝</button></form>
-              <form action={`/api/content/${item.id}/schedule`} method="post"><button disabled={!validApproval}>排期{client.mode === "LIVE" ? "真实发布" : client.mode === "DEMO" ? "模拟发布" : "（草稿模式禁止发布）"}</button></form>
+              <form action={`/api/content/${item.id}/schedule`} method="post" className="row"><select name="publishMode" defaultValue="NOW"><option value="NOW">立即进入队列</option><option value="SCHEDULED">按本地时间排期</option></select><input name="localDateTime" type="datetime-local" aria-label="计划发布时间" /><input type="hidden" name="timezone" value={client.timezone} /><button disabled={!validApproval}>排期{client.mode === "LIVE" ? "真实发布" : client.mode === "DEMO" ? "模拟发布" : "（草稿模式禁止发布）"}</button></form>
             </div>
             <div className={validApproval ? "warning" : "error"}>{validApproval ? `已批准 v${version?.version}，账号 ${item.account.displayName}` : "当前版本尚无有效批准，后端会阻止发布。"}</div>
             <small className="muted">历史版本：{item.versions.map((entry) => `v${entry.version}`).join("、")}</small>

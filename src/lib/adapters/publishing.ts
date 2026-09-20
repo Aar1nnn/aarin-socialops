@@ -13,7 +13,7 @@ export class MockSocialPublishAdapter implements SocialPublishAdapter {
       return { status: "unknown", code: "MOCK_TIMEOUT", message: "模拟请求超时，远端结果未知。" };
     }
     if (outcome === "failed") {
-      return { status: "failed", code: "MOCK_FAILURE", message: "模拟可重试失败。", retryable: true };
+      return { status: "failed", code: "MOCK_FAILURE", message: "模拟发送前可重试失败。", retryable: true, failurePhase: "PRE_DISPATCH" };
     }
     const remotePostId = `mock_${sha256(request.idempotencyKey).slice(0, 16)}`;
     return {

@@ -34,6 +34,7 @@ export type PublishRequest = {
   accountExternalId: string | null;
   text: string;
   assets: Array<{
+    storageProvider?: string;
     storageKey: string;
     mimeType: string;
     originalName: string;
@@ -43,7 +44,7 @@ export type PublishRequest = {
 
 export type PublishResult =
   | { status: "published"; remotePostId: string; remotePostUrl: string | null; publishedAt: Date }
-  | { status: "failed"; code: string; message: string; retryable: boolean }
+  | { status: "failed"; code: string; message: string; retryable: boolean; failurePhase?: "PRE_DISPATCH" | "POST_DISPATCH" }
   | { status: "unknown"; code: string; message: string; remotePostId?: string; remotePostUrl?: string | null };
 
 export interface SocialPublishAdapter {

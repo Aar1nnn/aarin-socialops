@@ -14,3 +14,7 @@ export function canWrite(role: MembershipRole): boolean {
 export function assertCanWrite(context: RequestContext): void {
   if (!canWrite(context.role)) throw new AppError("当前角色只有查看权限。", 403, "FORBIDDEN");
 }
+
+export function assertOwner(context: RequestContext): void {
+  if (context.role !== "OWNER") throw new AppError("只有客户负责人可管理平台连接。", 403, "OWNER_REQUIRED");
+}

@@ -18,6 +18,7 @@ export async function OperatorShell({ context, children }: { context: RequestCon
           <Link href="/">工作台</Link>
           <Link href="/products">产品与素材</Link>
           <Link href="/content">内容审核</Link>
+          <Link href="/connections">平台连接</Link>
           <Link href="/insights">线索与复盘</Link>
           <Link href="/settings">设置</Link>
         </nav>

@@ -83,7 +83,7 @@ export async function generateOperationReport(context: RequestContext, start?: D
     : ["以实际询盘质量而非表面互动决定下一轮内容重点。"];
   const recommendations = [
     client.targetMarkets.length ? "按已确认市场比较平台线索质量。" : "确认目标国家后再批准市场特定方案。",
-    "把人工回复与吕总反馈写回线索状态，建立询盘到结果的可追踪链路。",
+    "把人工回复与客户销售反馈写回线索状态，建立询盘到结果的可追踪链路。",
   ];
   return db.operationReport.create({
     data: {
