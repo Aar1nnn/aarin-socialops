@@ -1,4 +1,4 @@
-import type { ButtonHTMLAttributes, ReactNode } from "react";
+import { cloneElement, isValidElement, type ButtonHTMLAttributes, type ReactElement, type ReactNode } from "react";
 import { getStatusPresentation, type StatusTone } from "@/lib/presentation/status";
 
 function classNames(...values: Array<string | false | null | undefined>) {
@@ -97,7 +97,7 @@ export function Notice({
   tone?: "info" | "warning" | "danger" | "success";
 }) {
   return (
-    <div className={classNames("notice", `notice-${tone}`)} role={tone === "danger" ? "alert" : "status"}>
+    <div className={classNames("notice", `notice-${tone}`)} role={tone === "danger" ? "alert" : "note"}>
       {title ? <strong>{title}</strong> : null}
       <div>{children}</div>
     </div>
@@ -118,12 +118,19 @@ export function FormField({
   className?: string;
 }) {
   const helperId = helper ? `${htmlFor}-helper` : undefined;
+  const child = helper && helperId && isValidElement(children)
+    ? cloneElement(children as ReactElement<{ "aria-describedby"?: string }>, {
+        "aria-describedby": Array.from(new Set([
+          (children as ReactElement<{ "aria-describedby"?: string }>).props["aria-describedby"],
+          helperId,
+        ].filter(Boolean))).join(" "),
+      })
+    : children;
   return (
     <div className={classNames("form-field", className)}>
       <label htmlFor={htmlFor}>{label}</label>
-      {children}
+      {child}
       {helper ? <p className="field-helper" id={helperId}>{helper}</p> : null}
     </div>
   );
 }
-

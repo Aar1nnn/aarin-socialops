@@ -15,6 +15,11 @@ const STATUS_PRESENTATIONS: Record<string, StatusPresentation> = {
   CONFIRMED: { label: "已确认", tone: "success" },
   PROPOSED: { label: "待确认", tone: "warning" },
   MISSING: { label: "缺失", tone: "danger" },
+  IMAGE: { label: "图片", tone: "neutral" },
+  VIDEO: { label: "视频", tone: "neutral" },
+  DOCUMENT: { label: "文档", tone: "neutral" },
+  ORIGINAL: { label: "原始素材", tone: "neutral" },
+  DERIVED: { label: "衍生素材", tone: "neutral" },
   UNCONFIGURED: { label: "未配置", tone: "neutral" },
   UNVERIFIED: { label: "未验证", tone: "warning" },
   VERIFIED: { label: "可用", tone: "success" },
@@ -32,6 +37,8 @@ const STATUS_PRESENTATIONS: Record<string, StatusPresentation> = {
   CANCELLED: { label: "已取消", tone: "neutral" },
   PENDING: { label: "等待处理", tone: "neutral" },
   RETRY: { label: "等待重试", tone: "warning" },
+  DISPATCHING: { label: "正在发送", tone: "info" },
+  SUCCEEDED: { label: "已成功", tone: "success" },
   CONNECTING: { label: "连接中", tone: "info" },
   CONNECTED: { label: "已连接", tone: "success" },
   TOKEN_EXPIRING: { label: "凭据即将到期", tone: "warning" },
@@ -72,6 +79,21 @@ const STATUS_PRESENTATIONS: Record<string, StatusPresentation> = {
   GENERAL: { label: "一般互动", tone: "neutral" },
   SPAM: { label: "无效信息", tone: "neutral" },
   SIMULATED: { label: "模拟", tone: "warning" },
+  FACEBOOK_PAGE: { label: "Facebook Page", tone: "neutral" },
+  INSTAGRAM_PROFESSIONAL: { label: "Instagram 专业账号", tone: "neutral" },
+  COMMENT: { label: "评论", tone: "neutral" },
+  MESSAGE: { label: "私信", tone: "neutral" },
+  MANUAL_NOTE: { label: "人工记录", tone: "neutral" },
+  TEXT_GENERATION: { label: "文本生成", tone: "neutral" },
+  IMAGE_GENERATION: { label: "图像生成", tone: "neutral" },
+  SOCIAL_PUBLISHING: { label: "社媒发布", tone: "neutral" },
+  METRICS: { label: "指标同步", tone: "neutral" },
+  INTERACTIONS: { label: "互动同步", tone: "neutral" },
+  NOTIFICATION: { label: "通知", tone: "neutral" },
+  WORDPRESS: { label: "WordPress", tone: "neutral" },
+  OBJECT_STORAGE: { label: "对象存储", tone: "neutral" },
+  IN_APP: { label: "站内通知", tone: "neutral" },
+  URGENT_EXTERNAL: { label: "紧急外部通知", tone: "warning" },
 };
 
 export function getStatusPresentation(value: string | null | undefined): StatusPresentation {
@@ -109,7 +131,11 @@ export function platformLabel(value: string | null | undefined) {
   return value ? labels[value] ?? value : "未设置";
 }
 
-export function formatDateTime(value: Date | string | null | undefined, fallback = "—") {
+export function formatDateTime(
+  value: Date | string | null | undefined,
+  fallback = "—",
+  timeZone?: string,
+) {
   if (!value) return fallback;
   const date = value instanceof Date ? value : new Date(value);
   if (Number.isNaN(date.getTime())) return fallback;
@@ -120,6 +146,6 @@ export function formatDateTime(value: Date | string | null | undefined, fallback
     hour: "2-digit",
     minute: "2-digit",
     hour12: false,
+    timeZone,
   }).format(date);
 }
-
