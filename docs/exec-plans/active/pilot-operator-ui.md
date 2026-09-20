@@ -2,7 +2,7 @@
 
 ## Status
 
-- Phase: final verification and remote review
+- Phase: awaiting human visual review
 - Branch: `feat/pilot-operator-ui`
 - Baseline: `v0.3-meta-facebook-verified` / `main` at `859d7f0`
 - Working objective: redesign the operator-facing UI without changing core business behavior
@@ -221,7 +221,7 @@ No production dependency will be added unless an unavoidable need is demonstrate
 - [x] Reorganize Settings.
 - [x] Verify responsive behavior, accessibility, and operator copy through implementation review and an independent quality gate.
 - [x] Run the complete test/typecheck/build/diff verification set.
-- [ ] Commit, push, wait for CI, and create an unmerged PR.
+- [x] Commit, push, wait for CI, and create an unmerged PR.
 
 ## Known risks and controls
 
@@ -237,10 +237,12 @@ No production dependency will be added unless an unavoidable need is demonstrate
 - `pnpm test`: PASS — 15 files, 112 tests.
 - `pnpm build`: PASS — Next.js production build and route generation completed.
 - `git diff --check`: PASS; Git emitted only the existing Windows LF-to-CRLF conversion warnings.
+- GitHub Actions: PASS for both the initial push and pull-request runs; final checks are rerun for every follow-up commit.
+- Pull request: [#3 — refactor: redesign Aarin SocialOps operator experience](https://github.com/Aar1nnn/aarin-socialops/pull/3), OPEN and unmerged.
 - UI contract coverage now protects Meta OAuth return paths, account selection, disconnect confirmation, content generation/review/scheduling/query fields, Insights permission/capability gates, and Settings owner gates.
 - Independent quality review found no core business-semantics regression. Its blocking table-semantics and narrow lead-detail issues were corrected before final verification.
 - Browser-level human visual review remains the purpose of the unmerged PR; no real Meta publish, OAuth, metrics, comments, or disconnect operation was executed during this UI-only phase.
 
 ## Next step
 
-Create the remaining logical commits, push `feat/pilot-operator-ui`, wait for GitHub Actions, and open the unmerged visual-review PR.
+Complete human visual review of PR #3 at the target desktop and narrow-view widths. Keep the PR open and do not merge until that review is approved.
