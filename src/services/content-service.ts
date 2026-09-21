@@ -14,6 +14,7 @@ import { sha256 } from "../lib/security";
 import { zonedLocalDateTimeToUtc } from "../lib/timezone";
 import { assertCanWrite, type RequestContext } from "../lib/context";
 import { releaseUsage, reserveUsage, settleUsage } from "./usage-service";
+import { prepareAIContentPipelineInput, runPreparedAIContentPipeline } from "./ai-content-pipeline-service";
 
 const platforms = ["facebook", "instagram", "tiktok", "linkedin"] as const;
 const generateInputSchema = z.object({
@@ -45,7 +46,7 @@ export async function generateContentPlan(context: RequestContext, raw: unknown)
   if (accessibleAssets.length !== new Set(assetIds).size) {
     throw new AppError("包含不存在或其他客户的素材。", 403, "ASSET_SCOPE_VIOLATION");
   }
-  const [client, candidateAccounts, prompt, textIntegration] = await Promise.all([
+  const [client, candidateAccounts, prompt, textIntegration, policies] = await Promise.all([
     db.client.findUniqueOrThrow({ where: { id: context.clientId } }),
     db.socialAccount.findMany({
       where: requestedAccountIds?.length
@@ -60,6 +61,7 @@ export async function generateContentPlan(context: RequestContext, raw: unknown)
       where: { clientId: context.clientId, type: "TEXT_GENERATION", status: CapabilityStatus.VERIFIED },
       orderBy: { verifiedAt: "desc" },
     }),
+    db.platformPolicy.findMany({ where: { clientId: context.clientId } }),
   ]);
   let accounts = candidateAccounts;
   if (requestedAccountIds?.length) {
@@ -107,13 +109,18 @@ export async function generateContentPlan(context: RequestContext, raw: unknown)
     platforms: targetPlatforms,
     instruction: prompt.instruction,
   };
+  const pipelineInput = await prepareAIContentPipelineInput(context, modelInput);
   const reservation = configuredProvider === "openai-compatible"
-    ? await reserveUsage({ clientId: context.clientId, capability: "multi_platform_content", provider: configuredProvider, units: Math.ceil(JSON.stringify(modelInput).length / 4) + Number(process.env.TEXT_MODEL_MAX_OUTPUT_UNITS || 2000) })
+    ? await reserveUsage({ clientId: context.clientId, capability: "multi_platform_content", provider: configuredProvider, units: Math.ceil(JSON.stringify(pipelineInput).length / 4) + Number(process.env.TEXT_MODEL_MAX_OUTPUT_UNITS || 2000) })
     : null;
   let generated;
   try {
     const adapter = getTextGenerationAdapter(configuredProvider);
-    generated = await adapter.generate(modelInput);
+    generated = await runPreparedAIContentPipeline(
+      pipelineInput,
+      adapter,
+      Object.fromEntries(policies.map((policy) => [policy.platform, policy.maxTextLength])),
+    );
     if (reservation) await settleUsage({ reservationId: reservation.id, clientId: context.clientId, model: generated.model, inputUnits: generated.usage.inputUnits, outputUnits: generated.usage.outputUnits });
   } catch (error) {
     if (reservation) await releaseUsage(reservation.id, context.clientId);
@@ -169,7 +176,8 @@ export async function generateContentPlan(context: RequestContext, raw: unknown)
             productFocus: client.productFocus,
             brandGuidelines: client.brandGuidelines,
             targetMarkets: client.targetMarkets,
-          },
+            pipeline: generated.pipeline,
+          } as Prisma.InputJsonValue,
           assetLinks: {
             create: accessibleAssets.map((asset) => ({ clientId: context.clientId, assetId: asset.id })),
           },
@@ -199,7 +207,7 @@ export async function generateContentPlan(context: RequestContext, raw: unknown)
         action: "CONTENT_PLAN_GENERATED",
         entityType: "ContentPlan",
         entityId: plan.id,
-        metadata: { simulated: generated.simulated, platforms: targetPlatforms, accountIds: accounts.map((account) => account.id) },
+        metadata: { simulated: generated.simulated, platforms: targetPlatforms, accountIds: accounts.map((account) => account.id), pipelineStages: generated.pipeline.stages } as Prisma.InputJsonValue,
       },
     });
     return { plan, items };

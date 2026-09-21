@@ -58,6 +58,11 @@ pnpm demo:e2e
 - 本地磁盘与 S3-compatible `StorageAdapter`；上传和 Facebook 媒体发布使用流，不把完整文件读入内存。
 - `ffprobe` 媒体元数据检查（安装时启用，缺失时明确标为不可用）；IANA 时区排期和 DST 非法本地时间拒绝。
 - worker 在长外部请求期间续租；失去租约时不会写入最终发布结果，发布后超时继续保持 `UNKNOWN`。
+- 结构化 `BrandProfile` 与旧 `brandGuidelines` 兼容回退；品牌、最近内容、表现和研究记忆全部来自 PostgreSQL 权威记录。
+- 阶段化内容生成上下文、策略、结构校验、AI review、humanizer/shortener 和 image-prompt 接口；输出仍是待人工审核的 `ContentVersion`，不会创建审批或发布任务。
+- 基于现有内容/审批/发布记录的月、周、列表日历与服务层重排；没有第二套 scheduler。
+- 基于 `MetricSnapshot` 的 canonical metrics、周期比较和 freshness；缺失、失败和无权限继续与真实 0 分开。
+- 站内通知后的 Webhook/Email HTTP 投递记录；外部投递失败保留 `NotificationDelivery` 失败证据且不回滚主业务。
 
 ## 当前模拟
 
@@ -76,7 +81,7 @@ pnpm demo:e2e
 - Instagram、TikTok、LinkedIn 真实账号、发布、结果查询、指标和评论接口。
 - Facebook 私信自动采集、自动回复、自动私信和自动报价。
 - Facebook 群组自动检索、入群或发帖；当前只能创建人工任务。
-- 紧急外部通知；未配置时只保存站内通知和任务，不声称已送达。
+- Webhook/Email 外部通知端点需要单独配置和验证；未配置时只保存站内通知和任务，不声称已送达。
 - 图片生成与 WordPress 草稿写入；已有明确的受限适配器接口和配置状态。
 - 自动客户回复、私信、报价和广告投放不存在可执行路径。
 

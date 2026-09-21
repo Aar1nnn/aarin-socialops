@@ -15,11 +15,14 @@ export async function OperatorShell({ context, children }: { context: RequestCon
         <span className="mode">{modeName}</span>
         <p>{client.name}</p>
         <nav>
-          <Link href="/">工作台</Link>
-          <Link href="/products">产品与素材</Link>
-          <Link href="/content">内容审核</Link>
+          <Link href="/">总览</Link>
+          <Link href="/content">内容</Link>
+          <Link href="/calendar">日历</Link>
+          <Link href="/products">产品</Link>
+          <Link href="/brand">品牌</Link>
+          <Link href="/analytics">数据分析</Link>
+          <Link href="/insights">互动 / 线索</Link>
           <Link href="/connections">平台连接</Link>
-          <Link href="/insights">线索与复盘</Link>
           <Link href="/settings">设置</Link>
         </nav>
         {memberships.length > 1 && (
