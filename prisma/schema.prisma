@@ -178,6 +178,11 @@ enum NotificationSeverity {
   URGENT
 }
 
+enum AiReviewVerdict {
+  PASS
+  NEEDS_REVISION
+}
+
 enum IntegrationType {
   TEXT_GENERATION
   IMAGE_GENERATION
@@ -262,6 +267,29 @@ model Client {
   usageReservations    UsageReservation[]
   platformConnections  PlatformConnection[]
   oauthStates          OAuthState[]
+  brandProfile         BrandProfile?
+  aiContentReviews     AiContentReview[]
+}
+
+model BrandProfile {
+  id               String   @id @default(cuid())
+  clientId         String   @unique
+  businessSummary  String
+  positioning      String?
+  audience         String?
+  tone             String?
+  voiceTraits      String[] @default([])
+  goals            String[] @default([])
+  contentLanguages String[] @default([])
+  imageStyle       String?
+  bannedPhrases    String[] @default([])
+  requiredMentions String[] @default([])
+  ctaRules         String[] @default([])
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
+  client           Client   @relation(fields: [clientId], references: [id], onDelete: Cascade)
+
+  @@index([clientId, updatedAt])
 }
 
 model ResearchRecord {
@@ -525,6 +553,7 @@ model ContentItem {
   account          SocialAccount    @relation(fields: [accountId], references: [id], onDelete: Restrict)
   versions         ContentVersion[] @relation("ItemVersions")
   currentVersion   ContentVersion?  @relation("CurrentVersion", fields: [currentVersionId], references: [id], onDelete: SetNull)
+  metricSnapshots  MetricSnapshot[]
 
   @@unique([planId, accountId])
   @@index([clientId, status])
@@ -551,9 +580,26 @@ model ContentVersion {
   assetLinks         ContentVersionAsset[]
   approvals          Approval[]
   publishJobs        PublishJob[]
+  aiReviews          AiContentReview[]
 
   @@unique([contentItemId, version])
   @@index([clientId, createdAt])
+}
+
+model AiContentReview {
+  id               String          @id @default(cuid())
+  clientId         String
+  contentVersionId String
+  verdict          AiReviewVerdict
+  score            Int?
+  issues           Json
+  reviewer         String
+  metadata         Json?
+  createdAt        DateTime        @default(now())
+  client           Client          @relation(fields: [clientId], references: [id], onDelete: Cascade)
+  contentVersion   ContentVersion  @relation(fields: [contentVersionId], references: [id], onDelete: Cascade)
+
+  @@index([clientId, contentVersionId, createdAt])
 }
 
 model ContentVersionAsset {
@@ -642,23 +688,26 @@ model PublishAttempt {
 }
 
 model MetricSnapshot {
-  id           String           @id @default(cuid())
-  clientId     String
-  accountId    String
-  metricKey    String
-  numericValue Decimal?
-  availability DataAvailability
-  dataKind     DataKind
-  periodStart  DateTime?
-  periodEnd    DateTime?
-  fetchedAt    DateTime
-  source       String
-  errorMessage String?
-  createdAt    DateTime         @default(now())
-  client       Client           @relation(fields: [clientId], references: [id], onDelete: Cascade)
-  account      SocialAccount    @relation(fields: [accountId], references: [id], onDelete: Cascade)
+  id            String           @id @default(cuid())
+  clientId      String
+  accountId     String
+  contentItemId String?
+  metricKey     String
+  numericValue  Decimal?
+  availability  DataAvailability
+  dataKind      DataKind
+  periodStart   DateTime?
+  periodEnd     DateTime?
+  fetchedAt     DateTime
+  source        String
+  errorMessage  String?
+  createdAt     DateTime         @default(now())
+  client        Client           @relation(fields: [clientId], references: [id], onDelete: Cascade)
+  account       SocialAccount    @relation(fields: [accountId], references: [id], onDelete: Cascade)
+  contentItem   ContentItem?     @relation(fields: [contentItemId], references: [id], onDelete: SetNull)
 
   @@index([clientId, metricKey, fetchedAt])
+  @@index([clientId, contentItemId, fetchedAt])
 }
 
 model Interaction {
@@ -759,16 +808,19 @@ model Experiment {
 }
 
 model NotificationChannel {
-  id            String           @id @default(cuid())
-  clientId      String
-  type          String
-  displayName   String
-  credentialRef String?
-  status        CapabilityStatus @default(UNCONFIGURED)
-  verifiedAt    DateTime?
-  createdAt     DateTime         @default(now())
-  updatedAt     DateTime         @updatedAt
-  client        Client           @relation(fields: [clientId], references: [id], onDelete: Cascade)
+  id             String           @id @default(cuid())
+  clientId       String
+  type           String
+  displayName    String
+  credentialRef  String?
+  status         CapabilityStatus @default(UNCONFIGURED)
+  publicConfig   Json?
+  verifiedAt     DateTime?
+  lastDispatchAt DateTime?
+  lastError      String?
+  createdAt      DateTime         @default(now())
+  updatedAt      DateTime         @updatedAt
+  client         Client           @relation(fields: [clientId], references: [id], onDelete: Cascade)
 
   @@unique([clientId, type, displayName])
 }

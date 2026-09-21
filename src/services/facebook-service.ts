@@ -210,7 +210,7 @@ export async function syncFacebookComments(context: RequestContext, publishJobId
 
 export async function syncFacebookPostMetrics(context: RequestContext, publishJobId: string, adapterOverride?: FacebookGraphAdapter) {
   assertCanWrite(context);
-  const job = await db.publishJob.findFirst({ where: { id: publishJobId, clientId: context.clientId }, include: { account: { include: { facebookConnection: true, platformConnection: true } } } });
+  const job = await db.publishJob.findFirst({ where: { id: publishJobId, clientId: context.clientId }, include: { account: { include: { facebookConnection: true, platformConnection: true } }, contentVersion: { select: { contentItemId: true } } } });
   if (!job || job.account.clientId !== context.clientId) throw new AppError("发布任务不存在或无权访问。", 404, "PUBLISH_JOB_NOT_FOUND");
   if (job.environment !== "LIVE" || !["facebook-graph", "meta-facebook"].includes(job.adapter) || !job.remotePostId) throw new AppError("只有带远端 ID 的 Facebook LIVE 帖子可同步帖子指标。", 409, "FACEBOOK_POST_NOT_QUERYABLE");
   const connection = job.account.facebookConnection;
@@ -223,13 +223,13 @@ export async function syncFacebookPostMetrics(context: RequestContext, publishJo
   try {
     const values = await adapter.readPostMetrics(job.remotePostId);
     if (!values.length) {
-      return [await db.metricSnapshot.create({ data: { clientId: context.clientId, accountId: job.accountId, metricKey: `post_engagement:${job.remotePostId}`, numericValue: null, availability: DataAvailability.UNSUPPORTED, dataKind: "REAL", fetchedAt, source, errorMessage: "接口未返回评论或回应汇总。" } })];
+      return [await db.metricSnapshot.create({ data: { clientId: context.clientId, accountId: job.accountId, contentItemId: job.contentVersion.contentItemId, metricKey: `post_engagement:${job.remotePostId}`, numericValue: null, availability: DataAvailability.UNSUPPORTED, dataKind: "REAL", fetchedAt, source, errorMessage: "接口未返回评论或回应汇总。" } })];
     }
-    return db.$transaction(values.map((value) => db.metricSnapshot.create({ data: { clientId: context.clientId, accountId: job.accountId, metricKey: `${value.metricKey}:${job.remotePostId}`, numericValue: value.value, availability: DataAvailability.AVAILABLE, dataKind: "REAL", fetchedAt, source } })));
+    return db.$transaction(values.map((value) => db.metricSnapshot.create({ data: { clientId: context.clientId, accountId: job.accountId, contentItemId: job.contentVersion.contentItemId, metricKey: `${value.metricKey}:${job.remotePostId}`, numericValue: value.value, availability: DataAvailability.AVAILABLE, dataKind: "REAL", fetchedAt, source } })));
   } catch (error) {
     const normalized = normalizeFacebookFailure(error, token);
     if (normalized.category === "TOKEN_INVALID") await markAccountConnectionInvalid(job.account, normalized);
-    return [await db.metricSnapshot.create({ data: { clientId: context.clientId, accountId: job.accountId, metricKey: `post_engagement:${job.remotePostId}`, numericValue: null, availability: normalized.category === "PERMISSION_DENIED" || normalized.category === "TOKEN_INVALID" ? DataAvailability.PERMISSION_DENIED : DataAvailability.READ_FAILED, dataKind: "REAL", fetchedAt, source, errorMessage: `${normalized.category}: ${normalized.message}` } })];
+    return [await db.metricSnapshot.create({ data: { clientId: context.clientId, accountId: job.accountId, contentItemId: job.contentVersion.contentItemId, metricKey: `post_engagement:${job.remotePostId}`, numericValue: null, availability: normalized.category === "PERMISSION_DENIED" || normalized.category === "TOKEN_INVALID" ? DataAvailability.PERMISSION_DENIED : DataAvailability.READ_FAILED, dataKind: "REAL", fetchedAt, source, errorMessage: `${normalized.category}: ${normalized.message}` } })];
   }
 }
 

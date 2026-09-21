@@ -165,6 +165,18 @@ OAuth 路径还需额外验收：连接测试用户、回调一次性消费、Pa
 
 安装 `ffprobe` 后设置 `FFPROBE_PATH`，系统可提取视频时长、宽高和音视频 codec。没有安装时上传不会伪造元数据，检查结果会明确标为不可用。
 
+## 非发布运营模块
+
+本分支在现有 Aarin Core 上增加 Brand、结构化 PostgreSQL Memory、AI Content Pipeline、Calendar、Social Analytics 与 Notifications foundation：
+
+- `/brand`：维护一租户一份 `BrandProfile`，未建立时兼容读取 `Client.brandGuidelines`，并预览 Content / Performance / Research Memory。
+- `/calendar`：月、周、列表视图与过滤；只通过服务层移动已有、已批准、已排期的 `ContentItem` 和对应 `PublishJob`。
+- `/analytics`：从 `MetricSnapshot` 做统一指标、当前/上期、变化率与 freshness 聚合；缺失态不会显示为数值 `0`，REAL/MOCK 保持可见。
+- `/notifications`：沿用 `InAppNotification` 与 `NotificationChannel`，增加轻量 HTTP Webhook/Email gateway；外部派发失败不会删除或回滚站内事件。
+- Calendar 中的 AI 工作流会创建新的 `ContentVersion` 和独立 `AiContentReview`，不会创建 `Approval` 或 `PublishJob`，仍需人工提交与批准。
+
+Memory 全部由 PostgreSQL 现有业务表查询和结构化聚合生成，不使用 Vector DB，也不建立第二套 Content、Scheduler、Analytics、Research 或 Notification 数据库。
+
 ## 常用验证命令
 
 ```powershell
