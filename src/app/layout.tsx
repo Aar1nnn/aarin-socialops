@@ -2,8 +2,11 @@ import type { Metadata } from "next";
 import "./globals.css";
 
 export const metadata: Metadata = {
-  title: "海外社媒 AI 运营工作台",
-  description: "带确定性审批、发布和线索交接的海外社媒运营工作台",
+  title: {
+    default: "Aarin SocialOps",
+    template: "%s · Aarin SocialOps",
+  },
+  description: "Social operations workspace for content, publishing, and customer engagement.",
 };
 
 export default function RootLayout({ children }: Readonly<{ children: React.ReactNode }>) {

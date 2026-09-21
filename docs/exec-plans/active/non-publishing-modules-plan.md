@@ -95,8 +95,8 @@ All schema changes are additive and delivered by one forward migration.
 - [x] Calendar foundation.
 - [x] Analytics foundation.
 - [x] Notifications foundation.
-- [x] Operator UI integration.
-- [x] Local migration, typecheck, 14 test files / 94 tests, production build, and diff check.
+- [x] Operator UI integration, including the complete PR #3 pilot design system and navigation.
+- [x] Local migration, typecheck, 16 test files / 125 tests, production build, and diff check.
 - [x] Final defect-first diff review and GitHub CI.
 - [x] Branch pushed and unmerged PR #5 opened: https://github.com/Aar1nnn/aarin-socialops/pull/5
 
@@ -105,7 +105,7 @@ All schema changes are additive and delivered by one forward migration.
 - `pnpm db:generate`: PASS
 - `pnpm db:migrate`: PASS for both additive migrations
 - `pnpm typecheck`: PASS
-- `pnpm test`: PASS — 14 files, 94 tests
+- `pnpm test`: PASS — 16 files, 125 tests
 - `pnpm build`: PASS — 33 application routes/pages
 - `git diff --check`: PASS (Git only reports the existing Windows LF/CRLF conversion notice)
 - GitHub Actions push/PR `verify`: PASS
