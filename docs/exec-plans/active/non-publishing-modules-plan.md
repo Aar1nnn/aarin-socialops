@@ -97,8 +97,8 @@ All schema changes are additive and delivered by one forward migration.
 - [x] Notifications foundation.
 - [x] Operator UI integration.
 - [x] Local migration, typecheck, 14 test files / 94 tests, production build, and diff check.
-- [ ] Final independent diff review and GitHub CI.
-- [ ] Push branch and open an unmerged pull request.
+- [x] Final defect-first diff review and GitHub CI.
+- [x] Branch pushed and unmerged PR #5 opened: https://github.com/Aar1nnn/aarin-socialops/pull/5
 
 ## Current verification
 
@@ -108,6 +108,8 @@ All schema changes are additive and delivered by one forward migration.
 - `pnpm test`: PASS — 14 files, 94 tests
 - `pnpm build`: PASS — 33 application routes/pages
 - `git diff --check`: PASS (Git only reports the existing Windows LF/CRLF conversion notice)
+- GitHub Actions push/PR `verify`: PASS
+- PR state: OPEN and MERGEABLE
 
 ## Remaining limitations
 
