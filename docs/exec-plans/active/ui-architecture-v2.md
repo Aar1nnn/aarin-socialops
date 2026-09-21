@@ -5,11 +5,18 @@
 - Phase: architecture and UX planning only
 - Date: 2026-09-22
 - Working branch audited: `feat/brand-memory-ai-calendar-analytics`
-- Working branch head: `c6d5df295a55cb43480872c8faee18d319e9cc1c`
-- Baseline `main`: `859d7f05dc635800cde448fb2de17cfbf3cc57d0`
+- Planning commit: `fe51448` (`docs: define UI architecture v2`)
+- Baseline `main` at planning time: `859d7f05dc635800cde448fb2de17cfbf3cc57d0`
 - Delivery in this phase: this document only
-- Implementation status: not started
+- Implementation status: blocked before branch creation by the required PR convergence gate
 - Human review required before UI Phase 1
+
+### Implementation kickoff checkpoint — 2026-09-22
+
+- PR #3 was visually opened in the local product, its latest CI was green, and it was merged to `main` with merge commit `33ed458afec340866dcbd49b2c7a9eb39f6e1ae0`.
+- PR #4 was synchronized with that `main` by merge commit `63f7d1e`; local verification passed with 17 test files / 128 tests, typecheck, production build, and diff check. Both updated GitHub checks passed.
+- Read-only local acceptance-data inspection found no real `INSTAGRAM_PROFESSIONAL` account. The only Instagram records are demo fixtures or `UNCONFIGURED` placeholders. Instagram external acceptance therefore remains unavailable.
+- PR #4 must not be merged, PR #5 must not be rebased/merged, and `feat/ui-v2-phase1` must not be created until the required Instagram external acceptance is either completed or the human owner explicitly changes that merge gate.
 
 ## Goal
 
