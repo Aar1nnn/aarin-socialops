@@ -284,6 +284,7 @@ model Client {
   brandProfile           BrandProfile?
   analyticsSyncStates    AnalyticsSyncState[]
   notificationDeliveries NotificationDelivery[]
+  notificationRules      NotificationRule[]
 }
 
 model BrandProfile {
@@ -930,6 +931,22 @@ model NotificationChannel {
   @@unique([id, clientId])
 }
 
+model NotificationRule {
+  id              String               @id @default(cuid())
+  clientId        String
+  eventType       String
+  severity        NotificationSeverity
+  channelType     String
+  enabled         Boolean              @default(true)
+  cooldownMinutes Int                  @default(60)
+  createdAt       DateTime             @default(now())
+  updatedAt       DateTime             @updatedAt
+  client          Client               @relation(fields: [clientId], references: [id], onDelete: Cascade)
+
+  @@unique([clientId, eventType, severity, channelType])
+  @@index([clientId, enabled, eventType])
+}
+
 model InAppNotification {
   id          String                 @id @default(cuid())
   clientId    String
@@ -938,13 +955,19 @@ model InAppNotification {
   body        String
   relatedType String?
   relatedId   String?
+  eventType   String                 @default("HIGH_PRIORITY_TASK")
+  dedupeKey   String?
+  occurrenceCount Int               @default(1)
+  lastOccurredAt DateTime            @default(now())
   readAt      DateTime?
   createdAt   DateTime               @default(now())
   client      Client                 @relation(fields: [clientId], references: [id], onDelete: Cascade)
   deliveries  NotificationDelivery[]
 
   @@unique([id, clientId])
+  @@unique([clientId, dedupeKey])
   @@index([clientId, severity, readAt])
+  @@index([clientId, eventType, lastOccurredAt])
 }
 
 model NotificationDelivery {

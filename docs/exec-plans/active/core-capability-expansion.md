@@ -5,7 +5,7 @@
 - Branch: `feat/socialops-core-capability-expansion`
 - Baseline: `main` at `9f1e6e5`
 - Started: 2026-09-23
-- Current phase: Phase C implementation
+- Current phase: full regression and release verification
 - UI V2: explicitly out of scope
 - Instagram external acceptance: explicitly deferred
 
@@ -119,6 +119,7 @@ New route handlers may expose composition actions, version history/compare/resto
 - PR #5 closeout: migration, seed twice, typecheck, 18 files / 141 tests, build, diff check, and GitHub CI passed; merged as `9f1e6e5`.
 - Phase A: additive migration applied; `pnpm typecheck` passed; full suite passed with 19 files / 149 tests; `git diff --check` passed.
 - Phase B: additive migration applied; `pnpm typecheck` passed; full suite passed with 20 files / 157 tests; `git diff --check` passed.
+- Phase C: additive migration applied; `pnpm typecheck` passed; full suite passed with 21 files / 164 tests; `git diff --check` passed.
 - Expansion branch final verification: pending.
 
 ## Remaining limitations
@@ -129,4 +130,4 @@ New route handlers may expose composition actions, version history/compare/resto
 
 ## Next step
 
-Implement Phase C over the existing notification records and `MetricSnapshot` query boundary.
+Run the required migration/seed/regression/build/security checks, update capability documentation, and open the feature PR without merging it.
