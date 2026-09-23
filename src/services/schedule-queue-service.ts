@@ -4,6 +4,7 @@ import { assertCanWrite, type RequestContext } from "../lib/context";
 import { db } from "../lib/db";
 import { AppError } from "../lib/errors";
 import { assertValidTimeZone, zonedLocalDateTimeToUtc } from "../lib/timezone";
+import { recordDomainEvent } from "../lib/domain-events";
 import { rescheduleCalendarItems } from "./calendar-service";
 import { schedulePublication } from "./content-service";
 
@@ -148,7 +149,7 @@ export async function assignContentToQueue(context: RequestContext, raw: unknown
   if (item.accountId !== queue.accountId) throw new AppError("内容账号与排期队列账号不一致。", 409, "SCHEDULE_QUEUE_ACCOUNT_MISMATCH");
   const scheduledAt = await findNextAvailableSlot(context, queue.id, input.after || new Date(), item.id);
   const job = await schedulePublication(context, item.id, { publishMode: "SCHEDULED", localDateTime: formatLocalDateTime(scheduledAt, queue.timezone), timezone: queue.timezone });
-  await db.auditLog.create({ data: { clientId: context.clientId, userId: context.userId, action: "CONTENT_ASSIGNED_TO_SCHEDULE_QUEUE", entityType: "ContentItem", entityId: item.id, metadata: { queueId: queue.id, scheduledAt: scheduledAt.toISOString() } } });
+  await recordDomainEvent(context, { type: "CONTENT_SCHEDULED", entityType: "ContentItem", entityId: item.id, metadata: { queueId: queue.id, scheduledAt: scheduledAt.toISOString() } });
   return { contentItemId: item.id, queueId: queue.id, scheduledAt, publishJobId: job.id };
 }
 

@@ -3,6 +3,7 @@ import { z } from "zod";
 import { assertCanWrite, type RequestContext } from "../lib/context";
 import { db } from "../lib/db";
 import { AppError } from "../lib/errors";
+import { recordDomainEvent } from "../lib/domain-events";
 
 const requestChangesSchema = z.object({
   expectedVersionId: z.string().min(1),
@@ -66,16 +67,12 @@ export async function requestContentChanges(context: RequestContext, contentItem
       data: { status: PublishJobStatus.CANCELLED, lastErrorCode: "APPROVAL_REVOKED" },
     });
     await tx.contentItem.update({ where: { id: item.id }, data: { status: ContentStatus.CHANGES_REQUESTED } });
-    await tx.auditLog.create({
-      data: {
-        clientId: context.clientId,
-        userId: context.userId,
-        action: "CONTENT_CHANGES_REQUESTED",
-        entityType: "ContentVersion",
-        entityId: input.expectedVersionId,
-        metadata: { commentId: comment.id, approvalId: approval.id, requestedChangeCount: input.requestedChanges.length },
-      },
-    });
+    await recordDomainEvent(context, {
+      type: "CHANGES_REQUESTED",
+      entityType: "ContentVersion",
+      entityId: input.expectedVersionId,
+      metadata: { commentId: comment.id, approvalId: approval.id, requestedChangeCount: input.requestedChanges.length },
+    }, tx);
     return { approval, comment, status: ContentStatus.CHANGES_REQUESTED };
   });
 }

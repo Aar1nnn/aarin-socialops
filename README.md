@@ -60,9 +60,16 @@ pnpm demo:e2e
 - worker 在长外部请求期间续租；失去租约时不会写入最终发布结果，发布后超时继续保持 `UNKNOWN`。
 - 结构化 `BrandProfile` 与旧 `brandGuidelines` 兼容回退；品牌、最近内容、表现和研究记忆全部来自 PostgreSQL 权威记录。
 - 阶段化内容生成上下文、策略、结构校验、AI review、humanizer/shortener 和 image-prompt 接口；输出仍是待人工审核的 `ContentVersion`，不会创建审批或发布任务。
+- 内容组合服务支持单平台重生成、结构化改写、乐观并发草稿保存、不可变版本恢复/比较；任何实质改写都会创建新的 `ContentVersion`。
+- 品牌资料可从粘贴文本、工作区资料和结构化输入生成经 Zod 验证的 transient 建议；只有人工明确接受的字段才会写入 `BrandProfile`，完整度由程序按关键字段计算。
+- 审批协作支持结构化 `Request Changes`、版本化修订和基于版本/审批/评论/审计/发布任务组合的时间线；不提供平行聊天或审批系统。
+- 素材库支持租户范围搜索、过滤、标签、SHA-256 重复检测、真实使用关系查询和统一公网可用性分类；`Asset` 仍是唯一素材事实源。
 - 基于现有内容/审批/发布记录的月、周、列表日历与服务层重排；没有第二套 scheduler。
+- 账号排期队列支持有限 horizon 的每周时段、下一可用槽位、冲突检测和逐项结果的批量重排；最终排期仍写入 `ContentItem` / `PublishJob` 并经过原审批与账号验证。
 - 基于 `MetricSnapshot` 的 canonical metrics、周期比较和 freshness；缺失、失败和无权限继续与真实 0 分开。
+- Analytics 查询支持平台/账号/内容/指标范围、最新快照、帖子/账号/周期比较、内容表现排序、最小样本模式分析和统一数据健康状态；AI review 只能读取程序结果并明确不推断因果。
 - 站内通知后的 Webhook/Email HTTP 投递记录；外部投递失败保留 `NotificationDelivery` 失败证据且不回滚主业务。
+- 通知规则使用有限事件 registry，支持 IN_APP/EMAIL/WEBHOOK 选择、cooldown 去重和 unread/important/all Inbox API；规则和读状态均为租户范围。
 
 ## 当前模拟
 
@@ -78,7 +85,8 @@ pnpm demo:e2e
 
 ## 尚未实现的真实连接
 
-- Instagram、TikTok、LinkedIn 真实账号、发布、结果查询、指标和评论接口。
+- TikTok、LinkedIn 真实账号、发布、结果查询、指标和评论接口。
+- Instagram adapter、账号发现和发布/查询安全边界已经实现，但仍为 `IMPLEMENTED_NOT_EXTERNALLY_VERIFIED`，没有执行真实 Instagram external acceptance。
 - Facebook 私信自动采集、自动回复、自动私信和自动报价。
 - Facebook 群组自动检索、入群或发帖；当前只能创建人工任务。
 - Webhook/Email 外部通知端点需要单独配置和验证；未配置时只保存站内通知和任务，不声称已送达。
