@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import { InstagramGraphAdapter } from "../src/lib/adapters/instagram-graph";
+import { assessExternalReadUrl, type ExternalReadAssessment } from "../src/lib/adapters/storage";
 import type { PublishRequest } from "../src/lib/adapters/types";
 
 function jsonResponse(body: unknown, status = 200) {
@@ -20,7 +21,7 @@ function request(overrides: Partial<PublishRequest> = {}): PublishRequest {
 
 function adapter(
   fetchImpl: typeof fetch,
-  resolveAssetUrl: (asset: PublishRequest["assets"][number]) => Promise<string | null> = async () => "https://cdn.example.test/photo.jpg",
+  resolveExternalRead: (asset: PublishRequest["assets"][number]) => Promise<ExternalReadAssessment> = async () => externalRead("https://cdn.example.test/photo.jpg"),
 ) {
   return new InstagramGraphAdapter({
     igUserId: "ig-1",
@@ -30,7 +31,15 @@ function adapter(
     fetchImpl,
     pollIntervalMs: 0,
     pollMaxAttempts: 2,
-    resolveAssetUrl,
+    resolveExternalRead,
+  });
+}
+
+function externalRead(url: string | null) {
+  return assessExternalReadUrl(url, {
+    candidateType: "PUBLIC_HTTPS",
+    source: "METADATA_PUBLIC_URL",
+    fallbackAvailability: "PRIVATE_REMOTE",
   });
 }
 
@@ -73,7 +82,7 @@ describe("InstagramGraphAdapter", () => {
       if (url.endsWith("/ig-1/media_publish")) return jsonResponse({ id: "video-media" });
       return jsonResponse({ id: "video-media", permalink: "https://www.instagram.com/reel/video-media/" });
     }) as typeof fetch;
-    const result = await adapter(fetchImpl, async () => "https://cdn.example.test/video.mp4").publish(request({
+    const result = await adapter(fetchImpl, async () => externalRead("https://cdn.example.test/video.mp4")).publish(request({
       assets: [{ storageProvider: "s3", storageKey: "video.mp4", mimeType: "video/mp4", originalName: "video.mp4" }],
     }));
     expect(result).toMatchObject({ status: "published", remotePostId: "video-media" });
@@ -93,7 +102,7 @@ describe("InstagramGraphAdapter", () => {
       if (url.endsWith("/ig-1/media_publish")) return jsonResponse({ id: "carousel-media" });
       return jsonResponse({ id: "carousel-media" });
     }) as typeof fetch;
-    const result = await adapter(fetchImpl, async (asset) => `https://cdn.example.test/${asset.originalName}`).publish(request({
+    const result = await adapter(fetchImpl, async (asset) => externalRead(`https://cdn.example.test/${asset.originalName}`)).publish(request({
       assets: [
         { storageProvider: "s3", storageKey: "one.jpg", mimeType: "image/jpeg", originalName: "one.jpg" },
         { storageProvider: "s3", storageKey: "two.png", mimeType: "image/png", originalName: "two.png" },
@@ -111,10 +120,10 @@ describe("InstagramGraphAdapter", () => {
     await expect(adapter(fetchImpl).publish(request({ assets: [
       { storageProvider: "s3", storageKey: "doc.pdf", mimeType: "application/pdf", originalName: "doc.pdf" },
     ] }))).resolves.toMatchObject({ status: "failed", code: "MEDIA_INVALID", failurePhase: "PRE_DISPATCH" });
-    await expect(adapter(fetchImpl, async () => null).publish(request())).resolves.toMatchObject({
+    await expect(adapter(fetchImpl, async () => externalRead(null)).publish(request())).resolves.toMatchObject({
       status: "failed", code: "MEDIA_URL_UNAVAILABLE", failurePhase: "PRE_DISPATCH",
     });
-    await expect(adapter(fetchImpl, async () => "http://localhost/file.jpg").publish(request())).resolves.toMatchObject({
+    await expect(adapter(fetchImpl, async () => externalRead("http://localhost/file.jpg")).publish(request())).resolves.toMatchObject({
       status: "failed", code: "MEDIA_URL_UNAVAILABLE", failurePhase: "PRE_DISPATCH",
     });
     expect(fetchImpl).not.toHaveBeenCalled();

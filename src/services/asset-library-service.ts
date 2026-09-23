@@ -1,10 +1,11 @@
 import { AssetKind, Prisma } from "@prisma/client";
 import { z } from "zod";
 import { assertCanWrite, type RequestContext } from "../lib/context";
+import { assessAssetExternalRead, externalReadDescriptor, type MediaAvailability } from "../lib/adapters/storage";
 import { db } from "../lib/db";
 import { AppError } from "../lib/errors";
 
-export type MediaAvailability = "LOCAL_ONLY" | "PRIVATE_REMOTE" | "PUBLIC_HTTPS" | "SIGNED_HTTPS" | "UNAVAILABLE";
+export type { MediaAvailability } from "../lib/adapters/storage";
 
 const assetFilterSchema = z.object({
   query: z.string().trim().max(200).optional(),
@@ -29,18 +30,12 @@ export function classifyMediaAvailability(asset: {
   storageKey: string;
   metadata: Prisma.JsonValue | null;
 }): MediaAvailability {
-  if (!asset.storageKey) return "UNAVAILABLE";
-  const metadata = metadataObject(asset.metadata);
-  const publicUrl = typeof metadata.publicUrl === "string" ? metadata.publicUrl : null;
-  const signedUrl = typeof metadata.signedUrl === "string" ? metadata.signedUrl : null;
-  if (publicUrl?.startsWith("https://")) return "PUBLIC_HTTPS";
-  if (signedUrl?.startsWith("https://")) return "SIGNED_HTTPS";
-  if (asset.storageProvider === "local") return "LOCAL_ONLY";
-  return "PRIVATE_REMOTE";
+  return assessAssetExternalRead(asset).availability;
 }
 
-function presentAsset<T extends { metadata: Prisma.JsonValue | null; storageProvider: string; storageKey: string }>(asset: T) {
+function presentAsset<T extends { metadata: Prisma.JsonValue | null; storageProvider: string; storageKey: string }>(asset: T, now = new Date()) {
   const metadata = metadataObject(asset.metadata);
+  const externalRead = assessAssetExternalRead(asset, { now });
   return {
     ...asset,
     filename: "originalName" in asset ? asset.originalName : undefined,
@@ -48,30 +43,54 @@ function presentAsset<T extends { metadata: Prisma.JsonValue | null; storageProv
     width: typeof metadata.width === "number" ? metadata.width : null,
     height: typeof metadata.height === "number" ? metadata.height : null,
     duration: typeof metadata.duration === "number" ? metadata.duration : null,
-    availability: classifyMediaAvailability(asset),
+    availability: externalRead.availability,
+    externalRead: externalReadDescriptor(externalRead),
   };
 }
 
 export async function searchAssets(context: RequestContext, raw: unknown = {}) {
   const input = assetFilterSchema.parse(raw);
-  const assets = await db.asset.findMany({
-    where: {
-      clientId: context.clientId,
-      ...(input.query ? { originalName: { contains: input.query, mode: "insensitive" } } : {}),
-      ...(input.kind ? { kind: input.kind } : {}),
-      ...(input.mimeType ? { mimeType: { startsWith: input.mimeType } } : {}),
-      ...(input.productId ? { productLinks: { some: { productId: input.productId, clientId: context.clientId } } } : {}),
-      ...(input.tagIds?.length ? { tagLinks: { some: { clientId: context.clientId, tagId: { in: input.tagIds } } } } : {}),
-    },
-    include: {
-      tagLinks: { include: { tag: true } },
-      productLinks: { include: { product: { select: { id: true, name: true } } } },
-      _count: { select: { contentLinks: true } },
-    },
-    orderBy: [{ createdAt: "desc" }, { id: "asc" }],
-    take: input.limit,
-  });
-  return assets.map(presentAsset).filter((asset) => !input.availability || asset.availability === input.availability);
+  const where: Prisma.AssetWhereInput = {
+    clientId: context.clientId,
+    ...(input.query ? { originalName: { contains: input.query, mode: "insensitive" } } : {}),
+    ...(input.kind ? { kind: input.kind } : {}),
+    ...(input.mimeType ? { mimeType: { startsWith: input.mimeType } } : {}),
+    ...(input.productId ? { productLinks: { some: { productId: input.productId, clientId: context.clientId } } } : {}),
+    ...(input.tagIds?.length ? { tagLinks: { some: { clientId: context.clientId, tagId: { in: input.tagIds } } } } : {}),
+  };
+  const include = {
+    tagLinks: { include: { tag: true } },
+    productLinks: { include: { product: { select: { id: true, name: true } } } },
+    _count: { select: { contentLinks: true } },
+  } as const;
+  const orderBy = [{ createdAt: "desc" as const }, { id: "asc" as const }];
+  const assessedAt = new Date();
+  if (!input.availability) {
+    const assets = await db.asset.findMany({ where, include, orderBy, take: input.limit });
+    return assets.map((asset) => presentAsset(asset, assessedAt));
+  }
+
+  const results = [];
+  const batchSize = Math.max(50, input.limit);
+  let cursor: string | undefined;
+  while (results.length < input.limit) {
+    const batch = await db.asset.findMany({
+      where,
+      include,
+      orderBy,
+      take: batchSize,
+      ...(cursor ? { cursor: { id: cursor }, skip: 1 } : {}),
+    });
+    for (const asset of batch) {
+      const presented = presentAsset(asset, assessedAt);
+      if (presented.availability === input.availability) results.push(presented);
+      if (results.length === input.limit) break;
+    }
+    if (batch.length < batchSize) break;
+    cursor = batch.at(-1)?.id;
+    if (!cursor) break;
+  }
+  return results;
 }
 
 export async function setAssetTags(context: RequestContext, assetId: string, raw: unknown) {

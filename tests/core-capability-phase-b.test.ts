@@ -75,7 +75,13 @@ describe("asset library", () => {
     const tags = await setAssetTags(fixture.context, asset.id, { tags: ["Product", "Launch"] });
     const results = await searchAssets(fixture.context, { query: "chair", tagIds: [tags[0].id], kind: "IMAGE" });
     expect(results).toHaveLength(1);
-    expect(results[0]).toMatchObject({ id: asset.id, width: 1200, height: 630, availability: "LOCAL_ONLY" });
+    expect(results[0]).toMatchObject({
+      id: asset.id,
+      width: 1200,
+      height: 630,
+      availability: "LOCAL_ONLY",
+      externalRead: { ready: false, externalValidation: "NOT_EXTERNALLY_VERIFIED", reason: "LOCAL_STORAGE" },
+    });
     const other = await makeFixture();
     await expect(setAssetTags(other.context, asset.id, { tags: ["Forbidden"] })).rejects.toMatchObject({ code: "ASSET_NOT_FOUND" });
     expect(await searchAssets(other.context, { query: "chair" })).toHaveLength(0);
@@ -105,6 +111,21 @@ describe("asset library", () => {
     expect(classifyMediaAvailability({ storageProvider: "s3", storageKey: "x", metadata: { publicUrl: "https://cdn.example/x" } })).toBe("PUBLIC_HTTPS");
     expect(classifyMediaAvailability({ storageProvider: "s3", storageKey: "x", metadata: { signedUrl: "https://signed.example/x" } })).toBe("SIGNED_HTTPS");
     expect(classifyMediaAvailability({ storageProvider: "s3", storageKey: "", metadata: null })).toBe("UNAVAILABLE");
+  });
+
+  it("applies the derived availability filter before the result limit", async () => {
+    const publicAsset = await makeAsset(fixture, "older-public", { publicUrl: "https://cdn.example.test/older-public.jpg" });
+    const newerLocal = await makeAsset(fixture, "newer-local");
+    await db.asset.update({ where: { id: publicAsset.id }, data: { createdAt: new Date("2026-09-22T00:00:00Z") } });
+    await db.asset.update({ where: { id: newerLocal.id }, data: { createdAt: new Date("2026-09-23T00:00:00Z") } });
+
+    const results = await searchAssets(fixture.context, { availability: "PUBLIC_HTTPS", limit: 1 });
+    expect(results).toHaveLength(1);
+    expect(results[0]).toMatchObject({
+      id: publicAsset.id,
+      availability: "PUBLIC_HTTPS",
+      externalRead: { ready: true, externalValidation: "NOT_EXTERNALLY_VERIFIED", reason: "READY_CANDIDATE" },
+    });
   });
 });
 
