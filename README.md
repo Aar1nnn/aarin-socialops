@@ -112,7 +112,7 @@ META_APP_ID=""
 META_APP_SECRET=""
 META_REDIRECT_URI="http://localhost:3000/api/connections/meta/callback"
 META_LOGIN_CONFIG_ID=""
-META_OAUTH_SCOPES="pages_show_list,pages_manage_posts,pages_read_engagement,pages_read_user_content"
+META_OAUTH_SCOPES="pages_show_list,pages_manage_posts,pages_read_engagement,pages_read_user_content,instagram_basic,instagram_content_publish"
 META_GRAPH_API_VERSION="v26.0"
 META_PAGE_METRIC_KEYS=""
 ```
@@ -120,6 +120,14 @@ META_PAGE_METRIC_KEYS=""
 Meta App 的 Valid OAuth Redirect URI 必须与 `META_REDIRECT_URI` 完全一致。登录工作台后进入“平台连接”，点击“连接 Meta”，完成授权后明确勾选允许用于当前客户的 Page。发现的账号默认不启用，也不会按列表第一个账号自动选择。
 
 OAuth 连接完成后，发布、远端状态查询、帖子真实计数和公开评论导入复用 V1 现有业务服务。若 Meta 没有提供 refresh token，“刷新”会明确要求重新授权。
+
+### Instagram Professional 发布
+
+同一 Meta OAuth 会发现 Facebook Page 关联的 Instagram Professional 账号。只有显式选择、拥有 `instagram_basic` 与 `instagram_content_publish`、且发布能力验证通过的账号才能进入 LIVE 队列。当前实现支持单图、单视频/Reels 和 2–10 项 carousel，并可通过远端 media ID 查询发布状态。
+
+Instagram Graph API 必须能够主动拉取素材，因此素材 URL 必须是公网可达的 HTTPS URL。本地文件存储会在网络请求前以 `MEDIA_URL_UNAVAILABLE` 拒绝；生产环境应使用能够生成 HTTPS signed URL 的 S3-compatible storage。任何容器创建或 `media_publish` 写请求都不会自动重试；写请求超时、连接中断或无法确认的 5xx 会进入 `UNKNOWN` 并要求远端查询或人工对账。
+
+当前状态：`IMPLEMENTED_NOT_EXTERNALLY_VERIFIED`。本阶段没有执行真实 Instagram 发布，不能将其标记为 Production Ready；需要专用 Instagram Professional 测试账号完成 external acceptance。
 
 ## V1 手工 Facebook Page fallback
 

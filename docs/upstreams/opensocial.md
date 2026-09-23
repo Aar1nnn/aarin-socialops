@@ -2,22 +2,23 @@
 
 - Original: https://github.com/0xdileep/opensocial
 - Reviewed commit: `2a655db3408961e15572e5ba23caccee5376e12b`
-- License: not sufficiently established from a root license file in the reviewed checkout; repository text references licensing but is not treated as permission to copy.
-- Review scope: `apps/api/src/ai/`, `apps/api/src/ai/pipeline/`, `apps/api/src/ai/stages/`, `apps/api/src/modules/brands/`
+- License provenance: MIT text appears in `README.md`, but no root `LICENSE`, `COPYING`, or `NOTICE` existed at the reviewed commit; this is not treated as permission to copy.
+- Last audited/synced: 2026-09-21
 
-## Ideas adopted
+## Audited source areas
 
-- An explicit AI pipeline instead of a single opaque generation step.
-- Strategy generation followed by critique and rewrite.
-- Brand service and recent-content memory as reusable context providers.
-- Image prompt/review as an interface boundary that can remain unimplemented.
+- `apps/api/src/ai/pipeline/content.pipeline.ts`
+- `apps/api/src/ai/stages/`: strategy, critique/rewrite, and image prompt/generation/review boundaries.
+- `apps/api/src/modules/brands/`
 
-## Aarin landing points
+## Ideas and Aarin landing points
 
-- `ai-content-pipeline-service.ts` stage contracts.
-- `memory-service.ts` recent-content and performance context.
-- Existing `ContentVersion` remains the only generated-content record.
+- Explicit staged content generation instead of an opaque one-shot generation call.
+- Strategy followed by critique and rewrite.
+- Brand and recent-content memory supplied through reusable context providers.
+- Image prompt/review retained as a boundary that may remain unimplemented.
+- Aarin implementations live in its brand, memory, and AI services and only persist through `ContentVersion` plus human `Approval`.
 
-## Reuse status
+## Provenance boundary
 
-Architecture-only reference. No OpenSocial code, prompt text, or schema was copied because license provenance was not clear enough for direct adaptation.
+Architecture-only reference. No OpenSocial source, prompts, or schema were copied. Direct adaptation remains prohibited unless license provenance is independently established.

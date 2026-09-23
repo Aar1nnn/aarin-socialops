@@ -1,12 +1,13 @@
 import { randomBytes } from "node:crypto";
 import { CapabilityStatus, type Prisma, type Provider } from "@prisma/client";
-import { createMetaAuthAdapter } from "../lib/adapters/meta-auth";
+import { createMetaAuthAdapter, REQUIRED_META_CONNECTION_SCOPES } from "../lib/adapters/meta-auth";
 import { PlatformAuthError, type PlatformAuthAdapter } from "../lib/adapters/platform-auth";
 import { assertOwner, type RequestContext } from "../lib/context";
 import { db } from "../lib/db";
 import { AppError } from "../lib/errors";
 import { sha256 } from "../lib/security";
 import { safeErrorMessage, TokenVault, type EncryptedSecret } from "../lib/token-vault";
+import { getPlatformRegistry } from "./platform-registry-service";
 
 const OAUTH_STATE_TTL_MS = 10 * 60 * 1000;
 
@@ -79,9 +80,9 @@ export async function completePlatformConnection(
     const accessSecret = vault.encrypt(tokenSet.accessToken);
     const refreshSecret = tokenSet.refreshToken ? vault.encrypt(tokenSet.refreshToken) : null;
     const connection = await db.$transaction(async (tx) => {
-      const requestedScopes = (process.env.META_OAUTH_SCOPES || "pages_show_list,pages_manage_posts,pages_read_engagement,pages_read_user_content")
-        .split(",").map((scope) => scope.trim()).filter(Boolean);
-      const missingScopes = requestedScopes.filter((scope) => !discovery.grantedScopes.includes(scope));
+      const missingScopes = REQUIRED_META_CONNECTION_SCOPES.filter(
+        (scope) => !discovery.grantedScopes.includes(scope),
+      );
       const connectionData = {
         externalPrincipalId: discovery.externalPrincipalId,
         ...connectionTokenData(accessSecret, refreshSecret),
@@ -243,15 +244,31 @@ export async function selectPlatformAccounts(context: RequestContext, connection
     });
     for (const account of accounts) {
       const capabilities = (account.providerCapabilities || {}) as Record<string, unknown>;
-      const facebook = account.accountType === "FACEBOOK_PAGE";
+      const definition = getPlatformRegistry().get(connection.provider, account.platform).definition;
+      const publishingImplemented = definition.capabilities.includes("PUBLISH");
+      const metricsImplemented = definition.capabilities.includes("METRICS");
+      const commentsImplemented = definition.capabilities.includes("COMMENTS");
+      const publishVerified = publishingImplemented && capabilities.canPublish === true;
       await tx.socialAccount.update({
         where: { id: account.id },
         data: {
           isSelected: true,
-          publishCapability: facebook && capabilities.canPublish === true ? CapabilityStatus.VERIFIED : CapabilityStatus.UNSUPPORTED,
-          metricsCapability: facebook && capabilities.canReadMetrics === true ? CapabilityStatus.VERIFIED : CapabilityStatus.UNVERIFIED,
-          commentsCapability: facebook && capabilities.canReadComments === true ? CapabilityStatus.VERIFIED : CapabilityStatus.UNVERIFIED,
-          verifiedAt: facebook && capabilities.canPublish === true ? new Date() : null,
+          publishCapability: publishVerified
+            ? CapabilityStatus.VERIFIED
+            : publishingImplemented
+              ? CapabilityStatus.UNVERIFIED
+              : CapabilityStatus.UNSUPPORTED,
+          metricsCapability: metricsImplemented
+            ? capabilities.canReadMetrics === true
+              ? CapabilityStatus.VERIFIED
+              : CapabilityStatus.UNVERIFIED
+            : CapabilityStatus.UNSUPPORTED,
+          commentsCapability: commentsImplemented
+            ? capabilities.canReadComments === true
+              ? CapabilityStatus.VERIFIED
+              : CapabilityStatus.UNVERIFIED
+            : CapabilityStatus.UNSUPPORTED,
+          verifiedAt: publishVerified ? new Date() : null,
         },
       });
     }

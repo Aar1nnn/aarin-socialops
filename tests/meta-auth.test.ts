@@ -38,6 +38,8 @@ describe("MetaAuthAdapter", () => {
           { permission: "pages_manage_posts", status: "granted" },
           { permission: "pages_read_engagement", status: "granted" },
           { permission: "pages_read_user_content", status: "granted" },
+          { permission: "instagram_basic", status: "granted" },
+          { permission: "instagram_content_publish", status: "granted" },
         ] });
         if (url.includes("/me/accounts")) return jsonResponse({ data: [{
           id: "page-1", name: "Test Page", access_token: "page-access-token",
@@ -52,6 +54,7 @@ describe("MetaAuthAdapter", () => {
     expect(discovery.externalPrincipalId).toBe("person-1");
     expect(discovery.accounts.map((account) => account.accountType)).toEqual(["FACEBOOK_PAGE", "INSTAGRAM_PROFESSIONAL"]);
     expect(discovery.accounts[0].capabilities).toMatchObject({ canPublish: true, canReadMetrics: true, canReadComments: true });
+    expect(discovery.accounts[1].capabilities).toMatchObject({ canPublish: true, canQueryStatus: true, linkedFacebookPageId: "page-1" });
     expect(seen.filter((request) => request.url.includes("/me")).every((request) => !request.url.includes("user-access-token"))).toBe(true);
     expect(seen.filter((request) => request.url.includes("/me")).every((request) => request.authorization === "Bearer user-access-token")).toBe(true);
     expect(seen.find((request) => request.url.includes("oauth/access_token"))?.body).toContain("client_secret=app-secret");

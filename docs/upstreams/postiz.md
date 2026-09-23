@@ -2,20 +2,22 @@
 
 - Original: https://github.com/gitroomhq/postiz-app
 - Reviewed commit: `7cef69c12fd5ab486f97f70452cfd3dd3708de4b`
-- License: AGPL-3.0 (`LICENSE` in the reviewed checkout)
-- Review scope: scheduling/calendar UI, analytics UI, provider capability and content-operations navigation.
+- License: GNU AGPL-3.0 (`LICENSE` in the reviewed checkout)
+- Last audited/synced: 2026-09-21
 
-## Ideas adopted
+## Audited source areas
 
+- Integration manager, social adapter abstraction, provider interfaces, refresh service, and missing-scope handling.
+- Scheduling/calendar and analytics information architecture.
+- Provider capability presentation and content-operations navigation.
+
+## Ideas and Aarin landing points
+
+- Central provider registry and explicit provider capabilities in `src/lib/platforms/registry.ts` and `src/lib/platforms/capabilities.ts`.
 - Calendar-oriented content operations and compact scheduling filters.
-- Analytics views organized around account/platform and comparable time periods.
-- Capability-aware UI that does not pretend unsupported provider functions are available.
+- Comparable analytics views organized by account, platform, and period.
+- Capability-aware behavior that never presents an unsupported provider operation as available.
 
-## Aarin landing points
+## License boundary
 
-- Operator navigation and calendar/analytics information architecture.
-- Existing Aarin provider capability records remain authoritative.
-
-## Reuse status
-
-UX and information-architecture reference only. No Postiz code or design assets were copied into Aarin. Postiz is not introduced as a runtime service or a second system of record.
+Architecture, behavior, and UX reference only. No Postiz source or design assets were copied. Aarin's registry is a clean-room TypeScript implementation, and Postiz is not introduced as a runtime service or second system of record.
