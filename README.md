@@ -205,6 +205,8 @@ pnpm facebook:live:e2e # 仅在专用测试 Page + 显式确认后
 
 V2 Phase 1 本地验证（2026-09-20）：5 个 migration 在全新 PostgreSQL 17-alpine 数据库成功应用，seed 连续执行两次成功，`pnpm test` 的 10 个测试文件共 74 项通过，`pnpm typecheck` 与 `pnpm build` 通过。GitHub Actions 仍需在分支推送后单独确认，Meta 和 S3 外部边界仍未验证。
 
+Core capability expansion 本地验证（2026-09-23）：10 个 migration 均已应用且 `prisma migrate status` 为 up to date，seed 连续执行两次成功，`pnpm test` 的 21 个测试文件共 165 项通过，`pnpm typecheck`、production build 与 `git diff --check` 通过。分支没有修改 UI 或依赖文件，`.env` 仍被忽略且未跟踪；Instagram 保持 `IMPLEMENTED_NOT_EXTERNALLY_VERIFIED`。GitHub Actions 结果以对应 PR 的远程检查为准。
+
 ## V1 历史验收（2026-09-16）
 
 - PostgreSQL 17.11：三份迁移成功应用，种子连续执行两次无重复记录。

@@ -5,7 +5,7 @@
 - Branch: `feat/socialops-core-capability-expansion`
 - Baseline: `main` at `9f1e6e5`
 - Started: 2026-09-23
-- Current phase: full regression and release verification
+- Current phase: implementation complete; PR/CI closeout
 - UI V2: explicitly out of scope
 - Instagram external acceptance: explicitly deferred
 
@@ -119,8 +119,8 @@ New route handlers may expose composition actions, version history/compare/resto
 - PR #5 closeout: migration, seed twice, typecheck, 18 files / 141 tests, build, diff check, and GitHub CI passed; merged as `9f1e6e5`.
 - Phase A: additive migration applied; `pnpm typecheck` passed; full suite passed with 19 files / 149 tests; `git diff --check` passed.
 - Phase B: additive migration applied; `pnpm typecheck` passed; full suite passed with 20 files / 157 tests; `git diff --check` passed.
-- Phase C: additive migration applied; `pnpm typecheck` passed; full suite passed with 21 files / 164 tests; `git diff --check` passed.
-- Expansion branch final verification: pending.
+- Phase C: additive migration applied; `pnpm typecheck` passed; full suite passed with 21 files / 165 tests; `git diff --check` passed.
+- Expansion branch final verification: `db:generate`, `db:migrate`, `db:seed` twice, `prisma migrate status`, `typecheck`, 21 files / 165 tests, production build, and `git diff --check` passed. `.env` remains ignored and untracked; no UI or dependency files changed; high-confidence secret scan returned no findings.
 
 ## Remaining limitations
 
@@ -130,4 +130,4 @@ New route handlers may expose composition actions, version history/compare/resto
 
 ## Next step
 
-Run the required migration/seed/regression/build/security checks, update capability documentation, and open the feature PR without merging it.
+Push the verified branch, open the feature PR, confirm remote CI, and leave the PR unmerged for review.
