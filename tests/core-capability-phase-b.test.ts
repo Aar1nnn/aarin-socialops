@@ -17,7 +17,7 @@ import {
   getQueueOccurrences,
   upsertScheduleQueue,
 } from "../src/services/schedule-queue-service";
-import { generateContentPlan, reviewContent, submitForReview } from "../src/services/content-service";
+import { generateContentPlan, reviewContent, schedulePublication, submitForReview } from "../src/services/content-service";
 
 type Fixture = { client: Client; account: SocialAccount; context: RequestContext; productId: string; promptId: string };
 const clientIds: string[] = [];
@@ -118,6 +118,37 @@ describe("calendar queues", () => {
     expect(occurrences[occurrences.length - 1].getTime() - after.getTime()).toBeLessThanOrEqual(15 * 24 * 60 * 60 * 1000);
   });
 
+  it("skips only nonexistent and ambiguous DST occurrences", async () => {
+    await db.client.update({ where: { id: fixture.client.id }, data: { timezone: "America/New_York" } });
+    const springQueue = await upsertScheduleQueue(fixture.context, null, {
+      accountId: fixture.account.id,
+      name: "Spring DST",
+      timezone: "America/New_York",
+      horizonDays: 8,
+      slots: [
+        { dayOfWeek: 0, hour: 2, minute: 30 },
+        { dayOfWeek: 0, hour: 3, minute: 30 },
+      ],
+    });
+    const spring = await getQueueOccurrences(fixture.context, springQueue.id, new Date("2026-03-07T05:00:00.000Z"));
+    expect(spring[0].toISOString()).toBe("2026-03-08T07:30:00.000Z");
+    expect(spring.some((date) => date.toISOString() === "2026-03-15T06:30:00.000Z")).toBe(true);
+
+    const fallQueue = await upsertScheduleQueue(fixture.context, null, {
+      accountId: fixture.account.id,
+      name: "Fall DST",
+      timezone: "America/New_York",
+      horizonDays: 8,
+      slots: [
+        { dayOfWeek: 0, hour: 1, minute: 30 },
+        { dayOfWeek: 0, hour: 2, minute: 30 },
+      ],
+    });
+    const fall = await getQueueOccurrences(fixture.context, fallQueue.id, new Date("2026-10-31T04:00:00.000Z"));
+    expect(fall[0].toISOString()).toBe("2026-11-01T07:30:00.000Z");
+    expect(fall.some((date) => date.toISOString() === "2026-11-08T06:30:00.000Z")).toBe(true);
+  });
+
   it("detects account conflicts and assigns approved content through the existing scheduler", async () => {
     const after = new Date(Date.now() + 60_000);
     const slot = nextLocalSlot(after);
@@ -128,6 +159,41 @@ describe("calendar queues", () => {
     expect(conflict.conflict).toBe(true);
     expect(conflict.conflicts.some((entry) => entry.id === first.id)).toBe(true);
     expect((await db.publishJob.findUniqueOrThrow({ where: { id: assignment.publishJobId } })).nextAttemptAt.toISOString()).toBe(assignment.scheduledAt.toISOString());
+  });
+
+  it("serializes concurrent assignments across queues for the same account", async () => {
+    const after = new Date(Date.now() + 60_000);
+    const slot = nextLocalSlot(after);
+    const [firstQueue, secondQueue] = await Promise.all([
+      upsertScheduleQueue(fixture.context, null, { accountId: fixture.account.id, name: "Concurrent A", timezone: "Asia/Shanghai", horizonDays: 14, slots: [slot] }),
+      upsertScheduleQueue(fixture.context, null, { accountId: fixture.account.id, name: "Concurrent B", timezone: "Asia/Shanghai", horizonDays: 14, slots: [slot] }),
+    ]);
+    const [firstItem, secondItem] = await Promise.all([createItem(), createItem()]);
+    const [first, second] = await Promise.all([
+      assignContentToQueue(fixture.context, { queueId: firstQueue.id, contentItemId: firstItem.id, after }),
+      assignContentToQueue(fixture.context, { queueId: secondQueue.id, contentItemId: secondItem.id, after }),
+    ]);
+    expect(first.scheduledAt.toISOString()).not.toBe(second.scheduledAt.toISOString());
+    const jobs = await db.publishJob.findMany({ where: { id: { in: [first.publishJobId, second.publishJobId] } }, orderBy: { nextAttemptAt: "asc" } });
+    expect(new Set(jobs.map((job) => job.nextAttemptAt.toISOString())).size).toBe(2);
+  });
+
+  it("returns the persisted slot for duplicate assignment and keeps UNKNOWN immutable", async () => {
+    const after = new Date(Date.now() + 60_000);
+    const queue = await upsertScheduleQueue(fixture.context, null, { accountId: fixture.account.id, name: "Idempotent queue", timezone: "Asia/Shanghai", horizonDays: 14, slots: [nextLocalSlot(after)] });
+    const item = await createItem();
+    const first = await assignContentToQueue(fixture.context, { queueId: queue.id, contentItemId: item.id, after });
+    const duplicate = await assignContentToQueue(fixture.context, { queueId: queue.id, contentItemId: item.id, after: new Date(first.scheduledAt.getTime() + 60_000) });
+    expect(duplicate.publishJobId).toBe(first.publishJobId);
+    expect(duplicate.scheduledAt.toISOString()).toBe(first.scheduledAt.toISOString());
+    expect(await db.auditLog.count({ where: { clientId: fixture.client.id, action: "CONTENT_SCHEDULED", entityId: item.id } })).toBe(1);
+
+    await db.$transaction([
+      db.publishJob.update({ where: { id: first.publishJobId }, data: { status: "UNKNOWN" } }),
+      db.contentItem.update({ where: { id: item.id }, data: { status: "UNKNOWN" } }),
+    ]);
+    await expect(assignContentToQueue(fixture.context, { queueId: queue.id, contentItemId: item.id, after })).rejects.toMatchObject({ code: "CALENDAR_ITEM_LOCKED" });
+    expect((await db.publishJob.findUniqueOrThrow({ where: { id: first.publishJobId } })).status).toBe("UNKNOWN");
   });
 
   it("preserves approval and timezone requirements", async () => {
@@ -141,7 +207,14 @@ describe("calendar queues", () => {
   it("returns explicit per-item bulk results and never mutates protected jobs", async () => {
     const mutable = await createItem();
     const protectedItem = await createItem();
-    await db.contentItem.update({ where: { id: protectedItem.id }, data: { status: "PUBLISHED" } });
+    const mutableOriginal = new Date(Date.now() + 24 * 60 * 60 * 1000);
+    const protectedOriginal = new Date(Date.now() + 2 * 24 * 60 * 60 * 1000);
+    await schedulePublication(fixture.context, mutable.id, mutableOriginal);
+    const protectedJob = await schedulePublication(fixture.context, protectedItem.id, protectedOriginal);
+    await db.$transaction([
+      db.contentItem.update({ where: { id: protectedItem.id }, data: { status: "PUBLISHED" } }),
+      db.publishJob.update({ where: { id: protectedJob.id }, data: { status: "PUBLISHED" } }),
+    ]);
     const target = new Date(Date.now() + 3 * 24 * 60 * 60 * 1000);
     const result = await bulkRescheduleWithResults(fixture.context, { operations: [
       { contentItemId: mutable.id, scheduledAt: target },
@@ -149,6 +222,25 @@ describe("calendar queues", () => {
     ] });
     expect(result).toMatchObject({ updated: 1, rejected: 1 });
     expect(result.results.map((entry) => entry.status)).toEqual(["UPDATED", "REJECTED"]);
-    expect((await db.contentItem.findUniqueOrThrow({ where: { id: protectedItem.id } })).scheduledAt).toBeNull();
+    expect((await db.contentItem.findUniqueOrThrow({ where: { id: protectedItem.id } })).scheduledAt?.toISOString()).toBe(protectedOriginal.toISOString());
+  });
+
+  it("rejects bulk scheduling without approval, an active current job, or a usable client mode", async () => {
+    const target = new Date(Date.now() + 3 * 24 * 60 * 60 * 1000);
+    const draft = await createItem(fixture, false);
+    const approvedWithoutJob = await createItem();
+    const initial = await bulkRescheduleWithResults(fixture.context, { operations: [
+      { contentItemId: draft.id, scheduledAt: target },
+      { contentItemId: approvedWithoutJob.id, scheduledAt: target },
+    ] });
+    expect(initial.results.map((entry) => entry.error?.code)).toEqual(["APPROVAL_REQUIRED", "CALENDAR_JOB_LOCKED"]);
+
+    const scheduled = await createItem();
+    const original = new Date(Date.now() + 24 * 60 * 60 * 1000);
+    const job = await schedulePublication(fixture.context, scheduled.id, original);
+    await db.client.update({ where: { id: fixture.client.id }, data: { mode: "LIVE" } });
+    const liveBlocked = await bulkRescheduleWithResults(fixture.context, { operations: [{ contentItemId: scheduled.id, scheduledAt: target }] });
+    expect(liveBlocked.results[0].error?.code).toBe("LIVE_CONNECTION_REQUIRED");
+    expect((await db.publishJob.findUniqueOrThrow({ where: { id: job.id } })).nextAttemptAt.toISOString()).toBe(original.toISOString());
   });
 });

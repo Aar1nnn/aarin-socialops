@@ -110,6 +110,15 @@ describe("calendar foundation", () => {
     const original = new Date(Date.now() + 2 * 24 * 60 * 60 * 1000);
     const target = new Date(Date.now() + 3 * 24 * 60 * 60 * 1000);
     const { item, version } = await createContent({ status: "APPROVED", scheduledAt: original });
+    await db.approval.create({
+      data: {
+        clientId: fixture.client.id,
+        contentVersionId: version.id,
+        accountId: fixture.account.id,
+        reviewerId: fixture.context.userId,
+        decision: "APPROVED",
+      },
+    });
     const job = await db.publishJob.create({ data: { clientId: fixture.client.id, contentVersionId: version.id, accountId: fixture.account.id, idempotencyKey: randomUUID(), adapter: "mock", nextAttemptAt: original } });
     expect(await listCalendarEntries(fixture.context, { platform: "linkedin" })).toHaveLength(0);
     expect(await listCalendarEntries(fixture.context, { platform: "facebook", status: "APPROVED" })).toHaveLength(1);

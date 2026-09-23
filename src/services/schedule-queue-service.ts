@@ -1,4 +1,4 @@
-import { ContentStatus, PublishJobStatus } from "@prisma/client";
+import { ContentStatus, Prisma, PublishJobStatus } from "@prisma/client";
 import { z } from "zod";
 import { assertCanWrite, type RequestContext } from "../lib/context";
 import { db } from "../lib/db";
@@ -6,7 +6,15 @@ import { AppError } from "../lib/errors";
 import { assertValidTimeZone, zonedLocalDateTimeToUtc } from "../lib/timezone";
 import { recordDomainEvent } from "../lib/domain-events";
 import { rescheduleCalendarItems } from "./calendar-service";
-import { schedulePublication } from "./content-service";
+import {
+  findScheduleConflictsInTransaction,
+  lockContentItemForScheduling,
+  lockSchedulingAccount,
+  lockSchedulingClient,
+  persistPublicationGateTask,
+  schedulePublicationInTransaction,
+  validatePublicationInTransaction,
+} from "./content-service";
 
 const slotSchema = z.object({
   dayOfWeek: z.number().int().min(0).max(6),
@@ -37,8 +45,8 @@ const assignSchema = z.object({
   after: z.coerce.date().optional(),
 });
 
-const activeItemStatuses: ContentStatus[] = [ContentStatus.APPROVED, ContentStatus.SCHEDULED, ContentStatus.REVIEW_PENDING];
-const activeJobStatuses: PublishJobStatus[] = [PublishJobStatus.PENDING, PublishJobStatus.RETRY, PublishJobStatus.WAITING_CONFIGURATION, PublishJobStatus.RUNNING];
+const mutableJobStatuses = new Set<PublishJobStatus>([PublishJobStatus.PENDING, PublishJobStatus.RETRY, PublishJobStatus.WAITING_CONFIGURATION]);
+const immutableItemStatuses = new Set<ContentStatus>([ContentStatus.RUNNING, ContentStatus.PUBLISHED, ContentStatus.UNKNOWN, ContentStatus.FAILED, ContentStatus.CANCELLED]);
 
 function datePartsInZone(date: Date, timeZone: string) {
   const parts = new Intl.DateTimeFormat("en-CA", { timeZone, year: "numeric", month: "2-digit", day: "2-digit" }).formatToParts(date);
@@ -52,6 +60,28 @@ function addLocalDays(parts: { year: number; month: number; day: number }, days:
 }
 
 function pad(value: number) { return String(value).padStart(2, "0"); }
+
+function queueOccurrences(
+  queue: { timezone: string; horizonDays: number; slots: Array<{ dayOfWeek: number; hour: number; minute: number }> },
+  after: Date,
+) {
+  const start = datePartsInZone(after, queue.timezone);
+  const occurrences: Date[] = [];
+  for (let offset = 0; offset <= queue.horizonDays; offset += 1) {
+    const localDate = addLocalDays(start, offset);
+    for (const slot of queue.slots.filter((candidate) => candidate.dayOfWeek === localDate.dayOfWeek)) {
+      const localDateTime = `${localDate.year}-${pad(localDate.month)}-${pad(localDate.day)}T${pad(slot.hour)}:${pad(slot.minute)}:00`;
+      try {
+        const instant = zonedLocalDateTimeToUtc(localDateTime, queue.timezone);
+        if (instant.getTime() > after.getTime()) occurrences.push(instant);
+      } catch (error) {
+        if (error instanceof AppError && ["INVALID_SCHEDULE_TIME", "AMBIGUOUS_SCHEDULE_TIME"].includes(error.code)) continue;
+        throw error;
+      }
+    }
+  }
+  return occurrences.sort((left, right) => left.getTime() - right.getTime());
+}
 
 export async function upsertScheduleQueue(context: RequestContext, queueId: string | null, raw: unknown) {
   assertCanWrite(context);
@@ -92,39 +122,102 @@ export async function getQueueOccurrences(context: RequestContext, queueId: stri
     include: { slots: { where: { enabled: true } } },
   });
   if (!queue) throw new AppError("排期队列不存在、无权访问或已停用。", 404, "SCHEDULE_QUEUE_NOT_FOUND");
-  const start = datePartsInZone(after, queue.timezone);
-  const occurrences: Date[] = [];
-  for (let offset = 0; offset <= queue.horizonDays; offset += 1) {
-    const localDate = addLocalDays(start, offset);
-    for (const slot of queue.slots.filter((candidate) => candidate.dayOfWeek === localDate.dayOfWeek)) {
-      const localDateTime = `${localDate.year}-${pad(localDate.month)}-${pad(localDate.day)}T${pad(slot.hour)}:${pad(slot.minute)}:00`;
-      const instant = zonedLocalDateTimeToUtc(localDateTime, queue.timezone);
-      if (instant.getTime() > after.getTime()) occurrences.push(instant);
-    }
-  }
-  return occurrences.sort((left, right) => left.getTime() - right.getTime());
+  return queueOccurrences(queue, after);
 }
 
 export async function detectScheduleConflict(context: RequestContext, raw: unknown) {
   const input = conflictSchema.parse(raw);
   const account = await db.socialAccount.findFirst({ where: { id: input.accountId, clientId: context.clientId }, select: { id: true } });
   if (!account) throw new AppError("账号不存在或无权访问。", 404, "ACCOUNT_NOT_FOUND");
-  const from = new Date(input.scheduledAt.getTime() - input.windowMinutes * 60_000);
-  const to = new Date(input.scheduledAt.getTime() + input.windowMinutes * 60_000);
-  const conflicts = await db.contentItem.findMany({
-    where: {
+  return db.$transaction((tx) => findScheduleConflictsInTransaction(tx, {
+    clientId: context.clientId,
+    accountId: input.accountId,
+    scheduledAt: input.scheduledAt,
+    excludeContentItemIds: input.excludeContentItemId ? [input.excludeContentItemId] : [],
+    windowMinutes: input.windowMinutes,
+  }));
+}
+
+async function lockScheduleQueue(tx: Prisma.TransactionClient, context: RequestContext, queueId: string) {
+  const rows = await tx.$queryRaw<Array<{ id: string; accountId: string }>>`
+    SELECT "id", "accountId" FROM "ScheduleQueue"
+    WHERE "id" = ${queueId} AND "clientId" = ${context.clientId} AND "enabled" = true
+    FOR UPDATE
+  `;
+  if (!rows.length) throw new AppError("排期队列不存在、无权访问或已停用。", 404, "SCHEDULE_QUEUE_NOT_FOUND");
+  return rows[0];
+}
+
+async function assignContentToQueueInTransaction(
+  tx: Prisma.TransactionClient,
+  context: RequestContext,
+  input: z.infer<typeof assignSchema>,
+) {
+  await lockSchedulingClient(tx, context.clientId);
+  const lockedQueue = await lockScheduleQueue(tx, context, input.queueId);
+  const lockedItem = await lockContentItemForScheduling(tx, context, input.contentItemId);
+  if (lockedItem.accountId !== lockedQueue.accountId) {
+    throw new AppError("内容账号与排期队列账号不一致。", 409, "SCHEDULE_QUEUE_ACCOUNT_MISMATCH");
+  }
+  await lockSchedulingAccount(tx, context.clientId, lockedQueue.accountId);
+  const [queue, item] = await Promise.all([
+    tx.scheduleQueue.findFirst({
+      where: { id: lockedQueue.id, clientId: context.clientId, enabled: true },
+      include: { slots: { where: { enabled: true } } },
+    }),
+    tx.contentItem.findFirst({
+      where: { id: lockedItem.id, clientId: context.clientId },
+      select: { id: true, accountId: true, currentVersionId: true, status: true, scheduledAt: true },
+    }),
+  ]);
+  if (!queue) throw new AppError("排期队列不存在、无权访问或已停用。", 404, "SCHEDULE_QUEUE_NOT_FOUND");
+  if (!item) throw new AppError("内容不存在或无权访问。", 404, "CONTENT_NOT_FOUND");
+  if (item.accountId !== queue.accountId) throw new AppError("内容账号与排期队列账号不一致。", 409, "SCHEDULE_QUEUE_ACCOUNT_MISMATCH");
+  if (immutableItemStatuses.has(item.status)) throw new AppError("内容当前状态不允许排期或重排。", 409, "CALENDAR_ITEM_LOCKED");
+
+  const existing = item.currentVersionId
+    ? await tx.publishJob.findUnique({
+        where: { clientId_contentVersionId_accountId: { clientId: context.clientId, contentVersionId: item.currentVersionId, accountId: item.accountId } },
+      })
+    : null;
+  if (existing && mutableJobStatuses.has(existing.status)) {
+    const persistedAt = item.scheduledAt || existing.nextAttemptAt;
+    await validatePublicationInTransaction(tx, context, item.id, persistedAt);
+    return { contentItemId: item.id, queueId: queue.id, scheduledAt: persistedAt, publishJobId: existing.id, changed: false };
+  }
+  if (existing && !(existing.status === PublishJobStatus.CANCELLED && existing.attemptCount === 0)) {
+    throw new AppError("现有发布任务状态不允许重新排期。", 409, "CALENDAR_JOB_LOCKED");
+  }
+
+  let scheduledAt: Date | null = null;
+  for (const candidate of queueOccurrences(queue, input.after || new Date())) {
+    const conflict = await findScheduleConflictsInTransaction(tx, {
       clientId: context.clientId,
-      accountId: input.accountId,
-      ...(input.excludeContentItemId ? { id: { not: input.excludeContentItemId } } : {}),
-      OR: [
-        { status: { in: activeItemStatuses }, scheduledAt: { gte: from, lte: to } },
-        { currentVersion: { publishJobs: { some: { clientId: context.clientId, status: { in: activeJobStatuses }, nextAttemptAt: { gte: from, lte: to } } } } },
-      ],
-    },
-    select: { id: true, status: true, scheduledAt: true, accountId: true, platform: true },
-    orderBy: [{ scheduledAt: "asc" }, { id: "asc" }],
+      accountId: queue.accountId,
+      scheduledAt: candidate,
+      excludeContentItemIds: [item.id],
+    });
+    if (!conflict.conflict) {
+      scheduledAt = candidate;
+      break;
+    }
+  }
+  if (!scheduledAt) throw new AppError("队列计划周期内没有可用排期槽位。", 409, "NO_AVAILABLE_SCHEDULE_SLOT");
+  const scheduled = await schedulePublicationInTransaction(tx, context, item.id, {
+    publishMode: "SCHEDULED",
+    localDateTime: formatLocalDateTime(scheduledAt, queue.timezone),
+    timezone: queue.timezone,
   });
-  return { conflict: conflicts.length > 0, conflicts, window: { from, to } };
+  if (!scheduled.changed) {
+    return { contentItemId: item.id, queueId: queue.id, scheduledAt: scheduled.scheduledAt, publishJobId: scheduled.job.id, changed: false };
+  }
+  await recordDomainEvent(context, {
+    type: "CONTENT_SCHEDULED",
+    entityType: "ContentItem",
+    entityId: item.id,
+    metadata: { queueId: queue.id, scheduledAt: scheduled.scheduledAt.toISOString() },
+  }, tx);
+  return { contentItemId: item.id, queueId: queue.id, scheduledAt: scheduled.scheduledAt, publishJobId: scheduled.job.id, changed: true };
 }
 
 export async function findNextAvailableSlot(context: RequestContext, queueId: string, after = new Date(), excludeContentItemId?: string) {
@@ -140,17 +233,14 @@ export async function findNextAvailableSlot(context: RequestContext, queueId: st
 export async function assignContentToQueue(context: RequestContext, raw: unknown) {
   assertCanWrite(context);
   const input = assignSchema.parse(raw);
-  const [queue, item] = await Promise.all([
-    db.scheduleQueue.findFirst({ where: { id: input.queueId, clientId: context.clientId, enabled: true } }),
-    db.contentItem.findFirst({ where: { id: input.contentItemId, clientId: context.clientId } }),
-  ]);
-  if (!queue) throw new AppError("排期队列不存在、无权访问或已停用。", 404, "SCHEDULE_QUEUE_NOT_FOUND");
-  if (!item) throw new AppError("内容不存在或无权访问。", 404, "CONTENT_NOT_FOUND");
-  if (item.accountId !== queue.accountId) throw new AppError("内容账号与排期队列账号不一致。", 409, "SCHEDULE_QUEUE_ACCOUNT_MISMATCH");
-  const scheduledAt = await findNextAvailableSlot(context, queue.id, input.after || new Date(), item.id);
-  const job = await schedulePublication(context, item.id, { publishMode: "SCHEDULED", localDateTime: formatLocalDateTime(scheduledAt, queue.timezone), timezone: queue.timezone });
-  await recordDomainEvent(context, { type: "CONTENT_SCHEDULED", entityType: "ContentItem", entityId: item.id, metadata: { queueId: queue.id, scheduledAt: scheduledAt.toISOString() } });
-  return { contentItemId: item.id, queueId: queue.id, scheduledAt, publishJobId: job.id };
+  try {
+    const result = await db.$transaction((tx) => assignContentToQueueInTransaction(tx, context, input));
+    const { changed: _changed, ...response } = result;
+    return response;
+  } catch (error) {
+    await persistPublicationGateTask(context.clientId, error);
+    throw error;
+  }
 }
 
 function formatLocalDateTime(date: Date, timeZone: string) {
