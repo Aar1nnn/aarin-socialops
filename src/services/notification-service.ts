@@ -27,6 +27,7 @@ const defaultTransport: NotificationTransport = async ({ type, endpoint, display
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify(type === "EMAIL" ? { channel: displayName, subject: payload.title, text: payload.body, metadata: payload } : payload),
+    redirect: "error",
     signal: AbortSignal.timeout(10_000),
   });
   if (!response.ok) throw new Error(`${type} delivery failed with HTTP ${response.status}`);

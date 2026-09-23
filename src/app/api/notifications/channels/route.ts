@@ -20,7 +20,12 @@ export async function POST(request: Request) {
     const confirmed = String(body.confirmVerified || "") === "true";
     if (confirmed && !endpoint) throw new AppError("服务器环境变量尚未配置，不能标记为已验证。", 409, "CHANNEL_CREDENTIAL_MISSING");
     if (endpoint) {
-      try { new URL(endpoint); } catch { throw new AppError("通知端点环境变量不是有效 URL。", 409, "CHANNEL_ENDPOINT_INVALID"); }
+      try {
+        const parsed = new URL(endpoint);
+        if (parsed.protocol !== "https:") throw new Error("HTTPS required");
+      } catch {
+        throw new AppError("通知端点环境变量必须是有效的 HTTPS URL。", 409, "CHANNEL_ENDPOINT_INVALID");
+      }
     }
     const channel = await db.notificationChannel.upsert({
       where: { clientId_type_displayName: { clientId: context.clientId, type, displayName } },

@@ -1,4 +1,4 @@
-import { ContentStatus, PublishJobStatus } from "@prisma/client";
+import { ApprovalDecision, ContentStatus, PublishJobStatus } from "@prisma/client";
 import { z } from "zod";
 import { db } from "../lib/db";
 import { AppError } from "../lib/errors";
@@ -26,13 +26,7 @@ const protectedItemStatuses = new Set<ContentStatus>([
   ContentStatus.CANCELLED,
 ]);
 
-const protectedJobStatuses = new Set<PublishJobStatus>([
-  PublishJobStatus.RUNNING,
-  PublishJobStatus.PUBLISHED,
-  PublishJobStatus.UNKNOWN,
-  PublishJobStatus.FAILED,
-  PublishJobStatus.CANCELLED,
-]);
+const activeJobStatuses: PublishJobStatus[] = [PublishJobStatus.PENDING, PublishJobStatus.RETRY, PublishJobStatus.WAITING_CONFIGURATION];
 
 export async function listCalendarEntries(context: RequestContext, raw: unknown = {}) {
   const input = calendarFilterSchema.parse(raw);
@@ -53,16 +47,17 @@ export async function listCalendarEntries(context: RequestContext, raw: unknown 
       plan: { include: { product: { select: { id: true, name: true } } } },
       currentVersion: {
         include: {
-          approvals: { orderBy: { createdAt: "desc" }, take: 1 },
-          publishJobs: { orderBy: { createdAt: "desc" }, take: 1 },
+          approvals: { orderBy: { createdAt: "desc" } },
+          publishJobs: { orderBy: { createdAt: "desc" } },
         },
       },
     },
     orderBy: [{ scheduledAt: "asc" }, { updatedAt: "desc" }],
   });
   return items.map((item) => {
-    const approval = item.currentVersion?.approvals[0];
-    const job = item.currentVersion?.publishJobs[0];
+    const approval = item.currentVersion?.approvals.find((candidate) => candidate.accountId === item.accountId);
+    const job = item.currentVersion?.publishJobs.find((candidate) => candidate.accountId === item.accountId);
+    const activeJob = item.currentVersion?.publishJobs.find((candidate) => candidate.accountId === item.accountId && activeJobStatuses.includes(candidate.status));
     return {
       id: item.id,
       platform: item.platform,
@@ -76,7 +71,9 @@ export async function listCalendarEntries(context: RequestContext, raw: unknown 
       approvalStatus: approval?.decision || null,
       publishJobStatus: job?.status || null,
       queueAt: job?.nextAttemptAt || null,
-      reschedulable: !protectedItemStatuses.has(item.status) && (!job || !protectedJobStatuses.has(job.status)),
+      reschedulable: item.status === ContentStatus.SCHEDULED
+        && approval?.decision === ApprovalDecision.APPROVED
+        && Boolean(activeJob),
     };
   });
 }
@@ -88,24 +85,34 @@ export async function rescheduleCalendarItems(context: RequestContext, raw: unkn
   return db.$transaction(async (tx) => {
     const items = await tx.contentItem.findMany({
       where: { clientId: context.clientId, id: { in: input.contentItemIds } },
-      include: { currentVersion: { include: { publishJobs: true } } },
+      include: {
+        currentVersion: {
+          include: {
+            approvals: { orderBy: { createdAt: "desc" } },
+            publishJobs: { orderBy: { createdAt: "desc" } },
+          },
+        },
+      },
     });
     if (items.length !== new Set(input.contentItemIds).size) {
       throw new AppError("包含不存在或其他客户的内容。", 403, "CONTENT_SCOPE_VIOLATION");
     }
     for (const item of items) {
       if (protectedItemStatuses.has(item.status)) throw new AppError(`内容 ${item.id} 当前状态不允许重排。`, 409, "CALENDAR_ITEM_LOCKED");
-      const jobs = item.currentVersion?.publishJobs || [];
-      if (jobs.some((job) => protectedJobStatuses.has(job.status))) throw new AppError(`内容 ${item.id} 的发布任务不允许重排。`, 409, "CALENDAR_JOB_LOCKED");
+      if (item.status !== ContentStatus.SCHEDULED || !item.currentVersion) {
+        throw new AppError(`内容 ${item.id} 不是已有排期，不能通过 Calendar 创建新排期。`, 409, "CALENDAR_ITEM_NOT_RESCHEDULABLE");
+      }
+      const approval = item.currentVersion.approvals.find((candidate) => candidate.accountId === item.accountId);
+      if (!approval || approval.decision !== ApprovalDecision.APPROVED) {
+        throw new AppError(`内容 ${item.id} 的当前版本没有有效人工批准。`, 409, "APPROVAL_REQUIRED");
+      }
+      const job = item.currentVersion.publishJobs.find((candidate) => candidate.accountId === item.accountId && activeJobStatuses.includes(candidate.status));
+      if (!job) throw new AppError(`内容 ${item.id} 没有可移动的现有发布任务。`, 409, "PUBLISH_JOB_REQUIRED");
     }
     for (const item of items) {
+      const job = item.currentVersion!.publishJobs.find((candidate) => candidate.accountId === item.accountId && activeJobStatuses.includes(candidate.status))!;
       await tx.contentItem.update({ where: { id: item.id }, data: { scheduledAt: input.scheduledAt } });
-      if (item.currentVersionId) {
-        await tx.publishJob.updateMany({
-          where: { clientId: context.clientId, contentVersionId: item.currentVersionId, status: { in: ["PENDING", "RETRY", "WAITING_CONFIGURATION"] } },
-          data: { nextAttemptAt: input.scheduledAt },
-        });
-      }
+      await tx.publishJob.update({ where: { id: job.id }, data: { nextAttemptAt: input.scheduledAt } });
     }
     await tx.auditLog.create({
       data: {

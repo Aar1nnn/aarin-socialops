@@ -10,6 +10,7 @@ import { runAIContentPipeline } from "../src/services/ai-content-pipeline-servic
 import { listCalendarEntries, rescheduleCalendarItems } from "../src/services/calendar-service";
 import { aggregateMetricSnapshots, canonicalizeMetricKey, markAnalyticsSyncFailed, markAnalyticsSyncStarted, markAnalyticsSyncSucceeded, periodBounds, resolveFreshness } from "../src/services/analytics-service";
 import { createAndDispatchNotification } from "../src/services/notification-service";
+import { generateContentPlan } from "../src/services/content-service";
 
 type Fixture = { client: Client; context: RequestContext; account: SocialAccount; promptId: string };
 const clientIds: string[] = [];
@@ -28,7 +29,7 @@ async function makeFixture(brandGuidelines: string | null = "Legacy: direct and 
   return { client, account, promptId: prompt.id, context: { clientId: client.id, userId: user.id, role: "OWNER" as const } };
 }
 
-async function createContent(input: { status?: "DRAFT" | "APPROVED" | "PUBLISHED"; scheduledAt?: Date; text?: string } = {}) {
+async function createContent(input: { status?: "DRAFT" | "APPROVED" | "SCHEDULED" | "PUBLISHED"; scheduledAt?: Date; text?: string } = {}) {
   const product = await db.product.create({ data: { clientId: fixture.client.id, name: "Confirmed chair", status: "CONFIRMED" } });
   const plan = await db.contentPlan.create({ data: { clientId: fixture.client.id, productId: product.id, theme: "Wholesale chair", objective: "Qualified enquiry", channels: ["facebook"] } });
   const item = await db.contentItem.create({ data: { clientId: fixture.client.id, planId: plan.id, accountId: fixture.account.id, platform: "facebook", status: input.status || "DRAFT", scheduledAt: input.scheduledAt } });
@@ -103,16 +104,38 @@ describe("AI content pipeline foundation", () => {
     const adapter: TextGenerationAdapter = { async generate() { return { provider: "bad", model: null, simulated: true, usage: { inputUnits: 0, outputUnits: 0 }, output: { drafts: [] } }; } };
     await expect(runAIContentPipeline(fixture.context, { clientName: "x", mode: "DRAFT", targetMarkets: [], productFocus: null, brandGuidelines: null, productName: "x", objective: "x", theme: "x", confirmedFacts: [], missingFields: [], platforms: ["facebook"], instruction: "x" }, adapter)).rejects.toThrow();
   });
+
+  it("hard-rejects generated drafts that claim unconfirmed fact keys", async () => {
+    const adapter: TextGenerationAdapter = { async generate() { return { provider: "unsafe", model: "test", simulated: true, usage: { inputUnits: 1, outputUnits: 1 }, output: { drafts: [{ platform: "facebook", title: "Unsafe", text: "Unverified size claim.", usedFactKeys: ["size"], missingInformation: [], isGenericMarketDraft: false }] } }; } };
+    await expect(runAIContentPipeline(fixture.context, { clientName: "x", mode: "DRAFT", targetMarkets: [], productFocus: null, brandGuidelines: null, productName: "x", objective: "x", theme: "x", confirmedFacts: [{ key: "material", value: "steel", source: "sheet" }], missingFields: ["size"], platforms: ["facebook"], instruction: "x" }, adapter)).rejects.toMatchObject({ code: "AI_UNCONFIRMED_FACT_USED" });
+  });
+
+  it("does not persist AI output after product facts change during generation", async () => {
+    await db.socialAccount.update({ where: { id: fixture.account.id }, data: { isSelected: true } });
+    const product = await db.product.create({ data: {
+      clientId: fixture.client.id,
+      name: "Race-safe chair",
+      status: "CONFIRMED",
+      fields: { create: [{ clientId: fixture.client.id, key: "material", value: "steel", status: "CONFIRMED", source: "sheet" }] },
+    } });
+    const adapter: TextGenerationAdapter = { async generate(input) {
+      await db.product.update({ where: { id: product.id }, data: { dataVersion: { increment: 1 } } });
+      return { provider: "race-test", model: "test", simulated: true, usage: { inputUnits: 1, outputUnits: 1 }, output: { drafts: [{ platform: "facebook", title: "Draft", text: "Verified steel chair.", usedFactKeys: [input.confirmedFacts[0].key], missingInformation: [], isGenericMarketDraft: false }] } };
+    } };
+    await expect(generateContentPlan(fixture.context, { productId: product.id, theme: "Race", objective: "Leads", accountIds: [fixture.account.id], assetIds: [] }, adapter)).rejects.toMatchObject({ code: "STALE_OPERATION" });
+    expect(await db.contentPlan.count({ where: { clientId: fixture.client.id, productId: product.id } })).toBe(0);
+  });
 });
 
 describe("calendar foundation", () => {
   it("filters existing records and reschedules through the tenant service", async () => {
     const original = new Date(Date.now() + 2 * 24 * 60 * 60 * 1000);
     const target = new Date(Date.now() + 3 * 24 * 60 * 60 * 1000);
-    const { item, version } = await createContent({ status: "APPROVED", scheduledAt: original });
+    const { item, version } = await createContent({ status: "SCHEDULED", scheduledAt: original });
+    await db.approval.create({ data: { clientId: fixture.client.id, contentVersionId: version.id, accountId: fixture.account.id, reviewerId: fixture.context.userId, decision: "APPROVED" } });
     const job = await db.publishJob.create({ data: { clientId: fixture.client.id, contentVersionId: version.id, accountId: fixture.account.id, idempotencyKey: randomUUID(), adapter: "mock", nextAttemptAt: original } });
     expect(await listCalendarEntries(fixture.context, { platform: "linkedin" })).toHaveLength(0);
-    expect(await listCalendarEntries(fixture.context, { platform: "facebook", status: "APPROVED" })).toHaveLength(1);
+    expect(await listCalendarEntries(fixture.context, { platform: "facebook", status: "SCHEDULED" })).toEqual([expect.objectContaining({ id: item.id, reschedulable: true })]);
     await rescheduleCalendarItems(fixture.context, { contentItemIds: [item.id], scheduledAt: target });
     expect((await db.contentItem.findUniqueOrThrow({ where: { id: item.id } })).scheduledAt?.toISOString()).toBe(target.toISOString());
     expect((await db.publishJob.findUniqueOrThrow({ where: { id: job.id } })).nextAttemptAt.toISOString()).toBe(target.toISOString());
@@ -123,6 +146,20 @@ describe("calendar foundation", () => {
     await expect(rescheduleCalendarItems(fixture.context, { contentItemIds: [item.id], scheduledAt: new Date(Date.now() + 86400000) })).rejects.toMatchObject({ code: "CALENDAR_ITEM_LOCKED" });
     const other = await makeFixture();
     await expect(rescheduleCalendarItems(other.context, { contentItemIds: [item.id], scheduledAt: new Date(Date.now() + 86400000) })).rejects.toMatchObject({ code: "CONTENT_SCOPE_VIOLATION" });
+  });
+
+  it("does not create a schedule or bypass a revoked human approval", async () => {
+    const approvedOnly = await createContent({ status: "APPROVED" });
+    await expect(rescheduleCalendarItems(fixture.context, { contentItemIds: [approvedOnly.item.id], scheduledAt: new Date(Date.now() + 86400000) })).rejects.toMatchObject({ code: "CALENDAR_ITEM_NOT_RESCHEDULABLE" });
+
+    const scheduledAt = new Date(Date.now() + 2 * 86400000);
+    const scheduled = await createContent({ status: "SCHEDULED", scheduledAt });
+    await db.approval.createMany({ data: [
+      { clientId: fixture.client.id, contentVersionId: scheduled.version.id, accountId: fixture.account.id, reviewerId: fixture.context.userId, decision: "APPROVED", createdAt: new Date(Date.now() - 1000) },
+      { clientId: fixture.client.id, contentVersionId: scheduled.version.id, accountId: fixture.account.id, reviewerId: fixture.context.userId, decision: "REJECTED", createdAt: new Date() },
+    ] });
+    await db.publishJob.create({ data: { clientId: fixture.client.id, contentVersionId: scheduled.version.id, accountId: fixture.account.id, idempotencyKey: randomUUID(), adapter: "mock", nextAttemptAt: scheduledAt } });
+    await expect(rescheduleCalendarItems(fixture.context, { contentItemIds: [scheduled.item.id], scheduledAt: new Date(Date.now() + 3 * 86400000) })).rejects.toMatchObject({ code: "APPROVAL_REQUIRED" });
   });
 });
 
