@@ -3,6 +3,9 @@ import { AppError } from "../errors";
 import type {
   DraftGenerationInput,
   DraftGenerationResult,
+  StructuredTextGenerationAdapter,
+  StructuredTextGenerationInput,
+  StructuredTextGenerationResult,
   TextGenerationAdapter,
 } from "./types";
 
@@ -43,7 +46,12 @@ export class MockTextGenerationAdapter implements TextGenerationAdapter {
   }
 }
 
-export class OpenAICompatibleTextAdapter implements TextGenerationAdapter {
+type JsonCompletionResult = {
+  output: unknown;
+  usage: { inputUnits: number; outputUnits: number };
+};
+
+export class OpenAICompatibleTextAdapter implements TextGenerationAdapter, StructuredTextGenerationAdapter {
   constructor(
     private readonly baseUrl: string,
     private readonly apiKey: string,
@@ -51,6 +59,51 @@ export class OpenAICompatibleTextAdapter implements TextGenerationAdapter {
   ) {}
 
   async generate(input: DraftGenerationInput): Promise<DraftGenerationResult> {
+    const generated = await this.completeJson(
+      `${input.instruction}\nReturn JSON matching {drafts:[{platform,title,text,usedFactKeys,missingInformation,isGenericMarketDraft}]}.`,
+      {
+        clientName: input.clientName,
+        targetMarkets: input.targetMarkets,
+        productFocus: input.productFocus,
+        brandGuidelines: input.brandGuidelines,
+        productName: input.productName,
+        objective: input.objective,
+        theme: input.theme,
+        confirmedFacts: input.confirmedFacts,
+        missingFields: input.missingFields,
+        platforms: input.platforms,
+        brandProfile: input.brandProfile,
+        recentContent: input.recentContent,
+        performanceContext: input.performanceContext,
+        researchContext: input.researchContext,
+        strategy: input.strategy,
+      },
+    );
+    const output = generatedDraftsSchema.parse(generated.output);
+    return {
+      output,
+      provider: "openai-compatible",
+      model: this.model,
+      simulated: false,
+      usage: generated.usage,
+    };
+  }
+
+  async generateStructured(input: StructuredTextGenerationInput): Promise<StructuredTextGenerationResult> {
+    const generated = await this.completeJson(
+      `${input.instruction}\nReturn only JSON matching ${input.schemaDescription}.`,
+      input.input,
+    );
+    return {
+      output: generated.output,
+      provider: "openai-compatible",
+      model: this.model,
+      simulated: false,
+      usage: generated.usage,
+    };
+  }
+
+  private async completeJson(instruction: string, input: unknown): Promise<JsonCompletionResult> {
     const response = await fetch(`${this.baseUrl.replace(/\/$/, "")}/chat/completions`, {
       method: "POST",
       headers: {
@@ -64,28 +117,11 @@ export class OpenAICompatibleTextAdapter implements TextGenerationAdapter {
         messages: [
           {
             role: "system",
-            content:
-              `${input.instruction}\nReturn JSON matching {drafts:[{platform,title,text,usedFactKeys,missingInformation,isGenericMarketDraft}]}.`,
+            content: instruction,
           },
           {
             role: "user",
-            content: JSON.stringify({
-              clientName: input.clientName,
-              targetMarkets: input.targetMarkets,
-              productFocus: input.productFocus,
-              brandGuidelines: input.brandGuidelines,
-              productName: input.productName,
-              objective: input.objective,
-              theme: input.theme,
-              confirmedFacts: input.confirmedFacts,
-              missingFields: input.missingFields,
-              platforms: input.platforms,
-              brandProfile: input.brandProfile,
-              recentContent: input.recentContent,
-              performanceContext: input.performanceContext,
-              researchContext: input.researchContext,
-              strategy: input.strategy,
-            }),
+            content: JSON.stringify(input),
           },
         ],
       }),
@@ -106,12 +142,8 @@ export class OpenAICompatibleTextAdapter implements TextGenerationAdapter {
     } catch {
       throw new AppError("文本模型输出不是有效 JSON。", 502, "MODEL_INVALID_OUTPUT");
     }
-    const output = generatedDraftsSchema.parse(parsed);
     return {
-      output,
-      provider: "openai-compatible",
-      model: this.model,
-      simulated: false,
+      output: parsed,
       usage: {
         inputUnits: payload.usage?.prompt_tokens ?? 0,
         outputUnits: payload.usage?.completion_tokens ?? 0,
@@ -122,6 +154,17 @@ export class OpenAICompatibleTextAdapter implements TextGenerationAdapter {
 
 export function getTextGenerationAdapter(provider: string): TextGenerationAdapter {
   if (provider !== "openai-compatible") return new MockTextGenerationAdapter();
+  return getOpenAICompatibleTextAdapter();
+}
+
+export function getStructuredTextGenerationAdapter(provider: string): StructuredTextGenerationAdapter {
+  if (provider !== "openai-compatible") {
+    throw new AppError(`当前文本模型 provider 不支持结构化生成：${provider}`, 409, "MODEL_PROVIDER_UNSUPPORTED");
+  }
+  return getOpenAICompatibleTextAdapter();
+}
+
+function getOpenAICompatibleTextAdapter() {
   const baseUrl = process.env.TEXT_MODEL_BASE_URL;
   const apiKey = process.env.TEXT_MODEL_API_KEY;
   const model = process.env.TEXT_MODEL_NAME;

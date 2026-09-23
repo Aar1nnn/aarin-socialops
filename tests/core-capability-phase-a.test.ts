@@ -1,7 +1,12 @@
 import { randomUUID } from "node:crypto";
 import type { Client, SocialAccount } from "@prisma/client";
-import { afterAll, afterEach, beforeEach, describe, expect, it } from "vitest";
-import type { DraftGenerationInput, TextGenerationAdapter } from "../src/lib/adapters/types";
+import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import type {
+  DraftGenerationInput,
+  StructuredTextGenerationAdapter,
+  StructuredTextGenerationInput,
+  TextGenerationAdapter,
+} from "../src/lib/adapters/types";
 import type { RequestContext } from "../src/lib/context";
 import { db } from "../src/lib/db";
 import {
@@ -58,6 +63,18 @@ async function createItem(target = fixture) {
     assetIds: [],
   });
   return generated.items[0];
+}
+
+async function enableRealTextModel(target = fixture) {
+  return db.integrationConfig.create({
+    data: {
+      clientId: target.client.id,
+      type: "TEXT_GENERATION",
+      provider: "openai-compatible",
+      status: "VERIFIED",
+      verifiedAt: new Date(),
+    },
+  });
 }
 
 function adapter(captured: DraftGenerationInput[], text = "Rewritten verified steel chair."): TextGenerationAdapter {
@@ -130,17 +147,92 @@ describe("content composition engine", () => {
 });
 
 describe("brand autofill", () => {
-  it("returns validated transient partial suggestions and deterministic completeness", async () => {
+  it("returns an explicit rule-based degraded result without persisting or recording model usage", async () => {
     const draft = await createBrandAutofillDraft(fixture.context, { companyDescription: "Wholesale furniture exporter", structured: { audience: "Distributors", goals: ["Leads"] } });
     expect(draft.status).toBe("SUGGESTED");
     expect(draft.persistence).toBe("TRANSIENT");
+    expect(draft).toMatchObject({ analysisMode: "RULE_BASED", provider: "rules", model: null, degraded: true });
+    expect(draft.degradationReason).toContain("未调用 AI 模型");
     expect(draft.suggestions.audience).toEqual({ status: "SUGGESTED", value: "Distributors" });
     expect(calculateBrandCompleteness({ audience: "Distributors", goals: ["Leads"] })).toMatchObject({ completedFields: ["audience", "goals"] });
     expect((await getBrandProfile(fixture.context)).source).toBe("LEGACY_FALLBACK");
+    expect(await db.usageReservation.count({ where: { clientId: fixture.client.id } })).toBe(0);
+    expect(await db.usageLog.count({ where: { clientId: fixture.client.id } })).toBe(0);
   });
 
-  it("rejects invalid analyzer output and only writes confirmed fields with human overrides", async () => {
-    await expect(createBrandAutofillDraft(fixture.context, { manualNotes: "notes" }, async () => ({ unknown: "field" }))).rejects.toThrow();
+  it("calls the configured structured model adapter, settles usage, and keeps suggestions transient", async () => {
+    await enableRealTextModel();
+    const captured: StructuredTextGenerationInput[] = [];
+    const modelAdapter: StructuredTextGenerationAdapter = {
+      async generateStructured(input) {
+        captured.push(input);
+        return {
+          output: { businessSummary: "Model summary", audience: "Wholesale distributors", goals: ["Qualified leads"] },
+          provider: "openai-compatible",
+          model: "brand-test-model",
+          simulated: false,
+          usage: { inputUnits: 17, outputUnits: 9 },
+        };
+      },
+    };
+
+    const draft = await createBrandAutofillDraft(fixture.context, { companyDescription: "Verified source text" }, modelAdapter);
+
+    expect(captured).toHaveLength(1);
+    expect(captured[0].input).toEqual({ companyDescription: "Verified source text" });
+    expect(captured[0].schemaDescription).toContain("businessSummary");
+    expect(draft).toMatchObject({ analysisMode: "MODEL", provider: "openai-compatible", model: "brand-test-model", degraded: false, persistence: "TRANSIENT" });
+    expect(draft.suggestions.audience).toEqual({ status: "SUGGESTED", value: "Wholesale distributors" });
+    expect((await getBrandProfile(fixture.context)).source).toBe("LEGACY_FALLBACK");
+    expect(await db.usageReservation.findFirst({ where: { clientId: fixture.client.id } })).toMatchObject({ status: "SETTLED", settledUnits: 26, capability: "brand_autofill" });
+    expect(await db.usageLog.findFirst({ where: { clientId: fixture.client.id } })).toMatchObject({ capability: "brand_autofill", provider: "openai-compatible", model: "brand-test-model", inputUnits: 17, outputUnits: 9, simulated: false });
+  });
+
+  it("releases reserved usage when the model output violates the brand schema", async () => {
+    await enableRealTextModel();
+    const modelAdapter: StructuredTextGenerationAdapter = {
+      async generateStructured() {
+        return { output: { unknown: "field" }, provider: "openai-compatible", model: "brand-test-model", simulated: false, usage: { inputUnits: 3, outputUnits: 2 } };
+      },
+    };
+
+    await expect(createBrandAutofillDraft(fixture.context, { manualNotes: "notes" }, modelAdapter)).rejects.toMatchObject({ code: "MODEL_INVALID_OUTPUT" });
+    expect(await db.usageReservation.findFirst({ where: { clientId: fixture.client.id } })).toMatchObject({ status: "RELEASED", settledUnits: 0 });
+    expect(await db.usageLog.count({ where: { clientId: fixture.client.id } })).toBe(0);
+    expect((await getBrandProfile(fixture.context)).source).toBe("LEGACY_FALLBACK");
+  });
+
+  it("releases reserved usage and does not fall back when a verified model call fails", async () => {
+    await enableRealTextModel();
+    const modelAdapter: StructuredTextGenerationAdapter = {
+      async generateStructured() {
+        throw new Error("provider unavailable");
+      },
+    };
+
+    await expect(createBrandAutofillDraft(fixture.context, { manualNotes: "notes" }, modelAdapter)).rejects.toThrow("provider unavailable");
+    expect(await db.usageReservation.findFirst({ where: { clientId: fixture.client.id } })).toMatchObject({ status: "RELEASED", settledUnits: 0 });
+    expect(await db.usageLog.count({ where: { clientId: fixture.client.id } })).toBe(0);
+  });
+
+  it("blocks the configured model before invocation when the tenant budget is exhausted", async () => {
+    await enableRealTextModel();
+    await db.client.update({ where: { id: fixture.client.id }, data: { usageMonthlyLimit: 0 } });
+    const generateStructured = vi.fn<StructuredTextGenerationAdapter["generateStructured"]>();
+
+    await expect(createBrandAutofillDraft(fixture.context, { manualNotes: "notes" }, { generateStructured })).rejects.toMatchObject({ code: "USAGE_LIMIT_EXCEEDED" });
+    expect(generateStructured).not.toHaveBeenCalled();
+    expect(await db.usageReservation.count({ where: { clientId: fixture.client.id } })).toBe(0);
+    expect(await db.manualTask.count({ where: { clientId: fixture.client.id, triggerReason: "文本模型月度使用量上限已触达" } })).toBe(1);
+  });
+
+  it("rejects empty source material and accepted fields without a suggestion or override", async () => {
+    await expect(createBrandAutofillDraft(fixture.context, { structured: {} })).rejects.toThrow();
+    await expect(confirmBrandAutofill(fixture.context, { suggestions: {}, acceptedFields: ["tone"] })).rejects.toMatchObject({ code: "BRAND_FIELD_VALUE_REQUIRED" });
+    expect((await getBrandProfile(fixture.context)).source).toBe("LEGACY_FALLBACK");
+  });
+
+  it("only writes confirmed fields with human overrides", async () => {
     const confirmed = await confirmBrandAutofill(fixture.context, {
       suggestions: { audience: "Draft audience", tone: "Draft tone", goals: ["Leads"] },
       acceptedFields: ["audience", "goals"],
