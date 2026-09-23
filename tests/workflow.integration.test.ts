@@ -24,7 +24,8 @@ import { releaseUsage, reserveUsage, settleUsage } from "../src/services/usage-s
 import { checkLoginAllowed, clearLoginFailures, recordLoginFailure } from "../src/services/login-rate-limit-service";
 import type { PlatformAuthAdapter } from "../src/lib/adapters/platform-auth";
 import { TokenVault } from "../src/lib/token-vault";
-import { completePlatformConnection, selectPlatformAccounts, startPlatformConnection } from "../src/services/platform-connection-service";
+import { completePlatformConnection, disconnectPlatformConnection, selectPlatformAccounts, startPlatformConnection } from "../src/services/platform-connection-service";
+import { queryPlatformPublish } from "../src/services/platform-publish-query-service";
 
 type Fixture = {
   client: Client;
@@ -619,6 +620,80 @@ describe("phase two Facebook LIVE boundaries", () => {
   });
 });
 
+describe("platform remote query boundaries", () => {
+  it("queries an Instagram publish through the platform adapter without crossing tenants", async () => {
+    const account = fixture.accounts.find((candidate) => candidate.platform === "instagram")!;
+    const connection = await db.platformConnection.create({
+      data: {
+        clientId: fixture.client.id,
+        provider: "META",
+        externalPrincipalId: `instagram-query-${randomUUID()}`,
+        connectedByUserId: fixture.context.userId,
+        status: "CONNECTED",
+      },
+    });
+    await db.$transaction([
+      db.client.update({ where: { id: fixture.client.id }, data: { mode: "LIVE", isDemo: false } }),
+      db.socialAccount.update({
+        where: { id: account.id },
+        data: {
+          platformConnectionId: connection.id,
+          externalAccountId: "ig-query-account",
+          isSelected: true,
+          publishCapability: "VERIFIED",
+          verifiedAt: new Date(),
+          accessTokenCiphertext: "encrypted-test-only",
+          accessTokenIv: "iv-test-only",
+          accessTokenAuthTag: "tag-test-only",
+        },
+      }),
+    ]);
+    const generated = await generateContentPlan(fixture.context, {
+      productId: fixture.product.id,
+      theme: "Instagram remote query",
+      objective: "Verify platform query dispatch",
+      platforms: ["instagram"],
+      assetIds: [],
+    });
+    const item = generated.items[0];
+    await submitForReview(fixture.context, item.id);
+    await reviewContent(fixture.context, item.id, "APPROVED");
+    const scheduled = await schedulePublication(fixture.context, item.id);
+    await db.publishJob.update({
+      where: { id: scheduled.id },
+      data: { status: "UNKNOWN", remotePostId: "ig-media-query-1" },
+    });
+
+    const queryAdapter: SocialPublishAdapter = {
+      name: "instagram-query-test",
+      simulated: false,
+      async publish() { throw new Error("publish must not run during a remote query"); },
+      async queryByRemotePostId(remotePostId) {
+        expect(remotePostId).toBe("ig-media-query-1");
+        return {
+          status: "published",
+          remotePostId,
+          remotePostUrl: "https://www.instagram.com/p/test-query/",
+          publishedAt: new Date("2026-09-21T00:00:00Z"),
+        };
+      },
+    };
+    const second = await makeFixture();
+    await expect(queryPlatformPublish(second.context, scheduled.id, queryAdapter)).rejects.toMatchObject({
+      code: "PUBLISH_JOB_NOT_FOUND",
+    });
+    const queried = await queryPlatformPublish(fixture.context, scheduled.id, queryAdapter);
+    expect(queried).toMatchObject({
+      status: "PUBLISHED",
+      remotePostId: "ig-media-query-1",
+      remotePostUrl: "https://www.instagram.com/p/test-query/",
+    });
+    expect(await db.auditLog.findFirst({
+      where: { clientId: fixture.client.id, action: "PLATFORM_PUBLISH_QUERIED", entityId: scheduled.id },
+    })).not.toBeNull();
+  });
+});
+
 describe("phase two usage and authentication safety", () => {
   it("serializes concurrent usage reservations so the client budget cannot be oversubscribed", async () => {
     await db.client.update({ where: { id: fixture.client.id }, data: { usageMonthlyLimit: 100 } });
@@ -676,7 +751,14 @@ describe("v2 connection layer boundaries", () => {
       async discoverAccounts() {
         return {
           externalPrincipalId: "person-test",
-          grantedScopes: ["pages_show_list", "pages_manage_posts", "pages_read_engagement"],
+          grantedScopes: [
+            "pages_show_list",
+            "pages_manage_posts",
+            "pages_read_engagement",
+            "pages_read_user_content",
+            "instagram_basic",
+            "instagram_content_publish",
+          ],
           accounts: [
             {
               externalAccountId: "page-test",
@@ -696,8 +778,21 @@ describe("v2 connection layer boundaries", () => {
               capabilities: { canPublish: true, canReadMetrics: false, canReadComments: false },
               metadata: { source: "test" },
             },
+            {
+              externalAccountId: "instagram-test",
+              platform: "instagram",
+              accountType: "INSTAGRAM_PROFESSIONAL",
+              displayName: "Test Instagram",
+              username: "test_instagram",
+              accessToken: "instagram-page-secret-token",
+              capabilities: { canPublish: true, canQueryStatus: true, linkedFacebookPageId: "page-test" },
+              metadata: { source: "test", linkedFacebookPageId: "page-test" },
+            },
           ],
         };
+      },
+      async revoke(accessToken) {
+        expect(accessToken).toBe("user-secret-token");
       },
     };
     const vault = new TokenVault(new Map([["test-v1", Buffer.alloc(32, 9)]]), "test-v1");
@@ -707,14 +802,38 @@ describe("v2 connection layer boundaries", () => {
       const completed = await completePlatformConnection(fixture.context, "META", { code: "one-time", state }, { adapter, vault });
       const connection = await db.platformConnection.findFirstOrThrow({ where: { id: completed.connectionId, clientId: fixture.client.id }, include: { accounts: true } });
       expect(connection.accessTokenCiphertext).not.toContain("user-secret-token");
-      expect(connection.accounts[0].accessTokenCiphertext).not.toContain("page-secret-token");
-      expect(connection.accounts).toHaveLength(2);
+      expect(connection.accounts.every((account) => !account.accessTokenCiphertext?.includes("secret-token"))).toBe(true);
+      expect(connection.accounts).toHaveLength(3);
       expect(connection.accounts.every((account) => !account.isSelected)).toBe(true);
-      const selected = await selectPlatformAccounts(fixture.context, connection.id, [connection.accounts[0].id]);
-      expect(selected.accounts[0].isSelected).toBe(true);
-      expect(selected.accounts[0].publishCapability).toBe("VERIFIED");
+      const facebook = connection.accounts.find((account) => account.externalAccountId === "page-test")!;
+      const selected = await selectPlatformAccounts(fixture.context, connection.id, [facebook.id]);
+      expect(selected.accounts.find((account) => account.id === facebook.id)).toMatchObject({
+        isSelected: true,
+        publishCapability: "VERIFIED",
+        metricsCapability: "VERIFIED",
+      });
       expect(JSON.stringify(selected)).not.toMatch(/Ciphertext|AuthTag|page-secret-token|user-secret-token/);
+      const instagram = connection.accounts.find((account) => account.externalAccountId === "instagram-test")!;
+      const selectedInstagram = await selectPlatformAccounts(fixture.context, connection.id, [instagram.id]);
+      expect(selectedInstagram.accounts.find((account) => account.id === instagram.id)).toMatchObject({
+        isSelected: true,
+        publishCapability: "VERIFIED",
+        metricsCapability: "UNSUPPORTED",
+        commentsCapability: "UNSUPPORTED",
+      });
       await expect(completePlatformConnection(fixture.context, "META", { code: "replay", state }, { adapter, vault })).rejects.toMatchObject({ code: "OAUTH_STATE_INVALID" });
+      await expect(disconnectPlatformConnection(fixture.context, connection.id, { adapter, vault })).resolves.toEqual({
+        disconnected: true,
+        remoteRevokeConfirmed: true,
+      });
+      const disconnected = await db.platformConnection.findUniqueOrThrow({ where: { id: connection.id }, include: { accounts: true } });
+      expect(disconnected).toMatchObject({ status: "DISCONNECTED", accessTokenCiphertext: null, refreshTokenCiphertext: null });
+      expect(disconnected.accounts.every((account) =>
+        !account.isSelected
+        && account.accessTokenCiphertext === null
+        && account.accessTokenIv === null
+        && account.accessTokenAuthTag === null
+      )).toBe(true);
     } finally {
       if (previousRedirect === undefined) delete process.env.META_REDIRECT_URI;
       else process.env.META_REDIRECT_URI = previousRedirect;
