@@ -1,31 +1,24 @@
-# TryPost upstream record
+# TryPost upstream review
 
-- Original GitHub URL: https://github.com/trypostit/trypost
-- Pinned commit SHA: `ae0fa9eb83b2278409f261d25f6cef866150da82`
-- License: GNU AGPL-3.0, from root `LICENSE.md`
+- Original: https://github.com/trypostit/trypost
+- Reviewed commit: `ae0fa9eb83b2278409f261d25f6cef866150da82`
+- License: GNU AGPL-3.0 (`LICENSE.md` in the reviewed checkout)
 - Last audited/synced: 2026-09-21
 
 ## Audited source areas
 
-- `app/Ai/Agents/BrandAnalyzer.php`
-- `app/Ai/Agents/PostContentGenerator.php`
-- `app/Ai/Agents/PostContentReviewer.php`
-- `app/Ai/Agents/PostContentHumanizer.php`
-- `app/Ai/Agents/PostContentShortener.php`
-- `app/Ai/Agents/PostImageRegenerator.php`
-- `app/Actions/Ai/`
-- `app/Actions/Workspace/`
-- `app/Enums/Workspace/BrandVoiceTrait.php`
-- `app/Enums/Workspace/ContentLanguage.php`
-- `app/Enums/Workspace/ImageStyle.php`
-- `app/Enums/User/Persona.php`
+- Brand analyzer and content generation, review, humanization, shortening, and image-regeneration agents.
+- AI and workspace actions.
+- Brand voice trait, content language, image style, and persona enums.
 
-## Aarin use
+## Ideas and Aarin landing points
 
-- Future product/behavior reference for structured Brand Profile, persona, language/image-style choices, and separated AI generation/review/rewrite/humanize stages.
-- Future Aarin targets: `src/modules/brand/` and `src/modules/ai/`.
+- Structured Brand Profile with voice traits, languages, image style, and audience context.
+- Separate generation, review, rewrite/humanize, and shortening responsibilities represented as composition actions rather than independent systems.
+- Structured stage outputs and explicit platform length budgets.
+- Brand, product, and memory context supplied to generation instead of inferred from arbitrary text.
+- Aarin persists only through its existing `BrandProfile`, content, approval, adapter, usage, and tenant models.
 
-## License boundary and local modifications
+## License boundary
 
-- No TryPost PHP/Laravel source is copied into Aarin.
-- Future implementation will be a clean-room TypeScript design backed by Aarin `Client`, products/facts, `PromptVersion`, `ContentVersion`, `Approval`, and usage records.
+Architecture and behavior reference only. No TryPost PHP/Laravel source, prompts, enums, or UI were copied. Aarin uses a clean-room TypeScript implementation and remains the sole system of record.

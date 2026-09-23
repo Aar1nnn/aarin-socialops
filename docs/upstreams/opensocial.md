@@ -1,27 +1,24 @@
-# OpenSocial upstream record
+# OpenSocial upstream review
 
-- Original GitHub URL: https://github.com/0xdileep/opensocial
-- Pinned commit SHA: `2a655db3408961e15572e5ba23caccee5376e12b`
-- License: MIT text is embedded in `README.md`; no root `LICENSE`, `COPYING`, or `NOTICE` file was present at the pinned commit
+- Original: https://github.com/0xdileep/opensocial
+- Reviewed commit: `2a655db3408961e15572e5ba23caccee5376e12b`
+- License provenance: MIT text appears in `README.md`, but no root `LICENSE`, `COPYING`, or `NOTICE` existed at the reviewed commit; this is not treated as permission to copy.
 - Last audited/synced: 2026-09-21
 
 ## Audited source areas
 
 - `apps/api/src/ai/pipeline/content.pipeline.ts`
-- `apps/api/src/ai/stages/generate.strategy.ts`
-- `apps/api/src/ai/stages/critique.rewrite.ts`
-- `apps/api/src/ai/stages/image.prompt.ts`
-- `apps/api/src/ai/stages/image.generate.ts`
-- `apps/api/src/ai/stages/image.review.ts`
+- `apps/api/src/ai/stages/`: strategy, critique/rewrite, and image prompt/generation/review boundaries.
 - `apps/api/src/modules/brands/`
 
-## Aarin use
+## Ideas and Aarin landing points
 
-- Future architecture reference for staged AI content generation, critique/rewrite, image prompt/generation/review, brand context, and recent-content memory.
-- Future Aarin targets: `src/modules/brand/`, `src/modules/memory/`, and `src/modules/ai/`.
+- Explicit staged content generation instead of an opaque one-shot generation call.
+- Strategy followed by critique and rewrite.
+- Brand and recent-content memory supplied through reusable context providers.
+- Image prompt/review retained as a boundary that may remain unimplemented.
+- Aarin implementations live in its brand, memory, and AI services and only persist through `ContentVersion` plus human `Approval`.
 
-## Provenance boundary and local modifications
+## Provenance boundary
 
-- This delivery does not copy OpenSocial source.
-- Before a future direct port, reconfirm repository license provenance or obtain a standalone license record.
-- Future implementation must write through Aarin `ContentVersion` and human `Approval`; it cannot publish directly.
+Architecture-only reference. No OpenSocial source, prompts, or schema were copied. Direct adaptation remains prohibited unless license provenance is independently established.

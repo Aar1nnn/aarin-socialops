@@ -14,6 +14,28 @@ export type DraftGenerationInput = {
   missingFields: string[];
   platforms: Array<"facebook" | "instagram" | "tiktok" | "linkedin">;
   instruction: string;
+  brandProfile?: {
+    businessSummary: string | null;
+    positioning: string | null;
+    audience: string | null;
+    tone: string | null;
+    voiceTraits: string[];
+    goals: string[];
+    contentLanguages: string[];
+    imageStyle: string | null;
+    bannedPhrases: string[];
+    requiredMentions: string[];
+    ctaRules: string[];
+  };
+  recentContent?: Array<{ platform: string; theme: string; hook: string; cta: string | null; product: string | null }>;
+  performanceContext?: Array<{ metricKey: string; platform: string; value: string | null; availability: string; dataKind: string }>;
+  researchContext?: Array<{ kind: string; objective: string; observations: unknown; limitations: unknown }>;
+  strategy?: {
+    audience: string;
+    messageAngle: string;
+    contentGoal: string;
+    differentiation: string[];
+  };
 };
 
 export type DraftGenerationResult = {

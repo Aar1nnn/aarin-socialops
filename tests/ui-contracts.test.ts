@@ -26,6 +26,7 @@ const connectionsSource = readSource("../src/app/connections/page.tsx");
 const contentSource = readSource("../src/app/content/page.tsx");
 const insightsSource = readSource("../src/app/insights/page.tsx");
 const settingsSource = readSource("../src/app/settings/page.tsx");
+const primaryNavSource = readSource("../src/components/primary-nav.tsx");
 
 describe("pilot operator UI form contracts", () => {
   describe("platform connections", () => {
@@ -139,6 +140,20 @@ describe("pilot operator UI form contracts", () => {
       expect(settingsSource).toContain('name="mode"');
       expect(settingsSource).toContain('name="usageMonthlyLimit"');
       expect(settingsSource).toContain('name="textProvider"');
+    });
+
+    it("keeps the non-publishing foundation routes in the integrated navigation", () => {
+      expect(primaryNavSource).toContain('{ href: "/calendar", label: "日历"');
+      expect(primaryNavSource).toContain('{ href: "/brand", label: "品牌"');
+      expect(primaryNavSource).toContain('{ href: "/analytics", label: "数据分析"');
+    });
+
+    it("preserves external notification channel setup outside the workspace form", () => {
+      const form = formContaining(settingsSource, 'action="/api/notifications/channels"');
+
+      expectNamedFields(form, ["type", "displayName", "credentialRef", "confirmVerified"]);
+      expect(form).toContain('pattern="env:[A-Z][A-Z0-9_]+"');
+      expect(form).toContain("disabled={!isOwner}");
     });
   });
 });

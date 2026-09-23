@@ -590,6 +590,34 @@ details[open].disclosure > summary::after, details[open].card > summary::after {
   .summary-item:nth-child(-n + 2) { border-bottom: 1px solid var(--color-border); }
 }
 
+.calendar-board {
+  display: grid;
+  grid-template-columns: repeat(7, minmax(120px, 1fr));
+  gap: 9px;
+  overflow-x: auto;
+}
+.calendar-day {
+  min-height: 150px;
+  padding: 10px;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  background: var(--color-surface-subtle);
+}
+.calendar-entry {
+  margin-top: 8px;
+  padding: 9px;
+  border-radius: var(--radius-sm);
+  background: var(--color-info-bg);
+  color: var(--color-action);
+  font-size: 12px;
+  cursor: grab;
+}
+.calendar-entry[draggable="false"] {
+  background: var(--color-surface-muted);
+  color: var(--color-text-secondary);
+  cursor: not-allowed;
+}
+
 @media (max-width: 900px) {
   .shell { display: block; }
   .sidebar { position: static; height: auto; overflow: visible; }
@@ -621,6 +649,7 @@ details[open].disclosure > summary::after, details[open].card > summary::after {
   .main { padding: 26px 20px 44px; }
   .span-8, .span-6, .span-4, .span-3 { grid-column: span 12; }
   .settings-section { grid-template-columns: 1fr; gap: 10px; }
+  .calendar-board { grid-template-columns: repeat(7, minmax(145px, 1fr)); }
 }
 
 @media (max-width: 680px) {

@@ -77,6 +77,16 @@ async function seedClientBasics(prisma: PrismaClient, clientId: string, demo: bo
       verifiedAt: new Date(),
     },
   });
+  for (const external of [
+    { type: "WEBHOOK", displayName: "Webhook（待配置）" },
+    { type: "EMAIL", displayName: "Email HTTP endpoint（待配置）" },
+  ]) {
+    await prisma.notificationChannel.upsert({
+      where: { clientId_type_displayName: { clientId, ...external } },
+      update: {},
+      create: { clientId, ...external, status: CapabilityStatus.UNCONFIGURED },
+    });
+  }
   await prisma.notificationChannel.upsert({
     where: { clientId_type_displayName: { clientId, type: "URGENT_EXTERNAL", displayName: "紧急外部通知（待配置）" } },
     update: {},

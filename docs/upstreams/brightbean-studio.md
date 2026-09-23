@@ -1,24 +1,25 @@
-# BrightBean Studio upstream record
+# BrightBean Studio upstream review
 
-- Original GitHub URL: https://github.com/brightbeanxyz/brightbean-studio
-- Pinned commit SHA: `16dd55e8ec9123f5ebf99ba1e470e245dcc07519`
-- License: GNU AGPL-3.0, from root `LICENSE`
+- Original: https://github.com/brightbeanxyz/brightbean-studio
+- Reviewed commit: `16dd55e8ec9123f5ebf99ba1e470e245dcc07519`
+- License: GNU AGPL-3.0 (`LICENSE` in the reviewed checkout)
 - Last audited/synced: 2026-09-21
 
 ## Audited source areas
 
-- `apps/analytics/` including `metrics.py`, `freshness.py`, `derive.py`, services, tasks, quota and snapshot migrations
-- `apps/calendar/` including queue, recurrence, bulk-action and security tests
-- `apps/social_accounts/` including provider factory, OAuth, status, missing-scope and quota handling
-- `apps/publisher/` including publish confirmation and media/failure tests
-- `apps/notifications/` including delivery engine, retry caps, batching and unsubscribe behavior
+- `apps/analytics/`: metrics, freshness, derivation, services, tasks, quota, and snapshot migrations.
+- `apps/calendar/`: queue, recurrence, bulk-action, security, and operator calendar behavior.
+- `apps/social_accounts/`: provider factory, OAuth, status, missing-scope, and quota handling.
+- `apps/publisher/`: publish confirmation, media, and failure behavior.
+- `apps/notifications/`: delivery engine, retry caps, batching, and unsubscribe behavior.
 
-## Aarin use
+## Ideas and Aarin landing points
 
-- Future behavior reference for canonical metric mapping, freshness/sync state, calendar views and queues, account operations, publishing confirmation, and best-effort external notifications.
-- Future Aarin targets: `src/modules/analytics/`, `src/modules/calendar/`, `src/modules/notifications/`, plus existing account/publishing services.
+- Calendar remains an operational layer over Aarin content and scheduling records.
+- Canonical metric normalization, period aggregation, and freshness remain backed by `MetricSnapshot` and `AnalyticsSyncState`.
+- Account and publishing behavior informs Aarin's provider registry without replacing its adapter or safety contracts.
+- Notification outcomes use `NotificationDelivery`; delivery failure does not roll back the originating business event.
 
-## License boundary and local modifications
+## License boundary
 
-- No BrightBean Python/Django source is copied into Aarin.
-- Future features will be clean-room TypeScript implementations over Aarin `MetricSnapshot`, `DataAvailability`, `DataKind`, content/scheduling records, `InAppNotification`, `NotificationChannel`, and `ManualTask`.
+Architecture and workflow reference only. No BrightBean Python/Django source, templates, tasks, or models were copied. Aarin uses clean-room TypeScript over its existing domain models and remains the only system of record.

@@ -381,6 +381,62 @@ export default async function SettingsPage() {
           </section>
         </form>
 
+        <details className="disclosure" id="notification-channel-setup">
+          <summary>高级：新增外部通知通道</summary>
+          <form className="disclosure-body form-stack form-width" action="/api/notifications/channels" method="post">
+            <Notice title="凭据边界">
+              外部端点只从服务端环境变量读取。失败会记录在 NotificationDelivery，
+              不会回滚站内通知或主业务。
+            </Notice>
+            <div className="form-grid">
+              <FormField label="类型" htmlFor="notification-channel-type">
+                <select id="notification-channel-type" name="type" disabled={!isOwner}>
+                  <option value="WEBHOOK">Webhook</option>
+                  <option value="EMAIL">Email HTTP endpoint</option>
+                </select>
+              </FormField>
+              <FormField label="通道名称" htmlFor="notification-channel-name">
+                <input
+                  id="notification-channel-name"
+                  name="displayName"
+                  required
+                  placeholder="例如：运营告警 Webhook"
+                  disabled={!isOwner}
+                />
+              </FormField>
+              <FormField
+                label="服务端端点变量引用"
+                htmlFor="notification-channel-credential"
+                helper="仅填写 env: 开头的变量名，不要粘贴真实 URL 或 Secret。"
+                className="span-full"
+              >
+                <input
+                  id="notification-channel-credential"
+                  name="credentialRef"
+                  required
+                  pattern="env:[A-Z][A-Z0-9_]+"
+                  placeholder="env:NOTIFICATION_WEBHOOK_URL"
+                  disabled={!isOwner}
+                />
+              </FormField>
+            </div>
+            <label className="account-option" htmlFor="notification-channel-verified">
+              <input
+                id="notification-channel-verified"
+                type="checkbox"
+                name="confirmVerified"
+                value="true"
+                disabled={!isOwner}
+              />
+              <span>
+                <strong>已人工验证端点与收件范围</strong>
+                <span className="cell-meta">未确认时通道会保持未验证状态。</span>
+              </span>
+            </label>
+            <Button type="submit" disabled={!isOwner}>保存通知通道</Button>
+          </form>
+        </details>
+
         <details className="disclosure" id="legacy-facebook">
           <summary>高级：Legacy Facebook connection</summary>
           <div className="disclosure-body stack">
