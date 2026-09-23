@@ -84,14 +84,26 @@ afterAll(async () => { await db.$disconnect(); });
 
 describe("content composition engine", () => {
   it("regenerates only the target platform with confirmed facts and never creates approval or publish jobs", async () => {
-    const item = await createItem();
+    const instagram = await db.socialAccount.create({ data: { clientId: fixture.client.id, platform: "instagram", displayName: "Sibling Instagram", publishCapability: "VERIFIED" } });
+    await db.platformPolicy.create({ data: { clientId: fixture.client.id, platform: "instagram", source: "test" } });
+    const generated = await generateContentPlan(fixture.context, {
+      productId: fixture.productId,
+      theme: "Two-platform composition",
+      objective: "Qualified enquiries",
+      accountIds: [fixture.account.id, instagram.id],
+      assetIds: [],
+    });
+    const item = generated.items.find((candidate) => candidate.platform === "facebook")!;
+    const sibling = generated.items.find((candidate) => candidate.platform === "instagram")!;
     const captured: DraftGenerationInput[] = [];
     const result = await regeneratePlatformVariant(fixture.context, item.id, { expectedVersionId: item.currentVersionId }, adapter(captured));
     expect(result.version).toBe(2);
     expect(result.source).toBe("AI_REGENERATE");
     expect(captured[0].confirmedFacts).toEqual([{ key: "material", value: "verified steel", source: "catalogue" }]);
     expect(JSON.stringify(captured[0])).not.toContain("unconfirmed dimensions");
-    expect(await db.contentItem.count({ where: { clientId: fixture.client.id } })).toBe(1);
+    expect((await db.contentItem.findUniqueOrThrow({ where: { id: sibling.id } })).currentVersionId).toBe(sibling.currentVersionId);
+    expect(await db.contentVersion.count({ where: { contentItemId: sibling.id } })).toBe(1);
+    expect(await db.contentItem.count({ where: { clientId: fixture.client.id } })).toBe(2);
     expect(await db.approval.count({ where: { clientId: fixture.client.id } })).toBe(0);
     expect(await db.publishJob.count({ where: { clientId: fixture.client.id } })).toBe(0);
   });

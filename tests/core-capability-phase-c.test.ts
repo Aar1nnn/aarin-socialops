@@ -6,6 +6,7 @@ import { db } from "../src/lib/db";
 import {
   analyzePerformancePatterns,
   buildAnalyticsReview,
+  compareAccounts,
   comparePosts,
   getAnalyticsDataHealth,
   getContentPerformance,
@@ -141,6 +142,14 @@ describe("analytics query and analysis", () => {
     expect(performance.map((row) => row.remotePostId)).toEqual(["post-a", "post-b"]);
     expect(performance[0]).toMatchObject({ reach: 100, views: 200, engagement: 20, engagementRate: 0.2, mediaType: "VIDEO" });
     expect(await comparePosts(fixture.context, ["post-b", "post-a"])).toHaveLength(2);
+  });
+
+  it("compares tenant-scoped accounts from deduplicated canonical snapshots", async () => {
+    const second = await db.socialAccount.create({ data: { clientId: fixture.client.id, platform: "instagram", displayName: "Second Account", metricsCapability: "VERIFIED" } });
+    await metric("reach", 10);
+    await db.metricSnapshot.create({ data: { clientId: fixture.client.id, accountId: second.id, metricKey: "reach", numericValue: 20, availability: "AVAILABLE", dataKind: "REAL", fetchedAt: new Date(), source: "test" } });
+    const comparison = await compareAccounts(fixture.context, [fixture.account.id, second.id], "reach");
+    expect(comparison.map((entry) => entry.value).sort((a, b) => Number(a) - Number(b))).toEqual([10, 20]);
   });
 
   it("uses minimum sample thresholds for explainable patterns", async () => {
