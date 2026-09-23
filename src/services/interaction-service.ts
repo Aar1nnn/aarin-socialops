@@ -3,6 +3,9 @@ import { db } from "../lib/db";
 import { interactionImportSchema } from "../lib/contracts";
 import { AppError } from "../lib/errors";
 import { assertCanWrite, type RequestContext } from "../lib/context";
+import { recordDomainEvent } from "../lib/domain-events";
+import { dispatchPreparedNotification, prepareNotificationEvent, type PreparedNotificationEvent } from "./notification-service";
+import { safeErrorMessage } from "../lib/token-vault";
 
 const intentRules: Array<{ category: LeadCategory; priority: LeadPriority; words: RegExp; reason: string }> = [
   { category: "CATALOG_REQUEST", priority: "HIGH", words: /\b(catalog(?:ue)?|price list|产品目录|目录)\b/i, reason: "明确索取目录或价格表" },
@@ -59,23 +62,28 @@ export async function importInteraction(
           rawPayload: (options ? { importSource: options.source, payload: options.rawPayload } : { importedManually: true }) as Prisma.InputJsonValue,
         },
       });
-      const lead = classification.isLead ? await createLeadBundle(tx, context.clientId, interaction, classification) : null;
+      const leadBundle = classification.isLead ? await createLeadBundle(tx, context, interaction, classification) : null;
       await tx.auditLog.create({ data: { clientId: context.clientId, userId: context.userId, action: "INTERACTION_IMPORTED", entityType: "Interaction", entityId: interaction.id, metadata: { isLead: classification.isLead, platform: input.platform, source: options?.source || "manual" } } });
-      return { interaction, lead };
+      return { interaction, lead: leadBundle?.lead ?? null, preparedNotification: leadBundle?.preparedNotification ?? null };
     });
-    return { ...created, classification, duplicated: false };
+    if (created.preparedNotification) await dispatchUrgentLeadNotification(created.preparedNotification, context.userId);
+    return { interaction: created.interaction, lead: created.lead, classification, duplicated: false };
   } catch (error) {
     if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === "P2002") {
       const interaction = await db.interaction.findUniqueOrThrow({ where: { clientId_platform_platformRecordId: { clientId: context.clientId, platform: input.platform, platformRecordId: input.platformRecordId } }, include: { lead: true } });
       let lead = interaction.lead;
+      let preparedNotification: PreparedNotificationEvent | null = null;
       if (classification.isLead && !lead) {
         try {
-          lead = await db.$transaction((tx) => createLeadBundle(tx, context.clientId, interaction, classification));
+          const bundle = await db.$transaction((tx) => createLeadBundle(tx, context, interaction, classification));
+          lead = bundle.lead;
+          preparedNotification = bundle.preparedNotification;
         } catch (backfillError) {
           if (!(backfillError instanceof Prisma.PrismaClientKnownRequestError && backfillError.code === "P2002")) throw backfillError;
           lead = await db.lead.findUnique({ where: { interactionId: interaction.id } });
         }
       }
+      if (preparedNotification) await dispatchUrgentLeadNotification(preparedNotification, context.userId);
       return { interaction, classification, lead, duplicated: true };
     }
     throw error;
@@ -98,12 +106,33 @@ export async function updateLeadStatus(context: RequestContext, leadId: string, 
 
 async function createLeadBundle(
   tx: Prisma.TransactionClient,
-  clientId: string,
+  context: RequestContext,
   interaction: { id: string; body: string; platform: string; sourceUrl: string | null; authorHandle: string | null },
   classification: ReturnType<typeof classifyIntent>,
 ) {
-  const lead = await tx.lead.create({ data: { clientId, interactionId: interaction.id, category: classification.category, priority: classification.priority, rationale: classification.rationale, verificationNeeded: "跨平台身份未经验证；不得按相似用户名自动合并。" } });
-  await tx.manualTask.create({ data: { clientId, leadId: lead.id, triggerReason: "发现明确采购相关意向", priority: classification.priority === "HIGH" || classification.priority === "URGENT" ? "URGENT" : "HIGH", suggestedDueAt: new Date(Date.now() + 4 * 60 * 60 * 1000), sourceMaterial: { originalText: interaction.body, platform: interaction.platform, sourceUrl: interaction.sourceUrl, authorHandle: interaction.authorHandle }, requiredAction: "人工核实意向、准备回复，并按需转交客户负责人；系统不会自动发送任何回复。", completionCriteria: "线索状态记录为已回复、已转交、等待反馈或已关闭。", continuationStep: "结合销售反馈更新线索状态并纳入复盘。" } });
-  await tx.inAppNotification.create({ data: { clientId, severity: "URGENT", title: "发现重要采购意向", body: `${classification.rationale}：${interaction.body.slice(0, 160)}`, relatedType: "Lead", relatedId: lead.id } });
-  return lead;
+  const lead = await tx.lead.create({ data: { clientId: context.clientId, interactionId: interaction.id, category: classification.category, priority: classification.priority, rationale: classification.rationale, verificationNeeded: "跨平台身份未经验证；不得按相似用户名自动合并。" } });
+  await tx.manualTask.create({ data: { clientId: context.clientId, leadId: lead.id, triggerReason: "发现明确采购相关意向", priority: classification.priority === "HIGH" || classification.priority === "URGENT" ? "URGENT" : "HIGH", suggestedDueAt: new Date(Date.now() + 4 * 60 * 60 * 1000), sourceMaterial: { originalText: interaction.body, platform: interaction.platform, sourceUrl: interaction.sourceUrl, authorHandle: interaction.authorHandle }, requiredAction: "人工核实意向、准备回复，并按需转交客户负责人；系统不会自动发送任何回复。", completionCriteria: "线索状态记录为已回复、已转交、等待反馈或已关闭。", continuationStep: "结合销售反馈更新线索状态并纳入复盘。" } });
+  await recordDomainEvent(context, { type: "URGENT_LEAD", entityType: "Lead", entityId: lead.id, metadata: { interactionId: interaction.id, category: classification.category, priority: classification.priority } }, tx);
+  const preparedNotification = await prepareNotificationEvent(tx, context, {
+    eventType: "URGENT_LEAD",
+    title: "发现重要采购意向",
+    body: `${classification.rationale}：${interaction.body.slice(0, 160)}`,
+    relatedType: "Lead",
+    relatedId: lead.id,
+    urgent: true,
+    dedupeKey: `URGENT_LEAD:Lead:${lead.id}`,
+  });
+  return { lead, preparedNotification };
+}
+
+async function dispatchUrgentLeadNotification(prepared: PreparedNotificationEvent, userId: string) {
+  try {
+    await dispatchPreparedNotification(prepared);
+  } catch (error) {
+    try {
+      await db.auditLog.create({ data: { clientId: prepared.notification.clientId, userId, action: "NOTIFICATION_DISPATCH_FAILED", entityType: "InAppNotification", entityId: prepared.notification.id, metadata: { error: safeErrorMessage(error) } } });
+    } catch {
+      // Lead, manual task and in-app evidence are already committed.
+    }
+  }
 }

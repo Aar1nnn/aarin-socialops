@@ -12,6 +12,8 @@ export const domainEventTypes = [
   "CONTENT_SCHEDULED",
   "PUBLISH_FAILED",
   "PUBLISH_UNKNOWN",
+  "CONNECTION_ERROR",
+  "URGENT_LEAD",
 ] as const;
 
 const domainEventSchema = z.object({
@@ -24,7 +26,7 @@ const domainEventSchema = z.object({
 type AuditWriter = Pick<Prisma.TransactionClient, "auditLog">;
 
 export async function recordDomainEvent(
-  context: RequestContext,
+  context: Pick<RequestContext, "clientId"> & Partial<Pick<RequestContext, "userId">>,
   raw: z.input<typeof domainEventSchema>,
   writer: AuditWriter = db,
 ) {
@@ -32,7 +34,7 @@ export async function recordDomainEvent(
   return writer.auditLog.create({
     data: {
       clientId: context.clientId,
-      userId: context.userId,
+      userId: context.userId ?? null,
       action: event.type,
       entityType: event.entityType,
       entityId: event.entityId,

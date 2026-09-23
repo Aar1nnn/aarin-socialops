@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { ApprovalDecision, AttemptStatus, ClientMode, ContentStatus, PublishJobStatus, type PublishJob } from "@prisma/client";
+import { ApprovalDecision, AttemptStatus, ClientMode, ContentStatus, Prisma, PublishJobStatus, type PublishJob } from "@prisma/client";
 import { z } from "zod";
 import { db } from "../lib/db";
 import { MockSocialPublishAdapter } from "../lib/adapters/publishing";
@@ -11,8 +11,16 @@ import { FACEBOOK_ERROR_ADVICE, type FacebookErrorCategory } from "../lib/adapte
 import { classifyPublishFailure, decidePublishRetry } from "../lib/publish-safety";
 import { safeErrorMessage } from "../lib/token-vault";
 import { resolvePublishAdapter } from "./publish-adapter-service";
+import { recordDomainEvent } from "../lib/domain-events";
+import {
+  dispatchPreparedNotification,
+  prepareNotificationEvent,
+  type NotificationEvent,
+  type NotificationTransport,
+  type PreparedNotificationEvent,
+} from "./notification-service";
 
-export async function recoverStaleJobs(lockTimeoutSeconds: number) {
+export async function recoverStaleJobs(lockTimeoutSeconds: number, notificationTransport?: NotificationTransport) {
   const cutoff = new Date(Date.now() - lockTimeoutSeconds * 1000);
   const stale = await db.publishJob.findMany({
     where: { status: PublishJobStatus.RUNNING, lockedAt: { lt: cutoff } },
@@ -28,16 +36,31 @@ export async function recoverStaleJobs(lockTimeoutSeconds: number) {
           ? { status: PublishJobStatus.UNKNOWN, lockedAt: null, lockedBy: null, lastErrorCode: "WORKER_LOST_AFTER_DISPATCH", lastErrorMessage: "worker 在发送开始后失联，远端结果未知，禁止自动重试。" }
           : { status: PublishJobStatus.RETRY, lockedAt: null, lockedBy: null, nextAttemptAt: new Date(), lastErrorCode: "STALE_LOCK_RECOVERED" },
       });
-      if (claimed.count !== 1) return false;
+      if (claimed.count !== 1) return { won: false, preparedNotification: null };
       if (dispatchStarted) {
         await tx.contentItem.update({ where: { id: job.contentVersion.contentItemId }, data: { status: ContentStatus.UNKNOWN } });
         await tx.publishAttempt.update({ where: { id: job.attempts[0].id }, data: { status: AttemptStatus.UNKNOWN, finishedAt: new Date(), errorCode: "WORKER_LOST" } });
+        const reason = "发布结果未知，需要远端查询对账，禁止盲目重发";
+        await ensureFailureTask(tx, job.clientId, job.contentVersion.contentItemId, job.id, reason, "WORKER_LOST_AFTER_DISPATCH");
+        await recordDomainEvent({ clientId: job.clientId }, {
+          type: "PUBLISH_UNKNOWN",
+          entityType: "PublishJob",
+          entityId: job.id,
+          metadata: { contentItemId: job.contentVersion.contentItemId, errorCode: "WORKER_LOST_AFTER_DISPATCH" },
+        }, tx);
+        const preparedNotification = await prepareNotificationEvent(tx, { clientId: job.clientId }, publishNotificationEvent(
+          "PUBLISH_UNKNOWN",
+          job.id,
+          reason,
+          "WORKER_LOST_AFTER_DISPATCH",
+        ));
+        return { won: true, preparedNotification };
       }
-      return true;
+      return { won: true, preparedNotification: null };
     });
-    if (won) {
+    if (won.won) {
       recovered += 1;
-      if (dispatchStarted) await createFailureTask(job.clientId, job.contentVersion.contentItemId, job.id, "发布结果未知，需要远端查询对账，禁止盲目重发");
+      if (won.preparedNotification) await dispatchNotificationWithoutAffectingBusiness(won.preparedNotification, notificationTransport);
     }
   }
   return recovered;
@@ -75,7 +98,7 @@ export async function renewPublishJobLease(jobId: string, leaseToken: string) {
   return renewed.count === 1;
 }
 
-export async function processPublishJob(jobId: string, injectedAdapter?: SocialPublishAdapter) {
+export async function processPublishJob(jobId: string, injectedAdapter?: SocialPublishAdapter, notificationTransport?: NotificationTransport) {
   const job = await db.publishJob.findUniqueOrThrow({
     where: { id: jobId },
     include: {
@@ -129,8 +152,15 @@ export async function processPublishJob(jobId: string, injectedAdapter?: SocialP
     }
   } catch (error) {
     const code = error instanceof AppError ? error.code : error instanceof Error ? error.message : "LIVE_ADAPTER_UNAVAILABLE";
-    await createFailureTask(job.clientId, job.contentVersion.item.id, job.id, "发布连接在执行前不可用", code);
-    await db.publishJob.updateMany({ where: { id: job.id, status: PublishJobStatus.RUNNING, lockedBy: leaseToken }, data: { status: PublishJobStatus.WAITING_CONFIGURATION, lockedAt: null, lockedBy: null, lastErrorCode: code, lastErrorMessage: "发布适配器或账号连接在执行前不可用。" } });
+    const preparedNotification = await db.$transaction(async (tx) => {
+      const updated = await tx.publishJob.updateMany({ where: { id: job.id, status: PublishJobStatus.RUNNING, lockedBy: leaseToken }, data: { status: PublishJobStatus.WAITING_CONFIGURATION, lockedAt: null, lockedBy: null, lastErrorCode: code, lastErrorMessage: "发布适配器或账号连接在执行前不可用。" } });
+      if (updated.count !== 1) return null;
+      const reason = "发布连接在执行前不可用";
+      await ensureFailureTask(tx, job.clientId, job.contentVersion.item.id, job.id, reason, code);
+      await recordDomainEvent({ clientId: job.clientId }, { type: "CONNECTION_ERROR", entityType: "PublishJob", entityId: job.id, metadata: { contentItemId: job.contentVersion.item.id, errorCode: code } }, tx);
+      return prepareNotificationEvent(tx, { clientId: job.clientId }, publishNotificationEvent("CONNECTION_ERROR", job.id, reason, code));
+    });
+    if (preparedNotification) await dispatchNotificationWithoutAffectingBusiness(preparedNotification, notificationTransport);
     return db.publishJob.findUniqueOrThrow({ where: { id: job.id } });
   }
   const attemptNumber = job.attemptCount + 1;
@@ -170,8 +200,7 @@ export async function processPublishJob(jobId: string, injectedAdapter?: SocialP
   const uncertainRemotePostId = "remotePostId" in result ? result.remotePostId : undefined;
   const uncertainRemotePostUrl = "remotePostUrl" in result ? result.remotePostUrl : undefined;
 
-  let createTaskReason: string | null = null;
-  await db.$transaction(async (tx) => {
+  const preparedNotification = await db.$transaction(async (tx) => {
     const retryDecision = result.status === "failed"
       ? decidePublishRetry({
           phase: result.failurePhase ?? "POST_DISPATCH",
@@ -194,7 +223,7 @@ export async function processPublishJob(jobId: string, injectedAdapter?: SocialP
         ? { status: finalStatus, remotePostId: uncertainRemotePostId, remotePostUrl: uncertainRemotePostUrl, lockedAt: null, lockedBy: null, lastErrorCode: result.code, lastErrorMessage: result.message }
         : { status: finalStatus, nextAttemptAt: finalStatus === PublishJobStatus.RETRY ? new Date(Date.now() + 5_000 * attemptNumber) : job.nextAttemptAt, lockedAt: null, lockedBy: null, lastErrorCode: result.code, lastErrorMessage: result.message };
     const held = await tx.publishJob.updateMany({ where: { id: job.id, status: PublishJobStatus.RUNNING, lockedBy: leaseToken }, data });
-    if (held.count !== 1) return;
+    if (held.count !== 1) return null;
     await tx.publishAttempt.update({
       where: { id: attempt.id },
       data: result.status === "published"
@@ -227,13 +256,24 @@ export async function processPublishJob(jobId: string, injectedAdapter?: SocialP
       }
       await tx.socialAccount.update({ where: { id: job.accountId }, data: { publishCapability: "UNVERIFIED", metricsCapability: "UNVERIFIED", commentsCapability: "UNVERIFIED", verifiedAt: null } });
     }
-    if (finalStatus === PublishJobStatus.UNKNOWN) createTaskReason = "发布结果未知，需要远端查询对账，禁止盲目重发";
-    if (finalStatus === PublishJobStatus.FAILED) createTaskReason = result.status === "failed" ? `发布失败：${result.code}` : "发布重试次数已用尽";
+    const createTaskReason = finalStatus === PublishJobStatus.UNKNOWN
+      ? "发布结果未知，需要远端查询对账，禁止盲目重发"
+      : finalStatus === PublishJobStatus.FAILED
+        ? result.status === "failed" ? `发布失败：${result.code}` : "发布重试次数已用尽"
+        : null;
+    if (!createTaskReason) return null;
+    const errorCode = result.status === "published" ? undefined : result.code;
+    const eventType = finalStatus === PublishJobStatus.UNKNOWN ? "PUBLISH_UNKNOWN" : "PUBLISH_FAILED";
+    await ensureFailureTask(tx, job.clientId, job.contentVersion.item.id, job.id, createTaskReason, errorCode);
+    await recordDomainEvent({ clientId: job.clientId }, {
+      type: eventType,
+      entityType: "PublishJob",
+      entityId: job.id,
+      metadata: { contentItemId: job.contentVersion.item.id, errorCode: errorCode ?? null },
+    }, tx);
+    return prepareNotificationEvent(tx, { clientId: job.clientId }, publishNotificationEvent(eventType, job.id, createTaskReason, errorCode));
   });
-  if (createTaskReason) {
-    const code = result.status === "published" ? undefined : result.code;
-    await createFailureTask(job.clientId, job.contentVersion.item.id, job.id, createTaskReason, code);
-  }
+  if (preparedNotification) await dispatchNotificationWithoutAffectingBusiness(preparedNotification, notificationTransport);
   return db.publishJob.findUniqueOrThrow({ where: { id: job.id }, include: { attempts: true } });
 }
 
@@ -300,12 +340,47 @@ async function cancelClaim(jobId: string, leaseToken: string, code: string, mess
   return db.publishJob.updateMany({ where: { id: jobId, status: PublishJobStatus.RUNNING, lockedBy: leaseToken }, data: { status: PublishJobStatus.CANCELLED, lockedAt: null, lockedBy: null, lastErrorCode: code, lastErrorMessage: message } });
 }
 
-async function createFailureTask(clientId: string, contentItemId: string, publishJobId: string, reason: string, errorCode?: string) {
-  const existing = await db.manualTask.findFirst({ where: { clientId, publishJobId, triggerReason: reason, status: { in: ["TODO", "IN_PROGRESS", "WAITING_EXTERNAL"] } } });
+async function ensureFailureTask(tx: Prisma.TransactionClient, clientId: string, contentItemId: string, publishJobId: string, reason: string, errorCode?: string) {
+  const existing = await tx.manualTask.findFirst({ where: { clientId, publishJobId, triggerReason: reason, status: { in: ["TODO", "IN_PROGRESS", "WAITING_EXTERNAL"] } } });
   if (!existing) {
-    await db.$transaction([
-      db.manualTask.create({ data: { clientId, contentItemId, publishJobId, triggerReason: reason, priority: "URGENT", sourceMaterial: { contentItemId, publishJobId, errorCode: errorCode || null }, requiredAction: errorCode && errorCode in FACEBOOK_ERROR_ADVICE ? FACEBOOK_ERROR_ADVICE[errorCode as FacebookErrorCategory] : "检查远端平台、账号连接和执行记录；确认结果后人工对账。", completionCriteria: "远端帖子状态已确认，并在系统记录远端 ID 或失败原因。", continuationStep: "确认成功则标记发布；确认失败后由运营者决定是否创建新任务。" } }),
-      db.inAppNotification.create({ data: { clientId, severity: "URGENT", title: "发布任务需要人工处理", body: reason, relatedType: "ContentItem", relatedId: contentItemId } }),
-    ]);
+    await tx.manualTask.create({ data: { clientId, contentItemId, publishJobId, triggerReason: reason, priority: "URGENT", sourceMaterial: { contentItemId, publishJobId, errorCode: errorCode || null }, requiredAction: errorCode && errorCode in FACEBOOK_ERROR_ADVICE ? FACEBOOK_ERROR_ADVICE[errorCode as FacebookErrorCategory] : "检查远端平台、账号连接和执行记录；确认结果后人工对账。", completionCriteria: "远端帖子状态已确认，并在系统记录远端 ID 或失败原因。", continuationStep: "确认成功则标记发布；确认失败后由运营者决定是否创建新任务。" } });
+  }
+  return existing;
+}
+
+function publishNotificationEvent(
+  eventType: "PUBLISH_FAILED" | "PUBLISH_UNKNOWN" | "CONNECTION_ERROR",
+  publishJobId: string,
+  reason: string,
+  errorCode?: string,
+): NotificationEvent {
+  return {
+    eventType,
+    title: eventType === "PUBLISH_UNKNOWN" ? "发布结果未知，需要人工对账" : eventType === "PUBLISH_FAILED" ? "发布任务失败" : "发布连接不可用",
+    body: errorCode ? `${reason}（${errorCode}）` : reason,
+    relatedType: "PublishJob",
+    relatedId: publishJobId,
+    urgent: true,
+    dedupeKey: `${eventType}:PublishJob:${publishJobId}`,
+  };
+}
+
+async function dispatchNotificationWithoutAffectingBusiness(prepared: PreparedNotificationEvent, transport?: NotificationTransport) {
+  try {
+    await dispatchPreparedNotification(prepared, transport);
+  } catch (error) {
+    try {
+      await db.auditLog.create({
+        data: {
+          clientId: prepared.notification.clientId,
+          action: "NOTIFICATION_DISPATCH_FAILED",
+          entityType: "InAppNotification",
+          entityId: prepared.notification.id,
+          metadata: { error: safeErrorMessage(error) },
+        },
+      });
+    } catch {
+      // The business state and manual task are already committed; notification infrastructure must not roll them back.
+    }
   }
 }

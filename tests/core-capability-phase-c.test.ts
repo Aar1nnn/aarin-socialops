@@ -91,18 +91,20 @@ describe("notification rules and inbox", () => {
     let calls = 0;
     const transport = async () => { calls += 1; };
     const event = { eventType: "TOKEN_EXPIRED" as const, title: "Expired", body: "Reconnect", urgent: true, relatedType: "account", relatedId: fixture.account.id };
-    const first = await createAndDispatchNotification(fixture.context, event, transport);
-    const second = await createAndDispatchNotification(fixture.context, event, transport);
-    expect(first.deduplicated).toBe(false);
-    expect(second.deduplicated).toBe(true);
+    const [first, second] = await Promise.all([
+      createAndDispatchNotification(fixture.context, event, transport),
+      createAndDispatchNotification(fixture.context, event, transport),
+    ]);
+    expect([first.deduplicated, second.deduplicated].sort()).toEqual([false, true]);
     expect(calls).toBe(1);
-    expect(second.notification.occurrenceCount).toBe(2);
+    expect((await db.inAppNotification.findFirstOrThrow({ where: { clientId: fixture.client.id } })).occurrenceCount).toBe(2);
     expect(await db.inAppNotification.count({ where: { clientId: fixture.client.id } })).toBe(1);
   });
 
   it("isolates delivery failure and supports unread, important, read, unread and mark-all operations", async () => {
     process.env.PHASE_C_WEBHOOK = "https://notify.example.test/webhook";
     await db.notificationChannel.create({ data: { clientId: fixture.client.id, type: "WEBHOOK", displayName: "Webhook", credentialRef: "env:PHASE_C_WEBHOOK", status: "VERIFIED" } });
+    await upsertNotificationRule(fixture.context, { eventType: "PUBLISH_UNKNOWN", severity: "URGENT", channelType: "WEBHOOK", cooldownMinutes: 60 });
     const created = await createAndDispatchNotification(fixture.context, { eventType: "PUBLISH_UNKNOWN", title: "Unknown", body: "Reconcile", urgent: true }, async () => { throw new Error("provider unavailable"); });
     expect(created.deliveries[0].status).toBe("FAILED");
     expect(await db.inAppNotification.count({ where: { id: created.notification.id } })).toBe(1);

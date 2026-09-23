@@ -985,7 +985,7 @@ model NotificationDelivery {
   notification   InAppNotification          @relation(fields: [notificationId, clientId], references: [id, clientId], onDelete: Cascade)
   channel        NotificationChannel        @relation(fields: [channelId, clientId], references: [id, clientId], onDelete: Cascade)
 
-  @@unique([notificationId, channelId])
+  @@index([notificationId, channelId, createdAt])
   @@index([clientId, status, updatedAt])
 }
 

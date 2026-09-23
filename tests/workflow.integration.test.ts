@@ -214,6 +214,8 @@ describe("approval and persistent publishing", () => {
     const result = await processPublishJob(scheduled.id, new MockSocialPublishAdapter("unknown"));
     expect(result.status).toBe("UNKNOWN");
     expect(await claimNextJob("test-worker-2")).toBeNull();
+    expect(await db.inAppNotification.findFirst({ where: { clientId: fixture.client.id, relatedType: "PublishJob", relatedId: scheduled.id } })).toMatchObject({ eventType: "PUBLISH_UNKNOWN", severity: "URGENT" });
+    expect(await db.auditLog.findFirst({ where: { clientId: fixture.client.id, action: "PUBLISH_UNKNOWN", entityId: scheduled.id } })).not.toBeNull();
   });
 
   it("requires evidence to reconcile UNKNOWN and records a manual success", async () => {
@@ -267,6 +269,7 @@ describe("approval and persistent publishing", () => {
     expect(await recoverStaleJobs(1)).toBe(1);
     expect((await db.publishJob.findUniqueOrThrow({ where: { id: job.id } })).status).toBe("UNKNOWN");
     expect(await db.manualTask.count({ where: { clientId: fixture.client.id, contentItemId: item.id } })).toBe(1);
+    expect(await db.inAppNotification.findFirst({ where: { clientId: fixture.client.id, relatedType: "PublishJob", relatedId: job.id } })).toMatchObject({ eventType: "PUBLISH_UNKNOWN" });
   });
 
   it("renews the lease atomically at the final dispatch gate", async () => {
@@ -452,6 +455,9 @@ describe("tenant, interaction and evidence boundaries", () => {
     expect(first.duplicated).toBe(false);
     expect(second.duplicated).toBe(true);
     expect(await db.lead.count({ where: { clientId: fixture.client.id } })).toBe(1);
+    const lead = await db.lead.findFirstOrThrow({ where: { clientId: fixture.client.id } });
+    expect(await db.inAppNotification.count({ where: { clientId: fixture.client.id, eventType: "URGENT_LEAD", relatedId: lead.id } })).toBe(1);
+    expect(await db.auditLog.findFirst({ where: { clientId: fixture.client.id, action: "URGENT_LEAD", entityId: lead.id } })).not.toBeNull();
   });
 
   it("does not include proposed product values as generated facts", async () => {

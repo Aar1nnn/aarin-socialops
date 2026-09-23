@@ -9,7 +9,7 @@ import { buildContentEngineMemory } from "../src/services/memory-service";
 import { runAIContentPipeline } from "../src/services/ai-content-pipeline-service";
 import { listCalendarEntries, rescheduleCalendarItems } from "../src/services/calendar-service";
 import { aggregateMetricSnapshots, canonicalizeMetricKey, markAnalyticsSyncFailed, markAnalyticsSyncStarted, markAnalyticsSyncSucceeded, periodBounds, resolveFreshness } from "../src/services/analytics-service";
-import { createAndDispatchNotification } from "../src/services/notification-service";
+import { createAndDispatchNotification, upsertNotificationRule } from "../src/services/notification-service";
 
 type Fixture = { client: Client; context: RequestContext; account: SocialAccount; promptId: string };
 const clientIds: string[] = [];
@@ -167,6 +167,8 @@ describe("notifications foundation", () => {
       { clientId: fixture.client.id, type: "WEBHOOK", displayName: "Ops webhook", credentialRef: "env:TEST_WEBHOOK_ENDPOINT", status: "VERIFIED" },
       { clientId: fixture.client.id, type: "EMAIL", displayName: "Ops email", credentialRef: "env:TEST_EMAIL_ENDPOINT", status: "VERIFIED" },
     ] });
+    await upsertNotificationRule(fixture.context, { eventType: "PUBLISH_UNKNOWN", severity: "URGENT", channelType: "WEBHOOK", cooldownMinutes: 60 });
+    await upsertNotificationRule(fixture.context, { eventType: "PUBLISH_UNKNOWN", severity: "URGENT", channelType: "EMAIL", cooldownMinutes: 60 });
     const result = await createAndDispatchNotification(fixture.context, { eventType: "PUBLISH_UNKNOWN", title: "Remote result unknown", body: "Manual reconciliation required", urgent: true }, async ({ type }) => {
       if (type === "EMAIL") throw new Error("provider unavailable");
     });

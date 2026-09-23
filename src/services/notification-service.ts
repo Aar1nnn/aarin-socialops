@@ -1,4 +1,4 @@
-import { NotificationSeverity } from "@prisma/client";
+import { NotificationSeverity, Prisma } from "@prisma/client";
 import { z } from "zod";
 import { assertCanWrite, type RequestContext } from "../lib/context";
 import { db } from "../lib/db";
@@ -9,6 +9,7 @@ export const notificationEventTypes = [
   "PERMISSION_MISSING", "PLATFORM_DISCONNECTED", "URGENT_LEAD", "HIGH_PRIORITY_TASK",
 ] as const;
 export const notificationChannelTypes = ["IN_APP", "EMAIL", "WEBHOOK"] as const;
+const externalNotificationChannelTypes = ["EMAIL", "WEBHOOK"] as const;
 
 const notificationEventSchema = z.object({
   eventType: z.enum(notificationEventTypes),
@@ -67,47 +68,74 @@ export function listNotificationRules(context: RequestContext) {
   return db.notificationRule.findMany({ where: { clientId: context.clientId }, orderBy: [{ eventType: "asc" }, { severity: "asc" }, { channelType: "asc" }] });
 }
 
-export async function createAndDispatchNotification(context: RequestContext, raw: NotificationEvent, transport: NotificationTransport = defaultTransport) {
+export async function prepareNotificationEvent(
+  tx: Prisma.TransactionClient,
+  context: Pick<RequestContext, "clientId">,
+  raw: NotificationEvent,
+) {
   const input = notificationEventSchema.parse(raw);
   const severity = input.urgent ? NotificationSeverity.URGENT : NotificationSeverity.NORMAL;
-  const rules = await db.notificationRule.findMany({ where: { clientId: context.clientId, eventType: input.eventType, severity, enabled: true } });
-  const configuredRuleCount = await db.notificationRule.count({ where: { clientId: context.clientId, eventType: input.eventType } });
-  const externalTypes = configuredRuleCount
-    ? [...new Set(rules.map((rule) => rule.channelType).filter((type) => type === "EMAIL" || type === "WEBHOOK"))]
-    : ["EMAIL", "WEBHOOK"];
-  const cooldownMinutes = rules.length ? Math.max(...rules.map((rule) => rule.cooldownMinutes)) : 60;
   const dedupeKey = input.dedupeKey || (input.relatedType && input.relatedId ? `${input.eventType}:${input.relatedType}:${input.relatedId}` : null);
   const now = new Date();
-  const existing = dedupeKey
-    ? await db.inAppNotification.findUnique({ where: { clientId_dedupeKey: { clientId: context.clientId, dedupeKey } } })
-    : null;
-  if (existing && now.getTime() - existing.lastOccurredAt.getTime() < cooldownMinutes * 60_000) {
-    const notification = await db.inAppNotification.update({ where: { id: existing.id }, data: { title: input.title, body: input.body, occurrenceCount: { increment: 1 }, lastOccurredAt: now } });
-    return { notification, deliveries: [], deduplicated: true as const, selectedChannels: ["IN_APP", ...externalTypes] };
+  if (dedupeKey) {
+    await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${context.clientId}), hashtext(${dedupeKey}))`;
   }
+  const rules = await tx.notificationRule.findMany({
+    where: { clientId: context.clientId, eventType: input.eventType, severity, enabled: true, channelType: { in: [...externalNotificationChannelTypes] } },
+  });
+  const externalTypes = [...new Set(rules.map((rule) => rule.channelType))];
+  const existing = dedupeKey
+    ? await tx.inAppNotification.findUnique({ where: { clientId_dedupeKey: { clientId: context.clientId, dedupeKey } } })
+    : null;
   const notification = existing
-    ? await db.inAppNotification.update({ where: { id: existing.id }, data: { severity, title: input.title, body: input.body, relatedType: input.relatedType, relatedId: input.relatedId, eventType: input.eventType, occurrenceCount: { increment: 1 }, lastOccurredAt: now, readAt: null } })
-    : await db.inAppNotification.create({ data: { clientId: context.clientId, severity, title: input.title, body: input.body, relatedType: input.relatedType, relatedId: input.relatedId, eventType: input.eventType, dedupeKey, lastOccurredAt: now } });
+    ? await tx.inAppNotification.update({ where: { id: existing.id }, data: { severity, title: input.title, body: input.body, relatedType: input.relatedType, relatedId: input.relatedId, eventType: input.eventType, occurrenceCount: { increment: 1 }, lastOccurredAt: now, readAt: null } })
+    : await tx.inAppNotification.create({ data: { clientId: context.clientId, severity, title: input.title, body: input.body, relatedType: input.relatedType, relatedId: input.relatedId, eventType: input.eventType, dedupeKey, lastOccurredAt: now } });
   const channels = externalTypes.length
-    ? await db.notificationChannel.findMany({ where: { clientId: context.clientId, type: { in: externalTypes }, status: "VERIFIED" } })
+    ? await tx.notificationChannel.findMany({ where: { clientId: context.clientId, type: { in: externalTypes }, status: "VERIFIED" } })
     : [];
-  const deliveries = [];
+  const pendingDeliveries = [];
   for (const channel of channels) {
-    const delivery = await db.notificationDelivery.upsert({
-      where: { notificationId_channelId: { notificationId: notification.id, channelId: channel.id } },
-      update: { status: "PENDING", lastError: null },
-      create: { clientId: context.clientId, notificationId: notification.id, channelId: channel.id },
+    const rule = rules.find((candidate) => candidate.channelType === channel.type);
+    if (!rule) continue;
+    const latest = await tx.notificationDelivery.findFirst({
+      where: { notificationId: notification.id, channelId: channel.id },
+      orderBy: [{ createdAt: "desc" }, { id: "desc" }],
     });
+    if (latest && now.getTime() - latest.createdAt.getTime() < rule.cooldownMinutes * 60_000) continue;
+    const delivery = await tx.notificationDelivery.create({
+      data: { clientId: context.clientId, notificationId: notification.id, channelId: channel.id },
+    });
+    pendingDeliveries.push({ delivery, channel });
+  }
+  return {
+    notification,
+    pendingDeliveries,
+    selectedChannels: ["IN_APP", ...externalTypes],
+    deduplicated: Boolean(existing) && pendingDeliveries.length === 0,
+    payload: { title: input.title, body: input.body, eventType: input.eventType, relatedType: input.relatedType, relatedId: input.relatedId },
+  };
+}
+
+export type PreparedNotificationEvent = Awaited<ReturnType<typeof prepareNotificationEvent>>;
+
+export async function dispatchPreparedNotification(prepared: PreparedNotificationEvent, transport: NotificationTransport = defaultTransport) {
+  const deliveries = [];
+  for (const { delivery, channel } of prepared.pendingDeliveries) {
     const endpoint = resolveCredentialRef(channel.credentialRef);
     try {
       if (!endpoint) throw new Error("Channel endpoint credential is missing");
-      await transport({ type: channel.type, endpoint, displayName: channel.displayName, payload: { title: input.title, body: input.body, eventType: input.eventType, relatedType: input.relatedType, relatedId: input.relatedId } });
-      deliveries.push(await db.notificationDelivery.update({ where: { id: delivery.id }, data: { status: "DELIVERED", attemptCount: { increment: 1 }, deliveredAt: now } }));
+      await transport({ type: channel.type, endpoint, displayName: channel.displayName, payload: prepared.payload });
+      deliveries.push(await db.notificationDelivery.update({ where: { id: delivery.id }, data: { status: "DELIVERED", attemptCount: 1, deliveredAt: new Date(), lastError: null } }));
     } catch (error) {
-      deliveries.push(await db.notificationDelivery.update({ where: { id: delivery.id }, data: { status: "FAILED", attemptCount: { increment: 1 }, lastError: error instanceof Error ? error.message.slice(0, 1000) : "Unknown delivery failure" } }));
+      deliveries.push(await db.notificationDelivery.update({ where: { id: delivery.id }, data: { status: "FAILED", attemptCount: 1, lastError: error instanceof Error ? error.message.slice(0, 1000) : "Unknown delivery failure" } }));
     }
   }
-  return { notification, deliveries, deduplicated: false as const, selectedChannels: ["IN_APP", ...externalTypes] };
+  return { notification: prepared.notification, deliveries, deduplicated: prepared.deduplicated, selectedChannels: prepared.selectedChannels };
+}
+
+export async function createAndDispatchNotification(context: Pick<RequestContext, "clientId">, raw: NotificationEvent, transport: NotificationTransport = defaultTransport) {
+  const prepared = await db.$transaction((tx) => prepareNotificationEvent(tx, context, raw));
+  return dispatchPreparedNotification(prepared, transport);
 }
 
 export async function listNotificationInbox(context: RequestContext, raw: unknown = {}) {
