@@ -58,6 +58,11 @@ pnpm demo:e2e
 - 本地磁盘与 S3-compatible `StorageAdapter`；上传和 Facebook 媒体发布使用流，不把完整文件读入内存。
 - `ffprobe` 媒体元数据检查（安装时启用，缺失时明确标为不可用）；IANA 时区排期和 DST 非法本地时间拒绝。
 - worker 在长外部请求期间续租；失去租约时不会写入最终发布结果，发布后超时继续保持 `UNKNOWN`。
+- 结构化 `BrandProfile` 与旧 `brandGuidelines` 兼容回退；品牌、最近内容、表现和研究记忆全部来自 PostgreSQL 权威记录。
+- 阶段化内容生成上下文、策略、结构校验、AI review、humanizer/shortener 和 image-prompt 接口；输出仍是待人工审核的 `ContentVersion`，不会创建审批或发布任务。
+- 基于现有内容/审批/发布记录的月、周、列表日历与服务层重排；没有第二套 scheduler。
+- 基于 `MetricSnapshot` 的 canonical metrics、周期比较和 freshness；缺失、失败和无权限继续与真实 0 分开。
+- 站内通知后的 Webhook/Email HTTP 投递记录；外部投递失败保留 `NotificationDelivery` 失败证据且不回滚主业务。
 
 ## 当前模拟
 
@@ -76,7 +81,7 @@ pnpm demo:e2e
 - Instagram、TikTok、LinkedIn 真实账号、发布、结果查询、指标和评论接口。
 - Facebook 私信自动采集、自动回复、自动私信和自动报价。
 - Facebook 群组自动检索、入群或发帖；当前只能创建人工任务。
-- 紧急外部通知；未配置时只保存站内通知和任务，不声称已送达。
+- Webhook/Email 外部通知端点需要单独配置和验证；未配置时只保存站内通知和任务，不声称已送达。
 - 图片生成与 WordPress 草稿写入；已有明确的受限适配器接口和配置状态。
 - 自动客户回复、私信、报价和广告投放不存在可执行路径。
 
@@ -107,7 +112,7 @@ META_APP_ID=""
 META_APP_SECRET=""
 META_REDIRECT_URI="http://localhost:3000/api/connections/meta/callback"
 META_LOGIN_CONFIG_ID=""
-META_OAUTH_SCOPES="pages_show_list,pages_manage_posts,pages_read_engagement,pages_read_user_content"
+META_OAUTH_SCOPES="pages_show_list,pages_manage_posts,pages_read_engagement,pages_read_user_content,instagram_basic,instagram_content_publish"
 META_GRAPH_API_VERSION="v26.0"
 META_PAGE_METRIC_KEYS=""
 ```
@@ -115,6 +120,14 @@ META_PAGE_METRIC_KEYS=""
 Meta App 的 Valid OAuth Redirect URI 必须与 `META_REDIRECT_URI` 完全一致。登录工作台后进入“平台连接”，点击“连接 Meta”，完成授权后明确勾选允许用于当前客户的 Page。发现的账号默认不启用，也不会按列表第一个账号自动选择。
 
 OAuth 连接完成后，发布、远端状态查询、帖子真实计数和公开评论导入复用 V1 现有业务服务。若 Meta 没有提供 refresh token，“刷新”会明确要求重新授权。
+
+### Instagram Professional 发布
+
+同一 Meta OAuth 会发现 Facebook Page 关联的 Instagram Professional 账号。只有显式选择、拥有 `instagram_basic` 与 `instagram_content_publish`、且发布能力验证通过的账号才能进入 LIVE 队列。当前实现支持单图、单视频/Reels 和 2–10 项 carousel，并可通过远端 media ID 查询发布状态。
+
+Instagram Graph API 必须能够主动拉取素材，因此素材 URL 必须是公网可达的 HTTPS URL。本地文件存储会在网络请求前以 `MEDIA_URL_UNAVAILABLE` 拒绝；生产环境应使用能够生成 HTTPS signed URL 的 S3-compatible storage。任何容器创建或 `media_publish` 写请求都不会自动重试；写请求超时、连接中断或无法确认的 5xx 会进入 `UNKNOWN` 并要求远端查询或人工对账。
+
+当前状态：`IMPLEMENTED_NOT_EXTERNALLY_VERIFIED`。本阶段没有执行真实 Instagram 发布，不能将其标记为 Production Ready；需要专用 Instagram Professional 测试账号完成 external acceptance。
 
 ## V1 手工 Facebook Page fallback
 
@@ -164,18 +177,6 @@ OAuth 路径还需额外验收：连接测试用户、回调一次性消费、Pa
 默认 `STORAGE_PROVIDER=local`。S3-compatible 模式需要设置 `S3_ENDPOINT`、`S3_REGION`、`S3_BUCKET`、`S3_ACCESS_KEY_ID`、`S3_SECRET_ACCESS_KEY`，可选 `S3_SESSION_TOKEN`。当前实现使用 SigV4 预签名 GET；在目标对象存储上验收前不宣称兼容所有供应商。
 
 安装 `ffprobe` 后设置 `FFPROBE_PATH`，系统可提取视频时长、宽高和音视频 codec。没有安装时上传不会伪造元数据，检查结果会明确标为不可用。
-
-## 非发布运营模块
-
-本分支在现有 Aarin Core 上增加 Brand、结构化 PostgreSQL Memory、AI Content Pipeline、Calendar、Social Analytics 与 Notifications foundation：
-
-- `/brand`：维护一租户一份 `BrandProfile`，未建立时兼容读取 `Client.brandGuidelines`，并预览 Content / Performance / Research Memory。
-- `/calendar`：月、周、列表视图与过滤；只通过服务层移动已有、已批准、已排期的 `ContentItem` 和对应 `PublishJob`。
-- `/analytics`：从 `MetricSnapshot` 做统一指标、当前/上期、变化率与 freshness 聚合；缺失态不会显示为数值 `0`，REAL/MOCK 保持可见。
-- `/notifications`：沿用 `InAppNotification` 与 `NotificationChannel`，增加轻量 HTTP Webhook/Email gateway；外部派发失败不会删除或回滚站内事件。
-- Calendar 中的 AI 工作流会创建新的 `ContentVersion` 和独立 `AiContentReview`，不会创建 `Approval` 或 `PublishJob`，仍需人工提交与批准。
-
-Memory 全部由 PostgreSQL 现有业务表查询和结构化聚合生成，不使用 Vector DB，也不建立第二套 Content、Scheduler、Analytics、Research 或 Notification 数据库。
 
 ## 常用验证命令
 

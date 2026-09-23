@@ -178,9 +178,17 @@ enum NotificationSeverity {
   URGENT
 }
 
-enum AiReviewVerdict {
-  PASS
-  NEEDS_REVISION
+enum AnalyticsFreshnessStatus {
+  FRESH
+  STALE
+  SYNCING
+  FAILED
+}
+
+enum NotificationDeliveryStatus {
+  PENDING
+  DELIVERED
+  FAILED
 }
 
 enum IntegrationType {
@@ -224,57 +232,58 @@ model Session {
 }
 
 model Client {
-  id                   String                   @id @default(cuid())
-  slug                 String                   @unique
-  name                 String
-  mode                 ClientMode               @default(DEMO)
-  timezone             String                   @default("Asia/Shanghai")
-  targetMarkets        String[]                 @default([])
-  productFocus         String?
-  brandGuidelines      String?
-  contactDetails       Json?
-  usageMonthlyLimit    Int                      @default(100000)
-  isDemo               Boolean                  @default(false)
-  configurationStatus  String                   @default("PENDING")
-  createdAt            DateTime                 @default(now())
-  updatedAt            DateTime                 @updatedAt
-  memberships          ClientMembership[]
-  sessions             Session[]
-  products             Product[]
-  assets               Asset[]
-  accounts             SocialAccount[]
-  platformPolicies     PlatformPolicy[]
-  contentPlans         ContentPlan[]
-  contentItems         ContentItem[]
-  contentVersions      ContentVersion[]
-  approvals            Approval[]
-  publishJobs          PublishJob[]
-  publishAttempts      PublishAttempt[]
-  metricSnapshots      MetricSnapshot[]
-  interactions         Interaction[]
-  leads                Lead[]
-  manualTasks          ManualTask[]
-  reports              OperationReport[]
-  experiments          Experiment[]
-  notificationChannels NotificationChannel[]
-  notifications        InAppNotification[]
-  integrations         IntegrationConfig[]
-  promptVersions       PromptVersion[]
-  auditLogs            AuditLog[]
-  usageLogs            UsageLog[]
-  researchRecords      ResearchRecord[]
-  facebookConnections  FacebookPageConnection[]
-  usageReservations    UsageReservation[]
-  platformConnections  PlatformConnection[]
-  oauthStates          OAuthState[]
-  brandProfile         BrandProfile?
-  aiContentReviews     AiContentReview[]
+  id                     String                   @id @default(cuid())
+  slug                   String                   @unique
+  name                   String
+  mode                   ClientMode               @default(DEMO)
+  timezone               String                   @default("Asia/Shanghai")
+  targetMarkets          String[]                 @default([])
+  productFocus           String?
+  brandGuidelines        String?
+  contactDetails         Json?
+  usageMonthlyLimit      Int                      @default(100000)
+  isDemo                 Boolean                  @default(false)
+  configurationStatus    String                   @default("PENDING")
+  createdAt              DateTime                 @default(now())
+  updatedAt              DateTime                 @updatedAt
+  memberships            ClientMembership[]
+  sessions               Session[]
+  products               Product[]
+  assets                 Asset[]
+  accounts               SocialAccount[]
+  platformPolicies       PlatformPolicy[]
+  contentPlans           ContentPlan[]
+  contentItems           ContentItem[]
+  contentVersions        ContentVersion[]
+  approvals              Approval[]
+  publishJobs            PublishJob[]
+  publishAttempts        PublishAttempt[]
+  metricSnapshots        MetricSnapshot[]
+  interactions           Interaction[]
+  leads                  Lead[]
+  manualTasks            ManualTask[]
+  reports                OperationReport[]
+  experiments            Experiment[]
+  notificationChannels   NotificationChannel[]
+  notifications          InAppNotification[]
+  integrations           IntegrationConfig[]
+  promptVersions         PromptVersion[]
+  auditLogs              AuditLog[]
+  usageLogs              UsageLog[]
+  researchRecords        ResearchRecord[]
+  facebookConnections    FacebookPageConnection[]
+  usageReservations      UsageReservation[]
+  platformConnections    PlatformConnection[]
+  oauthStates            OAuthState[]
+  brandProfile           BrandProfile?
+  analyticsSyncStates    AnalyticsSyncState[]
+  notificationDeliveries NotificationDelivery[]
 }
 
 model BrandProfile {
   id               String   @id @default(cuid())
   clientId         String   @unique
-  businessSummary  String
+  businessSummary  String?
   positioning      String?
   audience         String?
   tone             String?
@@ -288,8 +297,6 @@ model BrandProfile {
   createdAt        DateTime @default(now())
   updatedAt        DateTime @updatedAt
   client           Client   @relation(fields: [clientId], references: [id], onDelete: Cascade)
-
-  @@index([clientId, updatedAt])
 }
 
 model ResearchRecord {
@@ -553,7 +560,6 @@ model ContentItem {
   account          SocialAccount    @relation(fields: [accountId], references: [id], onDelete: Restrict)
   versions         ContentVersion[] @relation("ItemVersions")
   currentVersion   ContentVersion?  @relation("CurrentVersion", fields: [currentVersionId], references: [id], onDelete: SetNull)
-  metricSnapshots  MetricSnapshot[]
 
   @@unique([planId, accountId])
   @@index([clientId, status])
@@ -580,26 +586,9 @@ model ContentVersion {
   assetLinks         ContentVersionAsset[]
   approvals          Approval[]
   publishJobs        PublishJob[]
-  aiReviews          AiContentReview[]
 
   @@unique([contentItemId, version])
   @@index([clientId, createdAt])
-}
-
-model AiContentReview {
-  id               String          @id @default(cuid())
-  clientId         String
-  contentVersionId String
-  verdict          AiReviewVerdict
-  score            Int?
-  issues           Json
-  reviewer         String
-  metadata         Json?
-  createdAt        DateTime        @default(now())
-  client           Client          @relation(fields: [clientId], references: [id], onDelete: Cascade)
-  contentVersion   ContentVersion  @relation(fields: [contentVersionId], references: [id], onDelete: Cascade)
-
-  @@index([clientId, contentVersionId, createdAt])
 }
 
 model ContentVersionAsset {
@@ -688,26 +677,41 @@ model PublishAttempt {
 }
 
 model MetricSnapshot {
-  id            String           @id @default(cuid())
-  clientId      String
-  accountId     String
-  contentItemId String?
-  metricKey     String
-  numericValue  Decimal?
-  availability  DataAvailability
-  dataKind      DataKind
-  periodStart   DateTime?
-  periodEnd     DateTime?
-  fetchedAt     DateTime
-  source        String
-  errorMessage  String?
-  createdAt     DateTime         @default(now())
-  client        Client           @relation(fields: [clientId], references: [id], onDelete: Cascade)
-  account       SocialAccount    @relation(fields: [accountId], references: [id], onDelete: Cascade)
-  contentItem   ContentItem?     @relation(fields: [contentItemId], references: [id], onDelete: SetNull)
+  id           String           @id @default(cuid())
+  clientId     String
+  accountId    String
+  metricKey    String
+  numericValue Decimal?
+  availability DataAvailability
+  dataKind     DataKind
+  periodStart  DateTime?
+  periodEnd    DateTime?
+  fetchedAt    DateTime
+  source       String
+  errorMessage String?
+  createdAt    DateTime         @default(now())
+  client       Client           @relation(fields: [clientId], references: [id], onDelete: Cascade)
+  account      SocialAccount    @relation(fields: [accountId], references: [id], onDelete: Cascade)
 
   @@index([clientId, metricKey, fetchedAt])
-  @@index([clientId, contentItemId, fetchedAt])
+}
+
+model AnalyticsSyncState {
+  id              String                   @id @default(cuid())
+  clientId        String
+  accountId       String?
+  scope           String
+  status          AnalyticsFreshnessStatus @default(STALE)
+  lastStartedAt   DateTime?
+  lastSucceededAt DateTime?
+  lastFailedAt    DateTime?
+  errorMessage    String?
+  createdAt       DateTime                 @default(now())
+  updatedAt       DateTime                 @updatedAt
+  client          Client                   @relation(fields: [clientId], references: [id], onDelete: Cascade)
+
+  @@unique([clientId, accountId, scope])
+  @@index([clientId, status, updatedAt])
 }
 
 model Interaction {
@@ -808,25 +812,24 @@ model Experiment {
 }
 
 model NotificationChannel {
-  id             String           @id @default(cuid())
-  clientId       String
-  type           String
-  displayName    String
-  credentialRef  String?
-  status         CapabilityStatus @default(UNCONFIGURED)
-  publicConfig   Json?
-  verifiedAt     DateTime?
-  lastDispatchAt DateTime?
-  lastError      String?
-  createdAt      DateTime         @default(now())
-  updatedAt      DateTime         @updatedAt
-  client         Client           @relation(fields: [clientId], references: [id], onDelete: Cascade)
+  id            String                 @id @default(cuid())
+  clientId      String
+  type          String
+  displayName   String
+  credentialRef String?
+  status        CapabilityStatus       @default(UNCONFIGURED)
+  verifiedAt    DateTime?
+  createdAt     DateTime               @default(now())
+  updatedAt     DateTime               @updatedAt
+  client        Client                 @relation(fields: [clientId], references: [id], onDelete: Cascade)
+  deliveries    NotificationDelivery[]
 
   @@unique([clientId, type, displayName])
+  @@unique([id, clientId])
 }
 
 model InAppNotification {
-  id          String               @id @default(cuid())
+  id          String                 @id @default(cuid())
   clientId    String
   severity    NotificationSeverity
   title       String
@@ -834,10 +837,31 @@ model InAppNotification {
   relatedType String?
   relatedId   String?
   readAt      DateTime?
-  createdAt   DateTime             @default(now())
-  client      Client               @relation(fields: [clientId], references: [id], onDelete: Cascade)
+  createdAt   DateTime               @default(now())
+  client      Client                 @relation(fields: [clientId], references: [id], onDelete: Cascade)
+  deliveries  NotificationDelivery[]
 
+  @@unique([id, clientId])
   @@index([clientId, severity, readAt])
+}
+
+model NotificationDelivery {
+  id             String                     @id @default(cuid())
+  clientId       String
+  notificationId String
+  channelId      String
+  status         NotificationDeliveryStatus @default(PENDING)
+  attemptCount   Int                        @default(0)
+  lastError      String?
+  deliveredAt    DateTime?
+  createdAt      DateTime                   @default(now())
+  updatedAt      DateTime                   @updatedAt
+  client         Client                     @relation(fields: [clientId], references: [id], onDelete: Cascade)
+  notification   InAppNotification          @relation(fields: [notificationId, clientId], references: [id, clientId], onDelete: Cascade)
+  channel        NotificationChannel        @relation(fields: [channelId, clientId], references: [id, clientId], onDelete: Cascade)
+
+  @@unique([notificationId, channelId])
+  @@index([clientId, status, updatedAt])
 }
 
 model IntegrationConfig {

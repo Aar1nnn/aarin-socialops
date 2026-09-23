@@ -1,30 +1,25 @@
 # BrightBean Studio upstream review
 
 - Original: https://github.com/brightbeanxyz/brightbean-studio
-- Reviewed: 2026-09-21
-- Default branch: `main`
 - Reviewed commit: `16dd55e8ec9123f5ebf99ba1e470e245dcc07519`
-- License: GNU AGPL-3.0 (`LICENSE`)
-- Classification: **architecture-only**; no source was copied or ported.
+- License: GNU AGPL-3.0 (`LICENSE` in the reviewed checkout)
+- Last audited/synced: 2026-09-21
 
-## Reviewed areas
+## Audited source areas
 
-- `apps/calendar/models.py` and `apps/calendar/services.py`
-- `apps/analytics/metrics.py`, `freshness.py`, and `services.py`
-- `apps/notifications/models.py`, `engine.py`, and `tasks.py`
-- Related security, bulk-action, retry, and failure-notification tests in those apps.
+- `apps/analytics/`: metrics, freshness, derivation, services, tasks, quota, and snapshot migrations.
+- `apps/calendar/`: queue, recurrence, bulk-action, security, and operator calendar behavior.
+- `apps/social_accounts/`: provider factory, OAuth, status, missing-scope, and quota handling.
+- `apps/publisher/`: publish confirmation, media, and failure behavior.
+- `apps/notifications/`: delivery engine, retry caps, batching, and unsubscribe behavior.
 
-## Ideas retained
+## Ideas and Aarin landing points
 
-- Calendar is a projection and mutation service over the publisher's source of truth.
-- Scheduling mutations must be serialized/validated in a service, not written directly by UI code.
-- Analytics needs a canonical catalog, explicit availability, period comparison, and independent freshness.
-- Notification delivery state must not make the originating business transaction fail.
+- Calendar remains an operational layer over Aarin content and scheduling records.
+- Canonical metric normalization, period aggregation, and freshness remain backed by `MetricSnapshot` and `AnalyticsSyncState`.
+- Account and publishing behavior informs Aarin's provider registry without replacing its adapter or safety contracts.
+- Notification outcomes use `NotificationDelivery`; delivery failure does not roll back the originating business event.
 
-## Aarin landing points
+## License boundary
 
-- Calendar directly reads and moves existing `ContentItem`/`PublishJob` timestamps.
-- Analytics aggregates existing `MetricSnapshot` rows and preserves Aarin's availability and REAL/MOCK fields.
-- Notifications reuse `NotificationChannel` and `InAppNotification` with best-effort webhook/email adapters.
-
-No Django models, scheduling algorithms, analytics functions, templates, or notification engine code is copied.
+Architecture and workflow reference only. No BrightBean Python/Django source, templates, tasks, or models were copied. Aarin uses clean-room TypeScript over its existing domain models and remains the only system of record.

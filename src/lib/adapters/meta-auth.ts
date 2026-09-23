@@ -31,11 +31,17 @@ type MetaAccount = {
   instagram_business_account?: { id: string; username?: string; name?: string };
 };
 
-const DEFAULT_META_SCOPES = [
+export const REQUIRED_META_CONNECTION_SCOPES = [
   "pages_show_list",
   "pages_manage_posts",
   "pages_read_engagement",
   "pages_read_user_content",
+] as const;
+
+export const DEFAULT_META_SCOPES = [
+  ...REQUIRED_META_CONNECTION_SCOPES,
+  "instagram_basic",
+  "instagram_content_publish",
 ];
 
 export class MetaAuthAdapter implements PlatformAuthAdapter {
@@ -148,7 +154,13 @@ export class MetaAuthAdapter implements PlatformAuthAdapter {
       displayName: page.instagram_business_account.name || page.instagram_business_account.username || `Instagram ${page.instagram_business_account.id}`,
       username: page.instagram_business_account.username,
       accessToken: page.access_token,
-      capabilities: { linkedFacebookPageId: page.id, publishingAdapterImplemented: false },
+      capabilities: {
+        linkedFacebookPageId: page.id,
+        canPublish: canPublish
+          && grantedScopes.includes("instagram_basic")
+          && grantedScopes.includes("instagram_content_publish"),
+        canQueryStatus: grantedScopes.includes("instagram_basic"),
+      },
       metadata: { source: "meta-account-discovery", linkedFacebookPageId: page.id },
     };
     return [facebook, instagram];

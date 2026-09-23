@@ -1,108 +1,127 @@
-# Non-publishing modules execution plan
+# Non-publishing modules implementation plan
 
-## Status
+## Objective
 
-- State: implementation and verification complete; pull request pending
-- Branch: `codex/non-publishing-modules`
-- Baseline: `origin/main` at `859d7f05dc635800cde448fb2de17cfbf3cc57d0`
-- Scope owner: Aarin SocialOps remains the only System of Record.
+Build the non-publishing foundations that turn Aarin SocialOps into a broader social operations system while preserving Aarin as the single system of record. This branch is independent from PR #4 and does not change Facebook/Instagram publishing, publish retries, worker dispatch, provider adapters, or platform OAuth behavior.
 
-## Current objective
+## Branch and integration boundary
 
-Deliver an independently reviewable foundation for Brand, structured PostgreSQL Memory, staged AI content creation, Calendar operations, Social Analytics, and Notifications without importing or changing the PR #4 publishing implementation.
+- Branch: `feat/brand-memory-ai-calendar-analytics`
+- Base: `origin/main` at `859d7f0`
+- PR #3 and PR #4 remain independent and unmodified.
+- Existing `Client`, content, approval, publish, metrics, interaction, task, audit, and usage records remain authoritative.
+- No vector database, second scheduler, second analytics store, or second notification store is introduced.
 
-## Verified baseline
+## Upstream review
 
-- The worktree was clean and `HEAD`, `origin/main`, and their merge base were all `859d7f0` before the branch was created.
-- PR #3 (`feat/pilot-operator-ui`, head `5876d84`) and PR #4 (`feat/upstream-platform-foundation-instagram`, head `ede1e53`) are open, mergeable, and based on `859d7f0`.
-- This branch does not contain PR #3 or PR #4 commits.
-- Existing `Client`, `ContentPlan`, `ContentItem`, `ContentVersion`, `Approval`, `PublishJob`, `MetricSnapshot`, `ResearchRecord`, `NotificationChannel`, `InAppNotification`, and `ManualTask` remain authoritative.
-- No repository `AGENTS.md` file exists; the task-supplied global AGENTS rules are authoritative.
+The reviewed repositories are recorded under `docs/upstreams/`. TryPost, BrightBean Studio, and Postiz are AGPL references. OpenSocial did not expose a sufficiently clear repository license in the reviewed checkout. All implementation in this branch is therefore clean-room TypeScript based on observed module boundaries and behavior; no upstream source is copied.
 
-## Scope and constraints
+## Data model additions
 
-### In scope
+1. `BrandProfile`: one-to-one structured brand context for `Client`; `Client.brandGuidelines` remains the compatibility fallback.
+2. `AnalyticsSyncState`: tenant-scoped operational sync state. `MetricSnapshot` remains the analytics fact source.
+3. `NotificationDelivery`: append-only delivery outcome for an existing `InAppNotification` and `NotificationChannel`. `InAppNotification`, `NotificationChannel`, and `ManualTask` remain authoritative.
 
-1. A one-per-client structured `BrandProfile`, with legacy `Client.brandGuidelines` fallback.
-2. Query-built Brand, Content, Performance, and Research memory; no vector database.
-3. Typed AI pipeline stages and separate AI review records; final output is a new `ContentVersion` that still requires human approval.
-4. Calendar read models plus single/bulk rescheduling of existing scheduled content through a service transaction.
-5. Canonical social metric aggregation, comparison periods, preserved availability/data-kind semantics, and freshness.
-6. In-app events plus lightweight webhook/email channels with best-effort delivery isolation.
-7. Operator pages, API routes, migration, tests, and documentation.
+All schema changes are additive and delivered by one forward migration.
 
-### Explicitly out of scope
+## Delivery phases
 
-- Platform Foundation, Facebook/Instagram publishing behavior, publisher adapters, and publish worker behavior. The only existing Facebook service change links post-metric snapshots to their existing `ContentItem`; it does not change publishing behavior and does not overlap PR #4's file set.
-- LinkedIn, TikTok, or YouTube provider work.
-- A second Workspace, Content, Post, Scheduler, Analytics, Research, or Notification database.
-- Vector DBs, automatic approval, AI-created `PublishJob` rows, or heavy notification dependencies.
-- Production dependency additions or upgrades.
+### Phase A — Brand and memory
 
-## Architecture decisions
+- Tenant-scoped BrandProfile read/upsert service and operator page.
+- Compatibility fallback to `Client.brandGuidelines` when a structured profile is absent.
+- Structured brand, recent-content, performance, and research memory builders using PostgreSQL queries.
+- No cross-tenant queries and no embedding/vector dependency.
 
-1. `Client` is the current tenant/workspace boundary; `BrandProfile.clientId` is unique and every service query includes `clientId`.
-2. Memory is a set of typed read models assembled from current PostgreSQL tables. It is not persisted as a parallel knowledge store.
-3. AI stages use Zod-validated contracts. Only `ProductField.status = CONFIRMED` values enter context. `AiContentReview` is intentionally separate from `Approval`.
-4. AI generation may supersede a mutable content version but must not create a `PublishJob`; any active job for a superseded version is cancelled before the new draft becomes current.
-5. Calendar mutations only move an already scheduled, approved current version and its existing active `PublishJob`; they never create scheduler records.
-6. `MetricSnapshot` gains only an optional `contentItemId` link for by-post analysis. Missing availability stays distinct from numeric zero; REAL/MOCK provenance is retained.
-7. Notification channel configuration extends `NotificationChannel`; `InAppNotification` remains the event record. External dispatch occurs after event persistence and catches channel failures.
-8. All upstream implementation is independently written. OpenSocial informs an Adapt of module boundaries; AGPL projects are architecture/UX reference only.
+### Phase B — AI foundation
 
-## Implementation sequence
+- Compose only BrandProfile, confirmed product facts, content memory, performance context, and research memory.
+- Explicit stages: strategy, generation, platform variants, reviewer, rewrite/humanizer, shortener, image-prompt placeholder.
+- Keep structured output validation.
+- Persist only `ContentPlan`, `ContentItem`, and `ContentVersion` in `DRAFT` state.
+- Never create an `Approval` or `PublishJob` from the AI pipeline.
 
-1. [completed] Schema and migration: Brand profile, AI review, optional metric-to-content link, notification channel delivery metadata.
-2. [completed] Brand and Memory services, API, and operator page.
-3. [completed] AI pipeline contracts, adapters, context builders, persistence service, and workflow action.
-4. [completed] Calendar query/reschedule service, API, and month/week/list operator views.
-5. [completed] Analytics normalization/aggregation/freshness service and operator view.
-6. [completed] Notification event/channel/dispatch service and operator view.
-7. [completed] Required regression and boundary tests.
-8. [completed] Full verification and defect-first quality review.
-9. [in progress] Clear commits, push, open unmerged PR, and attach the PR artifact.
+### Phase C — Calendar foundation
+
+- Read model over existing plans, items, versions, approvals, and publish jobs.
+- Month/week/list views plus platform, account, and status filters.
+- Single and bulk reschedule through a tenant-scoped service.
+- Refuse changes for running, published, unknown, failed, or cancelled work; preserve the approved content version and account binding.
+
+### Phase D — Analytics foundation
+
+- Canonical metric keys and period aggregation by post/account/platform.
+- Day/week/month comparisons with current, previous, and percentage change.
+- `null` for unavailable values; never coerce missing data to zero.
+- Freshness states `fresh`, `stale`, `syncing`, and `failed`, backed by `AnalyticsSyncState` and snapshot timestamps.
+- Programmatic calculations remain authoritative; AI review labels are explanatory only.
+
+### Phase E — Notifications foundation
+
+- Create the in-app notification first, then perform best-effort external dispatch.
+- Webhook and generic HTTP-email adapters use server-only credential references.
+- Record each delivery success/failure without rolling back the originating business event.
+- Cover urgent leads, publish failures/unknown results, token/permission/connection issues, and high-priority manual tasks through a typed event boundary.
+
+### Phase F — operator UI and verification
+
+- Navigation: overview, content, calendar, products, brand, analytics, interactions/leads, connections, settings.
+- AI capabilities remain inside the content workflow rather than becoming separate top-level tools.
+- Update seed data only for deterministic demo fixtures.
+- Add service-level regression tests, then run the complete quality gate.
 
 ## Acceptance criteria
 
-- Tenant isolation is enforced and tested for Brand, Memory, Calendar, Analytics, and Notifications.
-- Legacy `brandGuidelines` is used when no structured profile exists.
-- Memory extracts recent content and aggregates performance/research without cross-tenant leakage.
-- AI context contains confirmed facts only; all stage outputs validate; AI review creates no human approval or publish job.
-- Calendar filters work and rescheduling preserves current-version approval and scheduled-job constraints.
-- Analytics canonical mapping, periods, change, missing-vs-zero, REAL/MOCK, and freshness are tested.
-- Notification event/channel dispatch works and a failing external dispatcher cannot roll back the persisted event.
-- `pnpm typecheck`, `pnpm test`, `pnpm build`, and `git diff --check` pass.
+- Brand: create/read/update, tenant isolation, legacy compatibility.
+- Memory: recent content, performance and research context, no cross-tenant leakage.
+- AI: confirmed facts only, validated output, AI review never equals human approval.
+- Calendar: filters, service-layer reschedule, tenant isolation, protected terminal/running states.
+- Analytics: canonical mapping, aggregation, period comparison, freshness, missing-is-not-zero.
+- Notifications: event creation, webhook/email dispatch, delivery failures isolated from the main event.
+- `pnpm db:generate`
+- `pnpm db:migrate`
+- `pnpm typecheck`
+- `pnpm test`
+- `pnpm build`
+- `git diff --check`
 
-## Modified files
+## Progress
 
-- Schema/migrations: `prisma/schema.prisma`, `prisma/migrations/202609210001_non_publishing_foundations/`, and the idempotent repair migration `202609210002_non_publishing_foundations_repair/` required by the existing shared local database state.
-- Services/contracts: Brand, Memory, AI content, Calendar, Analytics, and Notifications under `src/services/` and `src/lib/`.
-- Operator/API: `/brand`, `/calendar`, `/analytics`, `/notifications`, their mutation routes, shell navigation, and minimal shared styling.
-- Analytics linkage: only `syncFacebookPostMetrics` in `src/services/facebook-service.ts`; no publish adapter, publish worker, Instagram, connection, or platform-foundation behavior changed.
-- Tests: `tests/non-publishing-modules.test.ts`.
-- Documentation: README, this plan, ADR `0006`, and four upstream audit records.
+- [x] Independent branch created from current `origin/main`.
+- [x] Existing Aarin models and service boundaries audited.
+- [x] Four upstream repositories reviewed and license boundary recorded.
+- [x] Brand and memory foundation.
+- [x] AI content pipeline foundation.
+- [x] Calendar foundation.
+- [x] Analytics foundation.
+- [x] Notifications foundation.
+- [x] Operator UI integration, including the complete PR #3 pilot design system and navigation.
+- [x] Local migration, typecheck, 16 test files / 125 tests, production build, and diff check.
+- [x] Final defect-first diff review and GitHub CI.
+- [x] Branch pushed and unmerged PR #5 opened: https://github.com/Aar1nnn/aarin-socialops/pull/5
 
-## Test status
+## Current verification
 
-- Baseline structure and PR #3/#4 file sets: verified by read-only audit.
-- `pnpm db:generate`: passed.
-- `pnpm db:migrate`: passed against the existing local PostgreSQL database.
-- `node node_modules/prisma/build/index.js validate`: passed; the schema is valid.
-- `pnpm typecheck`: passed after the final implementation changes.
-- `pnpm test tests/non-publishing-modules.test.ts --reporter=verbose`: 14/14 passed after defect fixes.
-- `pnpm test`: 14 files and 97 tests passed after all defect fixes.
-- `pnpm build`: passed after all defect fixes and generated 34 application routes.
-- `git diff --check`: passed before and after final staging.
-- Current branch UI: `http://localhost:3001` returned HTTP 200 after the expected `/login` redirect.
+- `pnpm db:generate`: PASS
+- `pnpm db:migrate`: PASS for both additive migrations
+- `pnpm typecheck`: PASS
+- `pnpm test`: PASS — 16 files, 125 tests
+- `pnpm build`: PASS — 33 application routes/pages
+- `git diff --check`: PASS (Git only reports the existing Windows LF/CRLF conversion notice)
+- GitHub Actions push/PR `verify`: PASS
+- PR state: OPEN and MERGEABLE
 
-## Known issues and uncertainties
+## Remaining limitations
 
-- PR #3 redesigns the operator shell and existing pages. This branch will add isolated pages and make only a small navigation edit; final integration should merge business pages first, then reconcile navigation/design tokens with PR #3.
-- PR #4 changes publishing services. This branch avoids those files; any future integration should retain PR #4's publishing checks and use this branch's new services as separate modules.
-- Email delivery uses a configurable HTTP gateway contract in this foundation; direct SMTP/provider integrations remain out of scope.
-- Webhook configuration rejects obvious private/loopback literal endpoints and redirects, but production deployment should also enforce outbound network policy and DNS/IP revalidation to close DNS-rebinding paths.
-- Notification event contracts are implemented, but automatic producers in PR #4's publish worker and future lead ingestion remain an integration step after branch convergence.
+- Image generation/review remains an explicit interface-only pipeline stage.
+- Notification email uses a generic server-side HTTP endpoint; SMTP and third-party notification dependencies are intentionally not added.
+- Calendar drag/drop moves a record to a date using the service layer; advanced recurrence and visual conflict resolution are not part of this foundation.
+- Analytics review text is deterministic and labeled; no causal AI analysis is claimed.
 
-## Next task
+## Explicit non-goals
 
-Create clear commits, push this branch, open an unmerged PR, record its URL here, and attach it to the task.
+- No Facebook/Instagram publishing changes.
+- No LinkedIn, TikTok, or YouTube implementation.
+- No OAuth, TokenVault, worker dispatch, publish retry, or reconciliation changes.
+- No direct external social publishing.
+- No dependency additions or upgrades.

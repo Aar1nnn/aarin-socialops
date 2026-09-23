@@ -1,165 +1,189 @@
-import type { DataAvailability, DataKind, Prisma } from "@prisma/client";
-import { z } from "zod";
-import type { RequestContext } from "../lib/context";
+import type { AnalyticsFreshnessStatus, DataAvailability, DataKind, MetricSnapshot } from "@prisma/client";
 import { db } from "../lib/db";
+import type { RequestContext } from "../lib/context";
 
-export const canonicalMetrics = [
-  "impressions", "reach", "views", "video_views", "watch_time", "likes", "comments", "shares", "saves",
-  "engagement", "engagement_rate", "followers", "follower_growth", "profile_views", "link_clicks",
+export const canonicalMetricKeys = [
+  "impressions", "reach", "views", "video_views", "watch_time",
+  "likes", "comments", "shares", "saves", "engagement", "engagement_rate",
+  "followers", "follower_growth", "profile_views", "link_clicks",
 ] as const;
 
-const aliases: Record<string, string> = {
-  plays: "video_views",
-  video_view: "video_views",
-  watch_time_minutes: "watch_time",
-  reactions: "likes",
-  post_reactions_total: "likes",
+export type CanonicalMetricKey = typeof canonicalMetricKeys[number];
+export type AnalyticsGrain = "day" | "week" | "month";
+
+const aliases: Record<string, CanonicalMetricKey> = {
   post_comments_total: "comments",
-  post_engagement: "engagement",
-  reposts: "shares",
-  clicks: "link_clicks",
-  outbound: "link_clicks",
-  outbound_clicks: "link_clicks",
+  comments_total: "comments",
+  post_reactions_total: "likes",
+  reactions: "likes",
+  page_impressions: "impressions",
+  page_post_engagements: "engagement",
+  page_views_total: "profile_views",
+  video_views_total: "video_views",
+  follower_count: "followers",
   follows: "follower_growth",
-  engagements: "engagement",
+  clicks: "link_clicks",
 };
 
-export function canonicalMetricKey(key: string): string {
-  const normalized = key.trim().toLocaleLowerCase().split(":", 1)[0].replace(/[\s-]+/g, "_");
-  return aliases[normalized] || normalized;
+export function canonicalizeMetricKey(raw: string): { key: CanonicalMetricKey | null; postId: string | null } {
+  const [base, ...rest] = raw.toLocaleLowerCase().split(":");
+  const normalized = base.replace(/^(real_|mock_)/, "");
+  const direct = canonicalMetricKeys.includes(normalized as CanonicalMetricKey) ? normalized as CanonicalMetricKey : aliases[normalized] || null;
+  return { key: direct, postId: rest.length ? rest.join(":") : null };
 }
 
-export type Freshness = "fresh" | "stale" | "syncing" | "failed";
-
-export function metricFreshness(
-  snapshot: { availability: DataAvailability; fetchedAt: Date } | undefined,
-  now = new Date(),
-  staleAfterMs = 24 * 60 * 60 * 1000,
-): Freshness {
-  if (!snapshot || snapshot.availability === "NOT_FETCHED") return "syncing";
-  if (["READ_FAILED", "PERMISSION_DENIED", "UNSUPPORTED"].includes(snapshot.availability)) return "failed";
-  return now.getTime() - snapshot.fetchedAt.getTime() > staleAfterMs ? "stale" : "fresh";
+function startOfPeriod(date: Date, grain: AnalyticsGrain) {
+  const result = new Date(Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate()));
+  if (grain === "week") result.setUTCDate(result.getUTCDate() - result.getUTCDay());
+  if (grain === "month") result.setUTCDate(1);
+  return result;
 }
 
-export type AnalyticsRow = {
-  metricKey: string;
-  numericValue: Prisma.Decimal | number | string | null;
-  availability: DataAvailability;
-  dataKind: DataKind;
-  periodStart?: Date | null;
-  periodEnd: Date | null;
-  fetchedAt: Date;
-  accountId: string;
-  contentItemId?: string | null;
-  account: { platform: string };
+export function periodBounds(now: Date, grain: AnalyticsGrain) {
+  const currentStart = startOfPeriod(now, grain);
+  const currentEnd = new Date(currentStart);
+  if (grain === "day") currentEnd.setUTCDate(currentEnd.getUTCDate() + 1);
+  if (grain === "week") currentEnd.setUTCDate(currentEnd.getUTCDate() + 7);
+  if (grain === "month") currentEnd.setUTCMonth(currentEnd.getUTCMonth() + 1);
+  const previousStart = new Date(currentStart);
+  if (grain === "day") previousStart.setUTCDate(previousStart.getUTCDate() - 1);
+  if (grain === "week") previousStart.setUTCDate(previousStart.getUTCDate() - 7);
+  if (grain === "month") previousStart.setUTCMonth(previousStart.getUTCMonth() - 1);
+  return { currentStart, currentEnd, previousStart };
+}
+
+type SnapshotLike = Pick<MetricSnapshot, "metricKey" | "numericValue" | "availability" | "dataKind" | "fetchedAt" | "periodStart" | "periodEnd" | "accountId"> & {
+  account?: { platform: string };
 };
 
-export function metricSnapshotScopeKey(row: AnalyticsRow): string {
-  const metricIdentity = row.metricKey.trim().toLocaleLowerCase();
-  const scopedPeriod = metricIdentity.includes(":")
-    ? "latest-in-window"
-    : row.periodStart || row.periodEnd
-      ? `${row.periodStart?.toISOString() || "open"}:${row.periodEnd?.toISOString() || "open"}`
-      : "latest-in-window";
-  return `${row.accountId}:${row.contentItemId || "account"}:${metricIdentity}:${row.dataKind}:${scopedPeriod}`;
-}
+type MetricSample = { value: number; fetchedAt: Date; intervalKey: string };
 
-type PeriodValue = {
-  value: number | null;
-  availableSamples: number;
-  availabilityStates: DataAvailability[];
-  dataKinds: DataKind[];
-};
-
-function summarize(rows: AnalyticsRow[]): PeriodValue {
-  const latestByScope = new Map<string, AnalyticsRow>();
-  for (const row of rows) {
-    const scope = metricSnapshotScopeKey(row);
-    const previous = latestByScope.get(scope);
-    if (!previous || row.fetchedAt > previous.fetchedAt) latestByScope.set(scope, row);
+function sumDeduplicatedSamples(samples: MetricSample[]) {
+  if (!samples.length) return null;
+  const latestByInterval = new Map<string, MetricSample>();
+  for (const sample of samples) {
+    const current = latestByInterval.get(sample.intervalKey);
+    if (!current || current.fetchedAt < sample.fetchedAt) latestByInterval.set(sample.intervalKey, sample);
   }
-  let value: number | null = null;
-  let availableSamples = 0;
-  const availabilityStates = new Set<DataAvailability>();
-  const dataKinds = new Set<DataKind>();
-  for (const row of latestByScope.values()) {
-    availabilityStates.add(row.availability);
-    dataKinds.add(row.dataKind);
-    if (row.availability === "AVAILABLE" && row.numericValue !== null) {
-      value = (value ?? 0) + Number(row.numericValue);
-      availableSamples += 1;
+  return [...latestByInterval.values()].reduce((sum, sample) => sum + sample.value, 0);
+}
+
+export function aggregateMetricSnapshots(snapshots: SnapshotLike[], bounds: ReturnType<typeof periodBounds>) {
+  const dimensions = new Map<string, {
+    key: CanonicalMetricKey;
+    postId: string | null;
+    accountId: string;
+    platform: string;
+    current: MetricSample[];
+    previous: MetricSample[];
+    unavailable: Partial<Record<DataAvailability, number>>;
+    kinds: Set<DataKind>;
+  }>();
+  for (const snapshot of snapshots) {
+    const canonical = canonicalizeMetricKey(snapshot.metricKey);
+    if (!canonical.key) continue;
+    const dimensionKey = `${canonical.key}|${snapshot.accountId}|${canonical.postId || "account"}`;
+    const item = dimensions.get(dimensionKey) || {
+      key: canonical.key,
+      postId: canonical.postId,
+      accountId: snapshot.accountId,
+      platform: snapshot.account?.platform || "unknown",
+      current: [], previous: [], unavailable: {}, kinds: new Set<DataKind>(),
+    };
+    item.kinds.add(snapshot.dataKind);
+    if (snapshot.availability !== "AVAILABLE" || snapshot.numericValue === null) {
+      item.unavailable[snapshot.availability] = (item.unavailable[snapshot.availability] || 0) + 1;
+    } else {
+      const sample = {
+        value: Number(snapshot.numericValue),
+        fetchedAt: snapshot.fetchedAt,
+        intervalKey: snapshot.periodStart || snapshot.periodEnd
+          ? `${snapshot.periodStart?.toISOString() || "open"}/${snapshot.periodEnd?.toISOString() || "open"}`
+          : "latest-unscoped",
+      };
+      if (snapshot.fetchedAt >= bounds.currentStart && snapshot.fetchedAt < bounds.currentEnd) item.current.push(sample);
+      if (snapshot.fetchedAt >= bounds.previousStart && snapshot.fetchedAt < bounds.currentStart) item.previous.push(sample);
     }
+    dimensions.set(dimensionKey, item);
   }
-  return { value, availableSamples, availabilityStates: [...availabilityStates], dataKinds: [...dataKinds] };
-}
-
-function bucketStart(date: Date, granularity: "day" | "week" | "month"): string {
-  const value = new Date(Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate()));
-  if (granularity === "week") value.setUTCDate(value.getUTCDate() - ((value.getUTCDay() + 6) % 7));
-  if (granularity === "month") value.setUTCDate(1);
-  return value.toISOString();
-}
-
-export function aggregateMetricSnapshots(
-  rows: AnalyticsRow[],
-  period: { currentStart: Date; currentEnd: Date; previousStart: Date; granularity: "day" | "week" | "month" },
-  now = new Date(),
-) {
-  const groups = new Map<string, AnalyticsRow[]>();
-  for (const row of rows) {
-    const key = canonicalMetricKey(row.metricKey);
-    groups.set(key, [...(groups.get(key) || []), row]);
-  }
-  const metrics = [...groups.entries()].map(([metricKey, metricRows]) => {
-    const timestamp = (row: AnalyticsRow) => row.periodEnd || row.fetchedAt;
-    const currentRows = metricRows.filter((row) => timestamp(row) >= period.currentStart && timestamp(row) < period.currentEnd);
-    const previousRows = metricRows.filter((row) => timestamp(row) >= period.previousStart && timestamp(row) < period.currentStart);
-    const current = summarize(currentRows);
-    const previous = summarize(previousRows);
-    const changePercent = current.value === null || previous.value === null || previous.value === 0
-      ? null
-      : ((current.value - previous.value) / previous.value) * 100;
-    const latest = [...currentRows].sort((a, b) => b.fetchedAt.getTime() - a.fetchedAt.getTime())[0];
-    return { metricKey, current, previous, changePercent, freshness: metricFreshness(latest, now), lastSyncedAt: latest?.fetchedAt ?? null };
-  }).sort((a, b) => a.metricKey.localeCompare(b.metricKey));
-
-  const buckets = new Map<string, AnalyticsRow[]>();
-  for (const row of rows) {
-    const timestamp = row.periodEnd || row.fetchedAt;
-    if (timestamp < period.currentStart || timestamp >= period.currentEnd) continue;
-    const key = `${bucketStart(timestamp, period.granularity)}:${canonicalMetricKey(row.metricKey)}`;
-    buckets.set(key, [...(buckets.get(key) || []), row]);
-  }
-  const series = [...buckets.entries()].map(([key, bucketRows]) => {
-    const separator = key.lastIndexOf(":");
-    return { bucket: key.slice(0, separator), metricKey: key.slice(separator + 1), ...summarize(bucketRows) };
-  }).sort((a, b) => a.bucket.localeCompare(b.bucket) || a.metricKey.localeCompare(b.metricKey));
-  return { metrics, series };
-}
-
-export const analyticsQuerySchema = z.object({
-  currentStart: z.coerce.date(),
-  currentEnd: z.coerce.date(),
-  granularity: z.enum(["day", "week", "month"]).default("day"),
-  accountId: z.string().min(1).optional(),
-  platform: z.string().min(1).optional(),
-  contentItemId: z.string().min(1).optional(),
-}).refine((value) => value.currentEnd > value.currentStart, { message: "Analytics end must be after start." });
-
-export async function getSocialAnalytics(context: RequestContext, raw: unknown) {
-  const input = analyticsQuerySchema.parse(raw);
-  const duration = input.currentEnd.getTime() - input.currentStart.getTime();
-  const previousStart = new Date(input.currentStart.getTime() - duration);
-  const rows = await db.metricSnapshot.findMany({
-    where: {
-      clientId: context.clientId,
-      fetchedAt: { gte: previousStart, lt: input.currentEnd },
-      ...(input.accountId ? { accountId: input.accountId } : {}),
-      ...(input.contentItemId ? { contentItemId: input.contentItemId } : {}),
-      ...(input.platform ? { account: { platform: input.platform } } : {}),
-    },
-    include: { account: { select: { platform: true } } },
-    orderBy: { fetchedAt: "asc" },
+  return [...dimensions.values()].map((item) => {
+    const current = sumDeduplicatedSamples(item.current);
+    const previous = sumDeduplicatedSamples(item.previous);
+    const changePercent = current === null || previous === null || previous === 0 ? null : ((current - previous) / previous) * 100;
+    return { ...item, current, previous, changePercent, kinds: [...item.kinds] };
   });
-  return aggregateMetricSnapshots(rows, { currentStart: input.currentStart, currentEnd: input.currentEnd, previousStart, granularity: input.granularity });
+}
+
+export function resolveFreshness(input: { status?: AnalyticsFreshnessStatus | null; latestFetchedAt?: Date | null; now?: Date; staleAfterMs?: number }) {
+  if (input.status === "SYNCING") return "syncing" as const;
+  if (input.status === "FAILED") return "failed" as const;
+  if (!input.latestFetchedAt) return "stale" as const;
+  const age = (input.now || new Date()).getTime() - input.latestFetchedAt.getTime();
+  return age <= (input.staleAfterMs || 24 * 60 * 60 * 1000) ? "fresh" as const : "stale" as const;
+}
+
+async function updateSyncState(
+  context: RequestContext,
+  accountId: string,
+  scope: string,
+  status: AnalyticsFreshnessStatus,
+  errorMessage?: string,
+) {
+  const account = await db.socialAccount.findFirst({ where: { id: accountId, clientId: context.clientId }, select: { id: true } });
+  if (!account) throw new Error("ANALYTICS_ACCOUNT_SCOPE_VIOLATION");
+  const now = new Date();
+  return db.analyticsSyncState.upsert({
+    where: { clientId_accountId_scope: { clientId: context.clientId, accountId, scope } },
+    create: {
+      clientId: context.clientId, accountId, scope, status,
+      lastStartedAt: status === "SYNCING" ? now : undefined,
+      lastSucceededAt: status === "FRESH" ? now : undefined,
+      lastFailedAt: status === "FAILED" ? now : undefined,
+      errorMessage: errorMessage || null,
+    },
+    update: {
+      status,
+      ...(status === "SYNCING" ? { lastStartedAt: now } : {}),
+      ...(status === "FRESH" ? { lastSucceededAt: now, errorMessage: null } : {}),
+      ...(status === "FAILED" ? { lastFailedAt: now, errorMessage: errorMessage || "Metric synchronization failed" } : {}),
+    },
+  });
+}
+
+export function markAnalyticsSyncStarted(context: RequestContext, accountId: string, scope = "metrics") {
+  return updateSyncState(context, accountId, scope, "SYNCING");
+}
+
+export function markAnalyticsSyncSucceeded(context: RequestContext, accountId: string, scope = "metrics") {
+  return updateSyncState(context, accountId, scope, "FRESH");
+}
+
+export function markAnalyticsSyncFailed(context: RequestContext, accountId: string, message: string, scope = "metrics") {
+  return updateSyncState(context, accountId, scope, "FAILED", message.slice(0, 1000));
+}
+
+export async function getAnalyticsOverview(context: RequestContext, grain: AnalyticsGrain = "week", now = new Date()) {
+  const bounds = periodBounds(now, grain);
+  const [snapshots, syncStates] = await Promise.all([
+    db.metricSnapshot.findMany({
+      where: { clientId: context.clientId, fetchedAt: { gte: bounds.previousStart, lt: bounds.currentEnd } },
+      include: { account: { select: { platform: true, displayName: true } } },
+      orderBy: { fetchedAt: "desc" },
+    }),
+    db.analyticsSyncState.findMany({ where: { clientId: context.clientId }, orderBy: { updatedAt: "desc" } }),
+  ]);
+  const metrics = aggregateMetricSnapshots(snapshots, bounds);
+  const latestFetchedAt = snapshots[0]?.fetchedAt || null;
+  const status = syncStates.find((state) => state.status === "SYNCING")?.status
+    || syncStates.find((state) => state.status === "FAILED")?.status
+    || syncStates[0]?.status
+    || null;
+  const freshness = resolveFreshness({ status, latestFetchedAt, now });
+  const review = [
+    { type: "FACT" as const, text: `${snapshots.length} metric snapshots were evaluated for the current comparison window.` },
+    { type: "OBSERVATION" as const, text: metrics.length ? `${metrics.filter((item) => item.current !== null).length} canonical metric dimensions have current-period values.` : "No canonical metric values are available." },
+    { type: "HYPOTHESIS" as const, text: "Performance changes require content and audience context before a causal conclusion." },
+    { type: "RECOMMENDATION" as const, text: freshness === "fresh" ? "Review account and post-level changes before planning the next experiment." : "Refresh source metrics before making performance decisions." },
+  ];
+  return { grain, bounds, freshness, latestFetchedAt, metrics, review, syncStates };
 }

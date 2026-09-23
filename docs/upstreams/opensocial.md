@@ -1,31 +1,24 @@
 # OpenSocial upstream review
 
 - Original: https://github.com/0xdileep/opensocial
-- Reviewed: 2026-09-21
-- Default branch: `master`
 - Reviewed commit: `2a655db3408961e15572e5ba23caccee5376e12b`
-- License: MIT text is included in `README.md`; GitHub license metadata is unset and no standalone license file was found.
-- Classification: **Adapt** of architectural boundaries, independently implemented; no source was directly ported.
+- License provenance: MIT text appears in `README.md`, but no root `LICENSE`, `COPYING`, or `NOTICE` existed at the reviewed commit; this is not treated as permission to copy.
+- Last audited/synced: 2026-09-21
 
-## Reviewed areas
+## Audited source areas
 
 - `apps/api/src/ai/pipeline/content.pipeline.ts`
-- `apps/api/src/ai/stages/generate.strategy.ts`
-- `apps/api/src/ai/stages/critique.rewrite.ts`
-- `apps/api/src/ai/ai.schemas.ts`
-- `apps/api/src/modules/brands/brand.service.ts`
-- `apps/api/src/modules/brands/brand.routes.ts`
+- `apps/api/src/ai/stages/`: strategy, critique/rewrite, and image prompt/generation/review boundaries.
+- `apps/api/src/modules/brands/`
 
-## Ideas retained
+## Ideas and Aarin landing points
 
-- Build a tenant-scoped brand/recent-content context before generation.
-- Separate strategy, generation, critique, and rewrite stages.
-- Parse structured model output and persist a draft only after validation.
+- Explicit staged content generation instead of an opaque one-shot generation call.
+- Strategy followed by critique and rewrite.
+- Brand and recent-content memory supplied through reusable context providers.
+- Image prompt/review retained as a boundary that may remain unimplemented.
+- Aarin implementations live in its brand, memory, and AI services and only persist through `ContentVersion` plus human `Approval`.
 
-## Aarin landing points
+## Provenance boundary
 
-- Aarin uses its existing `Client` tenant boundary rather than importing OpenSocial workspaces.
-- Context additionally includes confirmed product facts, performance memory, and research memory.
-- Output persists to the existing `ContentVersion`; the pipeline cannot schedule or publish.
-
-No OpenSocial database SQL, route code, prompts, or provider integrations are copied.
+Architecture-only reference. No OpenSocial source, prompts, or schema were copied. Direct adaptation remains prohibited unless license provenance is independently established.

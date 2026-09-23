@@ -1,115 +1,121 @@
-import { ApprovalDecision, ContentStatus, PublishJobStatus } from "@prisma/client";
+import { ContentStatus, PublishJobStatus } from "@prisma/client";
 import { z } from "zod";
-import { assertCanWrite, type RequestContext } from "../lib/context";
 import { db } from "../lib/db";
 import { AppError } from "../lib/errors";
+import { assertCanWrite, type RequestContext } from "../lib/context";
 
-const activeJobStatuses = [PublishJobStatus.PENDING, PublishJobStatus.RETRY, PublishJobStatus.WAITING_CONFIGURATION];
-
-export const calendarFiltersSchema = z.object({
-  from: z.coerce.date(),
-  to: z.coerce.date(),
-  platform: z.string().min(1).optional(),
-  accountId: z.string().min(1).optional(),
+const calendarFilterSchema = z.object({
+  from: z.coerce.date().optional(),
+  to: z.coerce.date().optional(),
+  platform: z.string().optional(),
+  accountId: z.string().optional(),
   status: z.nativeEnum(ContentStatus).optional(),
-}).refine((value) => value.to > value.from, { message: "Calendar end must be after start." });
+  view: z.enum(["month", "week", "list"]).default("month"),
+});
 
-const rescheduleInputSchema = z.object({
-  contentItemId: z.string().min(1),
+const rescheduleSchema = z.object({
+  contentItemIds: z.array(z.string().min(1)).min(1).max(100),
   scheduledAt: z.coerce.date(),
 });
 
-const bulkRescheduleSchema = z.object({
-  changes: z.array(rescheduleInputSchema).min(1).max(100),
-}).superRefine((value, ctx) => {
-  const ids = value.changes.map((change) => change.contentItemId);
-  if (new Set(ids).size !== ids.length) ctx.addIssue({ code: "custom", message: "Each content item may appear only once." });
-});
+const protectedItemStatuses = new Set<ContentStatus>([
+  ContentStatus.RUNNING,
+  ContentStatus.PUBLISHED,
+  ContentStatus.UNKNOWN,
+  ContentStatus.FAILED,
+  ContentStatus.CANCELLED,
+]);
 
-export async function listCalendarEntries(context: RequestContext, raw: unknown) {
-  const filters = calendarFiltersSchema.parse(raw);
-  return db.contentItem.findMany({
+const protectedJobStatuses = new Set<PublishJobStatus>([
+  PublishJobStatus.RUNNING,
+  PublishJobStatus.PUBLISHED,
+  PublishJobStatus.UNKNOWN,
+  PublishJobStatus.FAILED,
+  PublishJobStatus.CANCELLED,
+]);
+
+export async function listCalendarEntries(context: RequestContext, raw: unknown = {}) {
+  const input = calendarFilterSchema.parse(raw);
+  const scheduledAt = input.from || input.to ? {
+    ...(input.from ? { gte: input.from } : {}),
+    ...(input.to ? { lt: input.to } : {}),
+  } : undefined;
+  const items = await db.contentItem.findMany({
     where: {
       clientId: context.clientId,
-      scheduledAt: { gte: filters.from, lt: filters.to },
-      ...(filters.platform ? { platform: filters.platform } : {}),
-      ...(filters.accountId ? { accountId: filters.accountId } : {}),
-      ...(filters.status ? { status: filters.status } : {}),
+      ...(scheduledAt ? { scheduledAt } : {}),
+      ...(input.platform ? { platform: input.platform } : {}),
+      ...(input.accountId ? { accountId: input.accountId } : {}),
+      ...(input.status ? { status: input.status } : {}),
     },
     include: {
-      account: { select: { id: true, platform: true, displayName: true } },
-      plan: { select: { id: true, theme: true, objective: true, plannedAt: true } },
+      account: { select: { id: true, displayName: true, platform: true } },
+      plan: { include: { product: { select: { id: true, name: true } } } },
       currentVersion: {
-        select: {
-          id: true,
-          version: true,
-          title: true,
-          text: true,
-          approvals: { orderBy: { createdAt: "desc" }, take: 1, select: { decision: true, createdAt: true } },
-          publishJobs: { orderBy: { createdAt: "desc" }, take: 1, select: { id: true, status: true, nextAttemptAt: true } },
+        include: {
+          approvals: { orderBy: { createdAt: "desc" }, take: 1 },
+          publishJobs: { orderBy: { createdAt: "desc" }, take: 1 },
         },
       },
     },
-    orderBy: [{ scheduledAt: "asc" }, { createdAt: "asc" }],
+    orderBy: [{ scheduledAt: "asc" }, { updatedAt: "desc" }],
+  });
+  return items.map((item) => {
+    const approval = item.currentVersion?.approvals[0];
+    const job = item.currentVersion?.publishJobs[0];
+    return {
+      id: item.id,
+      platform: item.platform,
+      accountId: item.accountId,
+      accountName: item.account.displayName,
+      theme: item.plan.theme,
+      productName: item.plan.product?.name || null,
+      title: item.currentVersion?.title || null,
+      status: item.status,
+      scheduledAt: item.scheduledAt,
+      approvalStatus: approval?.decision || null,
+      publishJobStatus: job?.status || null,
+      queueAt: job?.nextAttemptAt || null,
+      reschedulable: !protectedItemStatuses.has(item.status) && (!job || !protectedJobStatuses.has(job.status)),
+    };
   });
 }
 
-export async function rescheduleCalendarItem(context: RequestContext, contentItemId: string, scheduledAt: Date) {
-  const result = await bulkRescheduleCalendarItems(context, { changes: [{ contentItemId, scheduledAt }] });
-  return result[0];
-}
-
-export async function bulkRescheduleCalendarItems(context: RequestContext, raw: unknown) {
+export async function rescheduleCalendarItems(context: RequestContext, raw: unknown) {
   assertCanWrite(context);
-  const input = bulkRescheduleSchema.parse(raw);
-  const now = new Date();
-  if (input.changes.some((change) => change.scheduledAt <= now)) {
-    throw new AppError("Calendar reschedule time must be in the future.", 400, "SCHEDULE_TIME_IN_PAST");
-  }
+  const input = rescheduleSchema.parse(raw);
+  if (input.scheduledAt.getTime() <= Date.now()) throw new AppError("排期时间必须晚于当前时间。", 400, "SCHEDULE_TIME_IN_PAST");
   return db.$transaction(async (tx) => {
     const items = await tx.contentItem.findMany({
-      where: { clientId: context.clientId, id: { in: input.changes.map((change) => change.contentItemId) } },
-      include: {
-        currentVersion: {
-          include: {
-            approvals: { where: { accountId: { not: undefined } }, orderBy: { createdAt: "desc" } },
-            publishJobs: { where: { status: { in: activeJobStatuses } }, orderBy: { createdAt: "desc" } },
-          },
-        },
+      where: { clientId: context.clientId, id: { in: input.contentItemIds } },
+      include: { currentVersion: { include: { publishJobs: true } } },
+    });
+    if (items.length !== new Set(input.contentItemIds).size) {
+      throw new AppError("包含不存在或其他客户的内容。", 403, "CONTENT_SCOPE_VIOLATION");
+    }
+    for (const item of items) {
+      if (protectedItemStatuses.has(item.status)) throw new AppError(`内容 ${item.id} 当前状态不允许重排。`, 409, "CALENDAR_ITEM_LOCKED");
+      const jobs = item.currentVersion?.publishJobs || [];
+      if (jobs.some((job) => protectedJobStatuses.has(job.status))) throw new AppError(`内容 ${item.id} 的发布任务不允许重排。`, 409, "CALENDAR_JOB_LOCKED");
+    }
+    for (const item of items) {
+      await tx.contentItem.update({ where: { id: item.id }, data: { scheduledAt: input.scheduledAt } });
+      if (item.currentVersionId) {
+        await tx.publishJob.updateMany({
+          where: { clientId: context.clientId, contentVersionId: item.currentVersionId, status: { in: ["PENDING", "RETRY", "WAITING_CONFIGURATION"] } },
+          data: { nextAttemptAt: input.scheduledAt },
+        });
+      }
+    }
+    await tx.auditLog.create({
+      data: {
+        clientId: context.clientId,
+        userId: context.userId,
+        action: input.contentItemIds.length > 1 ? "CALENDAR_BULK_RESCHEDULED" : "CALENDAR_ITEM_RESCHEDULED",
+        entityType: "ContentItem",
+        metadata: { contentItemIds: input.contentItemIds, scheduledAt: input.scheduledAt.toISOString() },
       },
     });
-    if (items.length !== input.changes.length) throw new AppError("One or more calendar items were not found in this client.", 404, "CALENDAR_ITEM_NOT_FOUND");
-    const byId = new Map(items.map((item) => [item.id, item]));
-    for (const change of input.changes) {
-      const item = byId.get(change.contentItemId)!;
-      if (item.status !== ContentStatus.SCHEDULED || !item.currentVersion) {
-        throw new AppError("Only an existing scheduled current version can be rescheduled.", 409, "CALENDAR_NOT_RESCHEDULABLE");
-      }
-      const approval = item.currentVersion.approvals.find((candidate) => candidate.accountId === item.accountId);
-      if (!approval || approval.decision !== ApprovalDecision.APPROVED) {
-        throw new AppError("Current version no longer has a valid human approval.", 409, "APPROVAL_REQUIRED");
-      }
-      const job = item.currentVersion.publishJobs.find((candidate) => candidate.accountId === item.accountId);
-      if (!job) throw new AppError("The existing scheduled item has no movable publish job.", 409, "PUBLISH_JOB_REQUIRED");
-    }
-    const updated = [];
-    for (const change of input.changes) {
-      const item = byId.get(change.contentItemId)!;
-      const job = item.currentVersion!.publishJobs.find((candidate) => candidate.accountId === item.accountId)!;
-      await tx.publishJob.update({ where: { id: job.id }, data: { nextAttemptAt: change.scheduledAt } });
-      const moved = await tx.contentItem.update({ where: { id: item.id }, data: { scheduledAt: change.scheduledAt } });
-      await tx.auditLog.create({
-        data: {
-          clientId: context.clientId,
-          userId: context.userId,
-          action: "CALENDAR_ITEM_RESCHEDULED",
-          entityType: "ContentItem",
-          entityId: item.id,
-          metadata: { previousScheduledAt: item.scheduledAt, scheduledAt: change.scheduledAt, publishJobId: job.id },
-        },
-      });
-      updated.push(moved);
-    }
-    return updated;
+    return { updated: items.length, scheduledAt: input.scheduledAt };
   });
 }
