@@ -141,4 +141,5 @@ All schema changes are additive and delivered by one forward migration.
 - Database-independent Vitest selection: PASS, 15 files / 86 tests.
 - `tests/ai-content-pipeline-safety.test.ts`: PASS, 1 test.
 - Database-backed tests: attempted but blocked before assertions because Docker Desktop could not keep its Linux engine running; PostgreSQL at `localhost:54329` was unreachable. Host logs first showed a stale Model Runner socket and, after disabling Docker AI, a Docker resume/cgroup failure.
+- GitHub Actions PR #6 `verify`: PASS. The CI PostgreSQL job completed install, Prisma generate/migrate, seed twice, migrate status, typecheck, the full test suite, and production build.
 - `git diff --check`: PASS before and after final staging.
