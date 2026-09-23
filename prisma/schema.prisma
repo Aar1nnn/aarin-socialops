@@ -252,6 +252,9 @@ model Client {
   sessions               Session[]
   products               Product[]
   assets                 Asset[]
+  assetTags              AssetTag[]
+  scheduleQueues         ScheduleQueue[]
+  scheduleSlots          ScheduleSlot[]
   accounts               SocialAccount[]
   platformPolicies       PlatformPolicy[]
   contentPlans           ContentPlan[]
@@ -384,9 +387,37 @@ model Asset {
   derivatives     Asset[]               @relation("AssetDerivatives")
   productLinks    ProductAsset[]
   contentLinks    ContentVersionAsset[]
+  tagLinks        AssetTagLink[]
 
   @@unique([clientId, checksum, storageKey])
+  @@unique([id, clientId])
   @@index([clientId, createdAt])
+}
+
+model AssetTag {
+  id             String         @id @default(cuid())
+  clientId       String
+  name           String
+  normalizedName String
+  createdAt      DateTime       @default(now())
+  client         Client         @relation(fields: [clientId], references: [id], onDelete: Cascade)
+  assetLinks     AssetTagLink[]
+
+  @@unique([clientId, normalizedName])
+  @@unique([id, clientId])
+  @@index([clientId, name])
+}
+
+model AssetTagLink {
+  assetId  String
+  tagId    String
+  clientId String
+  createdAt DateTime @default(now())
+  asset    Asset    @relation(fields: [assetId, clientId], references: [id, clientId], onDelete: Cascade)
+  tag      AssetTag @relation(fields: [tagId, clientId], references: [id, clientId], onDelete: Cascade)
+
+  @@id([assetId, tagId])
+  @@index([clientId, tagId])
 }
 
 model ProductAsset {
@@ -435,6 +466,7 @@ model SocialAccount {
   interactions          Interaction[]
   facebookConnection    FacebookPageConnection?
   platformConnection    PlatformConnection?     @relation(fields: [platformConnectionId, clientId], references: [id, clientId], onDelete: Restrict)
+  scheduleQueues         ScheduleQueue[]
 
   @@unique([clientId, platform, externalAccountId])
   @@unique([id, clientId])
@@ -568,6 +600,41 @@ model ContentItem {
   @@unique([planId, accountId])
   @@unique([id, clientId])
   @@index([clientId, status])
+}
+
+model ScheduleQueue {
+  id          String         @id @default(cuid())
+  clientId    String
+  accountId   String
+  name        String
+  timezone    String
+  enabled     Boolean        @default(true)
+  horizonDays Int            @default(30)
+  createdAt   DateTime       @default(now())
+  updatedAt   DateTime       @updatedAt
+  client      Client         @relation(fields: [clientId], references: [id], onDelete: Cascade)
+  account     SocialAccount  @relation(fields: [accountId, clientId], references: [id, clientId], onDelete: Cascade)
+  slots       ScheduleSlot[]
+
+  @@unique([clientId, accountId, name])
+  @@unique([id, clientId])
+  @@index([clientId, enabled])
+}
+
+model ScheduleSlot {
+  id          String        @id @default(cuid())
+  clientId    String
+  queueId     String
+  dayOfWeek   Int
+  hour        Int
+  minute      Int           @default(0)
+  enabled     Boolean       @default(true)
+  createdAt   DateTime      @default(now())
+  client      Client        @relation(fields: [clientId], references: [id], onDelete: Cascade)
+  queue       ScheduleQueue @relation(fields: [queueId, clientId], references: [id, clientId], onDelete: Cascade)
+
+  @@unique([queueId, dayOfWeek, hour, minute])
+  @@index([clientId, queueId, enabled])
 }
 
 model ContentVersion {

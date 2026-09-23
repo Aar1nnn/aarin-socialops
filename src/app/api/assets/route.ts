@@ -2,6 +2,17 @@ import { requireContext } from "@/lib/auth";
 import { errorResponse } from "@/lib/errors";
 import { actionResponse } from "@/lib/http";
 import { uploadAsset } from "@/services/product-service";
+import { searchAssets } from "@/services/asset-library-service";
+
+export async function GET(request: Request) {
+  try {
+    const context = await requireContext();
+    const query = Object.fromEntries(new URL(request.url).searchParams.entries());
+    return Response.json(await searchAssets(context, { ...query, tagIds: query.tagIds?.split(",").filter(Boolean) }));
+  } catch (error) {
+    return errorResponse(error);
+  }
+}
 
 export async function POST(request: Request) {
   try {
