@@ -212,6 +212,8 @@ model User {
   memberships         ClientMembership[]
   sessions            Session[]
   approvals           Approval[]
+  createdContentVersions ContentVersion[] @relation("ContentVersionCreator")
+  reviewComments      ReviewComment[]
   auditLogs           AuditLog[]
   platformConnections PlatformConnection[]
   oauthStates         OAuthState[]
@@ -256,6 +258,7 @@ model Client {
   contentItems           ContentItem[]
   contentVersions        ContentVersion[]
   approvals              Approval[]
+  reviewComments         ReviewComment[]
   publishJobs            PublishJob[]
   publishAttempts        PublishAttempt[]
   metricSnapshots        MetricSnapshot[]
@@ -560,8 +563,10 @@ model ContentItem {
   account          SocialAccount    @relation(fields: [accountId], references: [id], onDelete: Restrict)
   versions         ContentVersion[] @relation("ItemVersions")
   currentVersion   ContentVersion?  @relation("CurrentVersion", fields: [currentVersionId], references: [id], onDelete: SetNull)
+  reviewComments   ReviewComment[]
 
   @@unique([planId, accountId])
+  @@unique([id, clientId])
   @@index([clientId, status])
 }
 
@@ -578,17 +583,28 @@ model ContentVersion {
   simulated          Boolean               @default(false)
   generationLabel    String
   sourceFacts        Json
+  previousVersionId  String?
+  createdByUserId    String?
+  source             String                @default("SYSTEM")
+  reason             String?
   createdAt          DateTime              @default(now())
   client             Client                @relation(fields: [clientId], references: [id], onDelete: Cascade)
   item               ContentItem           @relation("ItemVersions", fields: [contentItemId], references: [id], onDelete: Cascade)
   currentFor         ContentItem[]         @relation("CurrentVersion")
   promptVersion      PromptVersion         @relation(fields: [promptVersionId], references: [id], onDelete: Restrict)
+  previousVersion    ContentVersion?       @relation("ContentVersionLineage", fields: [previousVersionId], references: [id], onDelete: SetNull)
+  nextVersions       ContentVersion[]      @relation("ContentVersionLineage")
+  createdBy          User?                 @relation("ContentVersionCreator", fields: [createdByUserId], references: [id], onDelete: SetNull)
   assetLinks         ContentVersionAsset[]
   approvals          Approval[]
+  reviewComments     ReviewComment[]
   publishJobs        PublishJob[]
 
   @@unique([contentItemId, version])
+  @@unique([id, clientId])
   @@index([clientId, createdAt])
+  @@index([previousVersionId])
+  @@index([createdByUserId, createdAt])
 }
 
 model ContentVersionAsset {
@@ -618,6 +634,25 @@ model Approval {
   reviewer         User             @relation(fields: [reviewerId], references: [id], onDelete: Restrict)
 
   @@index([clientId, contentVersionId, accountId, createdAt])
+}
+
+model ReviewComment {
+  id               String         @id @default(cuid())
+  clientId         String
+  contentItemId    String
+  contentVersionId String
+  reviewerId       String
+  comment          String
+  reason           String?
+  requestedChanges Json
+  createdAt        DateTime       @default(now())
+  client           Client         @relation(fields: [clientId], references: [id], onDelete: Cascade)
+  contentItem      ContentItem    @relation(fields: [contentItemId, clientId], references: [id, clientId], onDelete: Cascade)
+  contentVersion   ContentVersion @relation(fields: [contentVersionId, clientId], references: [id, clientId], onDelete: Restrict)
+  reviewer         User           @relation(fields: [reviewerId], references: [id], onDelete: Restrict)
+
+  @@index([clientId, contentItemId, createdAt])
+  @@index([clientId, contentVersionId, createdAt])
 }
 
 model PublishJob {

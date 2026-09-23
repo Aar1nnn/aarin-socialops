@@ -170,6 +170,9 @@ export async function generateContentPlan(context: RequestContext, raw: unknown)
           generator: generated.provider,
           simulated: generated.simulated,
           generationLabel: generated.simulated ? "模拟生成" : "真实模型生成",
+          createdByUserId: context.userId,
+          source: "AI",
+          reason: "INITIAL_GENERATION",
           sourceFacts: {
             confirmedFacts,
             missingFields: draft.missingInformation,
@@ -248,7 +251,19 @@ export async function submitForReview(context: RequestContext, contentItemId: st
 export async function editContentVersion(
   context: RequestContext,
   contentItemId: string,
-  input: { text: string; title?: string | null; assetIds?: string[]; accountId?: string },
+  input: {
+    text: string;
+    title?: string | null;
+    assetIds?: string[];
+    accountId?: string;
+    expectedVersionId?: string;
+    previousVersionId?: string;
+    reason?: string;
+    source?: "MANUAL" | "AUTOSAVE" | "RESTORE" | "AI_REWRITE" | "AI_REGENERATE";
+    generator?: string;
+    generationLabel?: string;
+    sourceFacts?: Prisma.InputJsonValue;
+  },
 ) {
   assertCanWrite(context);
   const item = await getScopedItem(context, contentItemId);
@@ -259,6 +274,9 @@ export async function editContentVersion(
   const assetIds = input.assetIds ?? item.currentVersion.assetLinks.map((link) => link.assetId);
   const assets = await db.asset.count({ where: { id: { in: assetIds }, clientId: context.clientId } });
   if (assets !== new Set(assetIds).size) throw new AppError("素材不属于当前客户。", 403, "ASSET_SCOPE_VIOLATION");
+  if (input.expectedVersionId && input.expectedVersionId !== item.currentVersion.id) {
+    throw new AppError("草稿已被其他操作更新，请刷新后重试。", 409, "VERSION_CONFLICT");
+  }
   return db.$transaction(async (tx) => {
     await tx.$queryRaw`SELECT "id" FROM "ContentItem" WHERE "id" = ${item.id} FOR UPDATE`;
     const liveItem = await tx.contentItem.findUniqueOrThrow({ where: { id: item.id } });
@@ -273,10 +291,14 @@ export async function editContentVersion(
         text: input.text,
         productDataVersion: item.currentVersion!.productDataVersion,
         promptVersionId: item.currentVersion!.promptVersionId,
-        generator: "operator-edit",
+        generator: input.generator || "operator-edit",
         simulated: item.currentVersion!.simulated,
-        generationLabel: "人工编辑版本",
-        sourceFacts: item.currentVersion!.sourceFacts as Prisma.InputJsonValue,
+        generationLabel: input.generationLabel || "人工编辑版本",
+        sourceFacts: input.sourceFacts || item.currentVersion!.sourceFacts as Prisma.InputJsonValue,
+        previousVersionId: input.previousVersionId || item.currentVersion!.id,
+        createdByUserId: context.userId,
+        source: input.source || "MANUAL",
+        reason: input.reason || "CONTENT_EDITED",
         assetLinks: { create: assetIds.map((assetId) => ({ clientId: context.clientId, assetId })) },
       },
     });

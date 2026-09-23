@@ -2,7 +2,7 @@ import { z } from "zod";
 import type { DraftGenerationInput, DraftGenerationResult, TextGenerationAdapter } from "../lib/adapters/types";
 import type { RequestContext } from "../lib/context";
 import { generatedDraftsSchema } from "../lib/contracts";
-import { buildContentEngineMemory } from "./memory-service";
+import { buildCompositionContext } from "./context-builder-service";
 
 export const contentStrategySchema = z.object({
   audience: z.string().min(1),
@@ -24,7 +24,7 @@ export const aiReviewSchema = z.object({
 export type PipelineBaseInput = Omit<DraftGenerationInput,
   "brandProfile" | "recentContent" | "performanceContext" | "researchContext" | "strategy">;
 
-export function generateStrategy(input: PipelineBaseInput, brand: Awaited<ReturnType<typeof buildContentEngineMemory>>["brand"]) {
+export function generateStrategy(input: PipelineBaseInput, brand: Awaited<ReturnType<typeof buildCompositionContext>>["brand"]) {
   return contentStrategySchema.parse({
     audience: brand.audience || "Qualified business buyers defined by the operator",
     messageAngle: input.theme,
@@ -83,26 +83,26 @@ export async function runAIContentPipeline(
 }
 
 export async function prepareAIContentPipelineInput(context: RequestContext, baseInput: PipelineBaseInput): Promise<DraftGenerationInput> {
-  const memory = await buildContentEngineMemory(context);
-  const strategy = generateStrategy(baseInput, memory.brand);
+  const compositionContext = await buildCompositionContext(context);
+  const strategy = generateStrategy(baseInput, compositionContext.brand);
   return {
     ...baseInput,
     brandProfile: {
-      businessSummary: memory.brand.businessSummary || null,
-      positioning: memory.brand.positioning || null,
-      audience: memory.brand.audience || null,
-      tone: memory.brand.tone || memory.brand.effectiveTone,
-      voiceTraits: memory.brand.voiceTraits || [],
-      goals: memory.brand.goals || [],
-      contentLanguages: memory.brand.contentLanguages || [],
-      imageStyle: memory.brand.imageStyle || null,
-      bannedPhrases: memory.brand.bannedPhrases || [],
-      requiredMentions: memory.brand.requiredMentions || [],
-      ctaRules: memory.brand.ctaRules || [],
+      businessSummary: compositionContext.brand.businessSummary || null,
+      positioning: compositionContext.brand.positioning || null,
+      audience: compositionContext.brand.audience || null,
+      tone: compositionContext.brand.tone || compositionContext.brand.effectiveTone,
+      voiceTraits: compositionContext.brand.voiceTraits || [],
+      goals: compositionContext.brand.goals || [],
+      contentLanguages: compositionContext.brand.contentLanguages || [],
+      imageStyle: compositionContext.brand.imageStyle || null,
+      bannedPhrases: compositionContext.brand.bannedPhrases || [],
+      requiredMentions: compositionContext.brand.requiredMentions || [],
+      ctaRules: compositionContext.brand.ctaRules || [],
     },
-    recentContent: memory.recentContent.map(({ platform, theme, hook, cta, product }) => ({ platform, theme, hook, cta, product })),
-    performanceContext: memory.performance.map(({ metricKey, platform, value, availability, dataKind }) => ({ metricKey, platform, value, availability, dataKind })),
-    researchContext: memory.research.map(({ kind, objective, observations, limitations }) => ({ kind, objective, observations, limitations })),
+    recentContent: compositionContext.recentContent.map(({ platform, theme, hook, cta, product }) => ({ platform, theme, hook, cta, product })),
+    performanceContext: compositionContext.performance.map(({ metricKey, platform, value, availability, dataKind }) => ({ metricKey, platform, value, availability, dataKind })),
+    researchContext: compositionContext.research.map(({ kind, objective, observations, limitations }) => ({ kind, objective, observations, limitations })),
     strategy,
   };
 }
