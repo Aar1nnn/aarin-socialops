@@ -48,6 +48,7 @@ Merge PR #6 boundary hardening, then converge and validate PR #7's seven-module 
 - Defect-first review found and fixed a same-account analytics suffix collision: content metrics now require the complete, case-sensitive remote post ID after the database prefilter. A regression test covers mixed-case IDs and `other-<id>` collisions.
 - Independent DEMO customer integration test: confirmed facts only -> generated version -> human change request -> immutable revised version -> human approval -> scheduled job -> simulated publish -> MOCK metric -> urgent lead/in-app notification -> manual handoff. One isolated test passed; no real customer publish.
 - Asset `ready` means a locally validated HTTPS candidate. Signed URL expiry is checked and stale URLs can be refreshed via storage; platform-side fetchability remains externally unverified.
+- First PR #7 CI attempt on `3caaf4c` failed in both push/PR jobs on one concurrency-test assertion. The `STALE_OPERATION` rejection added by PR #6 is another valid rollback outcome when a concurrent claim wins. The test now accepts this code and still asserts the original item/job times are unchanged; local targeted 16/16 and full 24 files / 218 tests pass. A new CI run is required before merge.
 
 ## Next action
 

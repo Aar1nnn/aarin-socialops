@@ -189,7 +189,7 @@ describe("calendar foundation", () => {
     });
     await claimHasLock;
     const move = expect(rescheduleCalendarItems(fixture.context, { contentItemIds: [item.id], scheduledAt: target }))
-      .rejects.toMatchObject({ code: expect.stringMatching(/^(CALENDAR_JOB_LOCKED|PUBLISH_JOB_REQUIRED)$/) });
+      .rejects.toMatchObject({ code: expect.stringMatching(/^(CALENDAR_JOB_LOCKED|PUBLISH_JOB_REQUIRED|STALE_OPERATION)$/) });
     await new Promise((resolve) => setTimeout(resolve, 50));
     releaseClaim();
     await claim;
