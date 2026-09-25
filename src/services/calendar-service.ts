@@ -34,11 +34,8 @@ const protectedItemStatuses = new Set<ContentStatus>([
   ContentStatus.CANCELLED,
 ]);
 
-const mutableJobStatuses = new Set<PublishJobStatus>([
-  PublishJobStatus.PENDING,
-  PublishJobStatus.RETRY,
-  PublishJobStatus.WAITING_CONFIGURATION,
-]);
+const activeJobStatuses: PublishJobStatus[] = [PublishJobStatus.PENDING, PublishJobStatus.RETRY, PublishJobStatus.WAITING_CONFIGURATION];
+const mutableJobStatuses = new Set(activeJobStatuses);
 
 export async function listCalendarEntries(context: RequestContext, raw: unknown = {}) {
   const input = calendarFilterSchema.parse(raw);
@@ -59,16 +56,17 @@ export async function listCalendarEntries(context: RequestContext, raw: unknown 
       plan: { include: { product: { select: { id: true, name: true } } } },
       currentVersion: {
         include: {
-          approvals: { orderBy: { createdAt: "desc" }, take: 1 },
-          publishJobs: { orderBy: { createdAt: "desc" }, take: 1 },
+          approvals: { orderBy: { createdAt: "desc" } },
+          publishJobs: { orderBy: { createdAt: "desc" } },
         },
       },
     },
     orderBy: [{ scheduledAt: "asc" }, { updatedAt: "desc" }],
   });
   return items.map((item) => {
-    const approval = item.currentVersion?.approvals[0];
-    const job = item.currentVersion?.publishJobs[0];
+    const approval = item.currentVersion?.approvals.find((candidate) => candidate.accountId === item.accountId);
+    const job = item.currentVersion?.publishJobs.find((candidate) => candidate.accountId === item.accountId);
+    const activeJob = item.currentVersion?.publishJobs.find((candidate) => candidate.accountId === item.accountId && activeJobStatuses.includes(candidate.status));
     return {
       id: item.id,
       platform: item.platform,
@@ -82,9 +80,9 @@ export async function listCalendarEntries(context: RequestContext, raw: unknown 
       approvalStatus: approval?.decision || null,
       publishJobStatus: job?.status || null,
       queueAt: job?.nextAttemptAt || null,
-      reschedulable: approval?.decision === ApprovalDecision.APPROVED
-        && !protectedItemStatuses.has(item.status)
-        && Boolean(job && mutableJobStatuses.has(job.status)),
+      reschedulable: item.status === ContentStatus.SCHEDULED
+        && approval?.decision === ApprovalDecision.APPROVED
+        && Boolean(activeJob),
     };
   });
 }
@@ -114,6 +112,9 @@ export async function rescheduleCalendarItems(context: RequestContext, raw: unkn
       for (const item of currentItems) {
         if (protectedItemStatuses.has(item.status)) {
           throw new AppError(`内容 ${item.id} 当前状态不允许重排。`, 409, "CALENDAR_ITEM_LOCKED");
+        }
+        if (item.status !== ContentStatus.SCHEDULED) {
+          throw new AppError(`内容 ${item.id} 不是已有排期，不能通过 Calendar 创建新排期。`, 409, "CALENDAR_ITEM_NOT_RESCHEDULABLE");
         }
       }
       for (const accountId of [...new Set(currentItems.map((item) => item.accountId))].sort()) {
@@ -145,14 +146,27 @@ export async function rescheduleCalendarItems(context: RequestContext, raw: unkn
 
       for (const validated of validatedItems) {
         const updated = await tx.publishJob.updateMany({
-          where: { id: validated.existing!.id, clientId: context.clientId, status: { in: [...mutableJobStatuses] } },
+          where: {
+            id: validated.existing!.id,
+            clientId: context.clientId,
+            contentVersionId: validated.currentVersionId,
+            accountId: validated.item.accountId,
+            status: { in: activeJobStatuses },
+          },
           data: { nextAttemptAt: input.scheduledAt },
         });
         if (updated.count !== 1) throw new AppError("发布任务已被其他操作更新，请刷新后重试。", 409, "STALE_OPERATION");
-        await tx.contentItem.update({
-          where: { id: validated.item.id },
-          data: { scheduledAt: input.scheduledAt, status: ContentStatus.SCHEDULED },
+        const movedItem = await tx.contentItem.updateMany({
+          where: {
+            id: validated.item.id,
+            clientId: context.clientId,
+            status: ContentStatus.SCHEDULED,
+            currentVersionId: validated.currentVersionId,
+            accountId: validated.item.accountId,
+          },
+          data: { scheduledAt: input.scheduledAt },
         });
+        if (movedItem.count !== 1) throw new AppError(`内容 ${validated.item.id} 的排期状态已变化。`, 409, "CALENDAR_ITEM_LOCKED");
       }
       await tx.auditLog.create({
         data: {

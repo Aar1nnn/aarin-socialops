@@ -10,6 +10,7 @@ import { z } from "zod";
 import { db } from "../lib/db";
 import { AppError } from "../lib/errors";
 import { getTextGenerationAdapter } from "../lib/adapters/text-generation";
+import type { TextGenerationAdapter } from "../lib/adapters/types";
 import { sha256 } from "../lib/security";
 import { assertValidTimeZone, zonedLocalDateTimeToUtc } from "../lib/timezone";
 import { assertCanWrite, type RequestContext } from "../lib/context";
@@ -30,7 +31,7 @@ const generateInputSchema = z.object({
   message: "至少选择一个具体账号。",
 });
 
-export async function generateContentPlan(context: RequestContext, raw: unknown) {
+export async function generateContentPlan(context: RequestContext, raw: unknown, adapterOverride?: TextGenerationAdapter) {
   assertCanWrite(context);
   const input = generateInputSchema.parse(raw);
   const requestedAccountIds = input.accountIds ? [...new Set(input.accountIds)] : undefined;
@@ -116,7 +117,7 @@ export async function generateContentPlan(context: RequestContext, raw: unknown)
     : null;
   let generated;
   try {
-    const adapter = getTextGenerationAdapter(configuredProvider);
+    const adapter = adapterOverride || getTextGenerationAdapter(configuredProvider);
     generated = await runPreparedAIContentPipeline(
       pipelineInput,
       adapter,
@@ -132,6 +133,14 @@ export async function generateContentPlan(context: RequestContext, raw: unknown)
   }
 
   const result = await db.$transaction(async (tx) => {
+    await tx.$queryRaw`SELECT "id" FROM "Product" WHERE "id" = ${product.id} AND "clientId" = ${context.clientId} FOR UPDATE`;
+    const liveProduct = await tx.product.findFirst({
+      where: { id: product.id, clientId: context.clientId },
+      select: { dataVersion: true },
+    });
+    if (!liveProduct || liveProduct.dataVersion !== product.dataVersion) {
+      throw new AppError("Product facts changed while AI generation was running. Refresh and try again.", 409, "STALE_OPERATION");
+    }
     const plan = await tx.contentPlan.create({
       data: {
         clientId: context.clientId,

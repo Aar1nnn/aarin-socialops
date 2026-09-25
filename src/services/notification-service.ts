@@ -43,10 +43,21 @@ function resolveCredentialRef(ref: string | null) {
   return process.env[key] || null;
 }
 
+function requireHttpsEndpoint(endpoint: string | null) {
+  if (!endpoint) throw new Error("Channel endpoint credential is missing");
+  try {
+    if (new URL(endpoint).protocol === "https:") return endpoint;
+  } catch {
+    // Invalid URLs are handled by the same delivery failure path.
+  }
+  throw new Error("Channel endpoint must be an HTTPS URL");
+}
+
 const defaultTransport: NotificationTransport = async ({ type, endpoint, displayName, payload }) => {
   const response = await fetch(endpoint, {
     method: "POST", headers: { "content-type": "application/json" },
     body: JSON.stringify(type === "EMAIL" ? { channel: displayName, subject: payload.title, text: payload.body, metadata: payload } : payload),
+    redirect: "error",
     signal: AbortSignal.timeout(10_000),
   });
   if (!response.ok) throw new Error(`${type} delivery failed with HTTP ${response.status}`);
@@ -121,9 +132,8 @@ export type PreparedNotificationEvent = Awaited<ReturnType<typeof prepareNotific
 export async function dispatchPreparedNotification(prepared: PreparedNotificationEvent, transport: NotificationTransport = defaultTransport) {
   const deliveries = [];
   for (const { delivery, channel } of prepared.pendingDeliveries) {
-    const endpoint = resolveCredentialRef(channel.credentialRef);
     try {
-      if (!endpoint) throw new Error("Channel endpoint credential is missing");
+      const endpoint = requireHttpsEndpoint(resolveCredentialRef(channel.credentialRef));
       await transport({ type: channel.type, endpoint, displayName: channel.displayName, payload: prepared.payload });
       deliveries.push(await db.notificationDelivery.update({ where: { id: delivery.id }, data: { status: "DELIVERED", attemptCount: 1, deliveredAt: new Date(), lastError: null } }));
     } catch (error) {

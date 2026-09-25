@@ -250,6 +250,14 @@ describe("calendar queues", () => {
     const target = new Date(Date.now() + 3 * 24 * 60 * 60 * 1000);
     const draft = await createItem(fixture, false);
     const approvedWithoutJob = await createItem();
+    await db.contentItem.update({
+      where: { id: draft.id },
+      data: { status: "SCHEDULED", scheduledAt: new Date(Date.now() + 5 * 24 * 60 * 60 * 1000) },
+    });
+    await db.contentItem.update({
+      where: { id: approvedWithoutJob.id },
+      data: { status: "SCHEDULED", scheduledAt: new Date(Date.now() + 6 * 24 * 60 * 60 * 1000) },
+    });
     const initial = await bulkRescheduleWithResults(fixture.context, { operations: [
       { contentItemId: draft.id, scheduledAt: target },
       { contentItemId: approvedWithoutJob.id, scheduledAt: target },

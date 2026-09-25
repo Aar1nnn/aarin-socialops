@@ -10,6 +10,7 @@ import { runAIContentPipeline } from "../src/services/ai-content-pipeline-servic
 import { listCalendarEntries, rescheduleCalendarItems } from "../src/services/calendar-service";
 import { aggregateMetricSnapshots, canonicalizeMetricKey, markAnalyticsSyncFailed, markAnalyticsSyncStarted, markAnalyticsSyncSucceeded, periodBounds, resolveFreshness } from "../src/services/analytics-service";
 import { createAndDispatchNotification, upsertNotificationRule } from "../src/services/notification-service";
+import { generateContentPlan } from "../src/services/content-service";
 
 type Fixture = { client: Client; context: RequestContext; account: SocialAccount; promptId: string };
 const clientIds: string[] = [];
@@ -28,7 +29,7 @@ async function makeFixture(brandGuidelines: string | null = "Legacy: direct and 
   return { client, account, promptId: prompt.id, context: { clientId: client.id, userId: user.id, role: "OWNER" as const } };
 }
 
-async function createContent(input: { status?: "DRAFT" | "APPROVED" | "PUBLISHED"; scheduledAt?: Date; text?: string } = {}) {
+async function createContent(input: { status?: "DRAFT" | "APPROVED" | "SCHEDULED" | "PUBLISHED"; scheduledAt?: Date; text?: string } = {}) {
   const product = await db.product.create({ data: { clientId: fixture.client.id, name: "Confirmed chair", status: "CONFIRMED" } });
   const plan = await db.contentPlan.create({ data: { clientId: fixture.client.id, productId: product.id, theme: "Wholesale chair", objective: "Qualified enquiry", channels: ["facebook"] } });
   const item = await db.contentItem.create({ data: { clientId: fixture.client.id, planId: plan.id, accountId: fixture.account.id, platform: "facebook", status: input.status || "DRAFT", scheduledAt: input.scheduledAt } });
@@ -41,6 +42,7 @@ beforeEach(async () => { fixture = await makeFixture(); });
 afterEach(async () => {
   delete process.env.TEST_WEBHOOK_ENDPOINT;
   delete process.env.TEST_EMAIL_ENDPOINT;
+  delete process.env.TEST_HTTP_ENDPOINT;
   for (const clientId of clientIds.splice(0)) await db.client.deleteMany({ where: { id: clientId } });
   for (const userId of userIds.splice(0)) await db.user.deleteMany({ where: { id: userId } });
 });
@@ -103,13 +105,34 @@ describe("AI content pipeline foundation", () => {
     const adapter: TextGenerationAdapter = { async generate() { return { provider: "bad", model: null, simulated: true, usage: { inputUnits: 0, outputUnits: 0 }, output: { drafts: [] } }; } };
     await expect(runAIContentPipeline(fixture.context, { clientName: "x", mode: "DRAFT", targetMarkets: [], productFocus: null, brandGuidelines: null, productName: "x", objective: "x", theme: "x", confirmedFacts: [], missingFields: [], platforms: ["facebook"], instruction: "x" }, adapter)).rejects.toThrow();
   });
+
+  it("hard-rejects generated drafts that claim unconfirmed fact keys", async () => {
+    const adapter: TextGenerationAdapter = { async generate() { return { provider: "unsafe", model: "test", simulated: true, usage: { inputUnits: 1, outputUnits: 1 }, output: { drafts: [{ platform: "facebook", title: "Unsafe", text: "Unverified size claim.", usedFactKeys: ["size"], missingInformation: [], isGenericMarketDraft: false }] } }; } };
+    await expect(runAIContentPipeline(fixture.context, { clientName: "x", mode: "DRAFT", targetMarkets: [], productFocus: null, brandGuidelines: null, productName: "x", objective: "x", theme: "x", confirmedFacts: [{ key: "material", value: "steel", source: "sheet" }], missingFields: ["size"], platforms: ["facebook"], instruction: "x" }, adapter)).rejects.toMatchObject({ code: "AI_UNCONFIRMED_FACT_USED" });
+  });
+
+  it("does not persist AI output after product facts change during generation", async () => {
+    await db.socialAccount.update({ where: { id: fixture.account.id }, data: { isSelected: true } });
+    const product = await db.product.create({ data: {
+      clientId: fixture.client.id,
+      name: "Race-safe chair",
+      status: "CONFIRMED",
+      fields: { create: [{ clientId: fixture.client.id, key: "material", value: "steel", status: "CONFIRMED", source: "sheet" }] },
+    } });
+    const adapter: TextGenerationAdapter = { async generate(input) {
+      await db.product.update({ where: { id: product.id }, data: { dataVersion: { increment: 1 } } });
+      return { provider: "race-test", model: "test", simulated: true, usage: { inputUnits: 1, outputUnits: 1 }, output: { drafts: [{ platform: "facebook", title: "Draft", text: "Verified steel chair.", usedFactKeys: [input.confirmedFacts[0].key], missingInformation: [], isGenericMarketDraft: false }] } };
+    } };
+    await expect(generateContentPlan(fixture.context, { productId: product.id, theme: "Race", objective: "Leads", accountIds: [fixture.account.id], assetIds: [] }, adapter)).rejects.toMatchObject({ code: "STALE_OPERATION" });
+    expect(await db.contentPlan.count({ where: { clientId: fixture.client.id, productId: product.id } })).toBe(0);
+  });
 });
 
 describe("calendar foundation", () => {
   it("filters existing records and reschedules through the tenant service", async () => {
     const original = new Date(Date.now() + 2 * 24 * 60 * 60 * 1000);
     const target = new Date(Date.now() + 3 * 24 * 60 * 60 * 1000);
-    const { item, version } = await createContent({ status: "APPROVED", scheduledAt: original });
+    const { item, version } = await createContent({ status: "SCHEDULED", scheduledAt: original });
     await db.approval.create({
       data: {
         clientId: fixture.client.id,
@@ -121,7 +144,7 @@ describe("calendar foundation", () => {
     });
     const job = await db.publishJob.create({ data: { clientId: fixture.client.id, contentVersionId: version.id, accountId: fixture.account.id, idempotencyKey: randomUUID(), adapter: "mock", nextAttemptAt: original } });
     expect(await listCalendarEntries(fixture.context, { platform: "linkedin" })).toHaveLength(0);
-    expect(await listCalendarEntries(fixture.context, { platform: "facebook", status: "APPROVED" })).toHaveLength(1);
+    expect(await listCalendarEntries(fixture.context, { platform: "facebook", status: "SCHEDULED" })).toEqual([expect.objectContaining({ id: item.id, reschedulable: true })]);
     await rescheduleCalendarItems(fixture.context, { contentItemIds: [item.id], scheduledAt: target });
     expect((await db.contentItem.findUniqueOrThrow({ where: { id: item.id } })).scheduledAt?.toISOString()).toBe(target.toISOString());
     expect((await db.publishJob.findUniqueOrThrow({ where: { id: job.id } })).nextAttemptAt.toISOString()).toBe(target.toISOString());
@@ -132,6 +155,47 @@ describe("calendar foundation", () => {
     await expect(rescheduleCalendarItems(fixture.context, { contentItemIds: [item.id], scheduledAt: new Date(Date.now() + 86400000) })).rejects.toMatchObject({ code: "CALENDAR_ITEM_LOCKED" });
     const other = await makeFixture();
     await expect(rescheduleCalendarItems(other.context, { contentItemIds: [item.id], scheduledAt: new Date(Date.now() + 86400000) })).rejects.toMatchObject({ code: "CONTENT_SCOPE_VIOLATION" });
+  });
+
+  it("does not create a schedule or bypass a revoked human approval", async () => {
+    const approvedOnly = await createContent({ status: "APPROVED" });
+    await expect(rescheduleCalendarItems(fixture.context, { contentItemIds: [approvedOnly.item.id], scheduledAt: new Date(Date.now() + 86400000) })).rejects.toMatchObject({ code: "CALENDAR_ITEM_NOT_RESCHEDULABLE" });
+
+    const scheduledAt = new Date(Date.now() + 2 * 86400000);
+    const scheduled = await createContent({ status: "SCHEDULED", scheduledAt });
+    await db.approval.createMany({ data: [
+      { clientId: fixture.client.id, contentVersionId: scheduled.version.id, accountId: fixture.account.id, reviewerId: fixture.context.userId, decision: "APPROVED", createdAt: new Date(Date.now() - 1000) },
+      { clientId: fixture.client.id, contentVersionId: scheduled.version.id, accountId: fixture.account.id, reviewerId: fixture.context.userId, decision: "REJECTED", createdAt: new Date() },
+    ] });
+    await db.publishJob.create({ data: { clientId: fixture.client.id, contentVersionId: scheduled.version.id, accountId: fixture.account.id, idempotencyKey: randomUUID(), adapter: "mock", nextAttemptAt: scheduledAt } });
+    await expect(rescheduleCalendarItems(fixture.context, { contentItemIds: [scheduled.item.id], scheduledAt: new Date(Date.now() + 3 * 86400000) })).rejects.toMatchObject({ code: "APPROVAL_REQUIRED" });
+  });
+
+  it("rolls back a move when a concurrent claim changes the existing job state", async () => {
+    const original = new Date(Date.now() + 2 * 86400000);
+    const target = new Date(Date.now() + 3 * 86400000);
+    const { item, version } = await createContent({ status: "SCHEDULED", scheduledAt: original });
+    await db.approval.create({ data: { clientId: fixture.client.id, contentVersionId: version.id, accountId: fixture.account.id, reviewerId: fixture.context.userId, decision: "APPROVED" } });
+    const job = await db.publishJob.create({ data: { clientId: fixture.client.id, contentVersionId: version.id, accountId: fixture.account.id, idempotencyKey: randomUUID(), adapter: "mock", nextAttemptAt: original } });
+    let releaseClaim!: () => void;
+    let claimLocked!: () => void;
+    const claimCanFinish = new Promise<void>((resolve) => { releaseClaim = resolve; });
+    const claimHasLock = new Promise<void>((resolve) => { claimLocked = resolve; });
+    const claim = db.$transaction(async (tx) => {
+      await tx.$queryRaw`SELECT "id" FROM "PublishJob" WHERE "id" = ${job.id} FOR UPDATE`;
+      claimLocked();
+      await claimCanFinish;
+      await tx.publishJob.update({ where: { id: job.id }, data: { status: "RUNNING" } });
+    });
+    await claimHasLock;
+    const move = expect(rescheduleCalendarItems(fixture.context, { contentItemIds: [item.id], scheduledAt: target }))
+      .rejects.toMatchObject({ code: expect.stringMatching(/^(CALENDAR_JOB_LOCKED|PUBLISH_JOB_REQUIRED)$/) });
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    releaseClaim();
+    await claim;
+    await move;
+    expect((await db.contentItem.findUniqueOrThrow({ where: { id: item.id } })).scheduledAt?.toISOString()).toBe(original.toISOString());
+    expect((await db.publishJob.findUniqueOrThrow({ where: { id: job.id } })).nextAttemptAt.toISOString()).toBe(original.toISOString());
   });
 });
 
@@ -185,5 +249,16 @@ describe("notifications foundation", () => {
     expect(result.deliveries.map((delivery) => delivery.status).sort()).toEqual(["DELIVERED", "FAILED"]);
     expect(await db.inAppNotification.count({ where: { id: result.notification.id } })).toBe(1);
     expect(await db.notificationDelivery.count({ where: { notificationId: result.notification.id } })).toBe(2);
+  });
+
+  it("rejects an endpoint changed to HTTP after channel verification without calling transport", async () => {
+    process.env.TEST_HTTP_ENDPOINT = "http://notify.example.test/webhook";
+    await db.notificationChannel.create({ data: { clientId: fixture.client.id, type: "WEBHOOK", displayName: "Changed endpoint", credentialRef: "env:TEST_HTTP_ENDPOINT", status: "VERIFIED" } });
+    await upsertNotificationRule(fixture.context, { eventType: "PUBLISH_FAILED", severity: "NORMAL", channelType: "WEBHOOK", enabled: true, cooldownMinutes: 0 });
+    let called = false;
+    const result = await createAndDispatchNotification(fixture.context, { eventType: "PUBLISH_FAILED", title: "Failed", body: "Investigate" }, async () => { called = true; });
+    expect(called).toBe(false);
+    expect(result.deliveries).toEqual([expect.objectContaining({ status: "FAILED", lastError: "Channel endpoint must be an HTTPS URL" })]);
+    expect(await db.inAppNotification.count({ where: { id: result.notification.id } })).toBe(1);
   });
 });
