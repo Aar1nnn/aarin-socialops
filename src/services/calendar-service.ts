@@ -111,8 +111,16 @@ export async function rescheduleCalendarItems(context: RequestContext, raw: unkn
     }
     for (const item of items) {
       const job = item.currentVersion!.publishJobs.find((candidate) => candidate.accountId === item.accountId && activeJobStatuses.includes(candidate.status))!;
-      await tx.contentItem.update({ where: { id: item.id }, data: { scheduledAt: input.scheduledAt } });
-      await tx.publishJob.update({ where: { id: job.id }, data: { nextAttemptAt: input.scheduledAt } });
+      const movedItem = await tx.contentItem.updateMany({
+        where: { id: item.id, clientId: context.clientId, status: ContentStatus.SCHEDULED, currentVersionId: item.currentVersionId, accountId: item.accountId },
+        data: { scheduledAt: input.scheduledAt },
+      });
+      if (movedItem.count !== 1) throw new AppError(`内容 ${item.id} 的排期状态已变化。`, 409, "CALENDAR_ITEM_LOCKED");
+      const movedJob = await tx.publishJob.updateMany({
+        where: { id: job.id, clientId: context.clientId, contentVersionId: item.currentVersionId!, accountId: item.accountId, status: { in: activeJobStatuses } },
+        data: { nextAttemptAt: input.scheduledAt },
+      });
+      if (movedJob.count !== 1) throw new AppError(`内容 ${item.id} 的发布任务状态已变化。`, 409, "CALENDAR_JOB_LOCKED");
     }
     await tx.auditLog.create({
       data: {

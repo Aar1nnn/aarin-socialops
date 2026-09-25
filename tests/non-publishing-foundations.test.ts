@@ -42,6 +42,7 @@ beforeEach(async () => { fixture = await makeFixture(); });
 afterEach(async () => {
   delete process.env.TEST_WEBHOOK_ENDPOINT;
   delete process.env.TEST_EMAIL_ENDPOINT;
+  delete process.env.TEST_HTTP_ENDPOINT;
   for (const clientId of clientIds.splice(0)) await db.client.deleteMany({ where: { id: clientId } });
   for (const userId of userIds.splice(0)) await db.user.deleteMany({ where: { id: userId } });
 });
@@ -161,6 +162,33 @@ describe("calendar foundation", () => {
     await db.publishJob.create({ data: { clientId: fixture.client.id, contentVersionId: scheduled.version.id, accountId: fixture.account.id, idempotencyKey: randomUUID(), adapter: "mock", nextAttemptAt: scheduledAt } });
     await expect(rescheduleCalendarItems(fixture.context, { contentItemIds: [scheduled.item.id], scheduledAt: new Date(Date.now() + 3 * 86400000) })).rejects.toMatchObject({ code: "APPROVAL_REQUIRED" });
   });
+
+  it("rolls back a move when a concurrent claim changes the existing job state", async () => {
+    const original = new Date(Date.now() + 2 * 86400000);
+    const target = new Date(Date.now() + 3 * 86400000);
+    const { item, version } = await createContent({ status: "SCHEDULED", scheduledAt: original });
+    await db.approval.create({ data: { clientId: fixture.client.id, contentVersionId: version.id, accountId: fixture.account.id, reviewerId: fixture.context.userId, decision: "APPROVED" } });
+    const job = await db.publishJob.create({ data: { clientId: fixture.client.id, contentVersionId: version.id, accountId: fixture.account.id, idempotencyKey: randomUUID(), adapter: "mock", nextAttemptAt: original } });
+    let releaseClaim!: () => void;
+    let claimLocked!: () => void;
+    const claimCanFinish = new Promise<void>((resolve) => { releaseClaim = resolve; });
+    const claimHasLock = new Promise<void>((resolve) => { claimLocked = resolve; });
+    const claim = db.$transaction(async (tx) => {
+      await tx.$queryRaw`SELECT "id" FROM "PublishJob" WHERE "id" = ${job.id} FOR UPDATE`;
+      claimLocked();
+      await claimCanFinish;
+      await tx.publishJob.update({ where: { id: job.id }, data: { status: "RUNNING" } });
+    });
+    await claimHasLock;
+    const move = expect(rescheduleCalendarItems(fixture.context, { contentItemIds: [item.id], scheduledAt: target }))
+      .rejects.toMatchObject({ code: expect.stringMatching(/^(CALENDAR_JOB_LOCKED|PUBLISH_JOB_REQUIRED)$/) });
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    releaseClaim();
+    await claim;
+    await move;
+    expect((await db.contentItem.findUniqueOrThrow({ where: { id: item.id } })).scheduledAt?.toISOString()).toBe(original.toISOString());
+    expect((await db.publishJob.findUniqueOrThrow({ where: { id: job.id } })).nextAttemptAt.toISOString()).toBe(original.toISOString());
+  });
 });
 
 describe("analytics foundation", () => {
@@ -211,5 +239,15 @@ describe("notifications foundation", () => {
     expect(result.deliveries.map((delivery) => delivery.status).sort()).toEqual(["DELIVERED", "FAILED"]);
     expect(await db.inAppNotification.count({ where: { id: result.notification.id } })).toBe(1);
     expect(await db.notificationDelivery.count({ where: { notificationId: result.notification.id } })).toBe(2);
+  });
+
+  it("rejects an endpoint changed to HTTP after channel verification without calling transport", async () => {
+    process.env.TEST_HTTP_ENDPOINT = "http://notify.example.test/webhook";
+    await db.notificationChannel.create({ data: { clientId: fixture.client.id, type: "WEBHOOK", displayName: "Changed endpoint", credentialRef: "env:TEST_HTTP_ENDPOINT", status: "VERIFIED" } });
+    let called = false;
+    const result = await createAndDispatchNotification(fixture.context, { eventType: "PUBLISH_FAILED", title: "Failed", body: "Investigate" }, async () => { called = true; });
+    expect(called).toBe(false);
+    expect(result.deliveries).toEqual([expect.objectContaining({ status: "FAILED", lastError: "Channel endpoint must be an HTTPS URL" })]);
+    expect(await db.inAppNotification.count({ where: { id: result.notification.id } })).toBe(1);
   });
 });
