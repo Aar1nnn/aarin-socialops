@@ -2,6 +2,7 @@ import { z } from "zod";
 import type { DraftGenerationInput, DraftGenerationResult, TextGenerationAdapter } from "../lib/adapters/types";
 import type { RequestContext } from "../lib/context";
 import { generatedDraftsSchema } from "../lib/contracts";
+import { AppError } from "../lib/errors";
 import { buildContentEngineMemory } from "./memory-service";
 
 export const contentStrategySchema = z.object({
@@ -115,6 +116,12 @@ export async function runPreparedAIContentPipeline(
   const strategy = contentStrategySchema.parse(input.strategy);
   const generated = await adapter.generate(input);
   generated.output = generatedDraftsSchema.parse(generated.output);
+  const confirmedFactKeys = new Set(input.confirmedFacts.map((fact) => fact.key));
+  const unconfirmedUsedKeys = [...new Set(generated.output.drafts.flatMap((draft) => draft.usedFactKeys)
+    .filter((key) => !confirmedFactKeys.has(key)))];
+  if (unconfirmedUsedKeys.length) {
+    throw new AppError(`AI used unconfirmed fact keys: ${unconfirmedUsedKeys.join(", ")}`, 422, "AI_UNCONFIRMED_FACT_USED");
+  }
   const reviews = generated.output.drafts.map((draft) => reviewDraft(input, draft));
   const drafts = generated.output.drafts.map((draft) => ({
     ...draft,

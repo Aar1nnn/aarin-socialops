@@ -125,3 +125,21 @@ All schema changes are additive and delivered by one forward migration.
 - No OAuth, TokenVault, worker dispatch, publish retry, or reconciliation changes.
 - No direct external social publishing.
 - No dependency additions or upgrades.
+
+## PR #6 convergence addendum (2026-09-23)
+
+- PR #3, PR #4, and PR #5 are now merged into `main`. PR #6 was reconciled with `origin/main` in merge commit `4e4e00a` without rebasing or force-pushing.
+- All duplicate PR #6 schema, migration, service, page, and test implementations were removed during convergence. The merge commit's file tree matched `origin/main` before incremental fixes were applied.
+- PR #6 is now limited to defect-prevention increments: hard rejection of AI-declared unconfirmed fact keys, a locked product-version recheck before generated content persistence, Calendar reschedule enforcement for existing scheduled/approved/current-version jobs, HTTPS-only notification endpoint configuration, redirect rejection, and regression tests.
+- No Facebook/Instagram publisher, OAuth, provider adapter, worker, retry, or reconciliation behavior is changed by the incremental diff.
+
+### Addendum verification
+
+- `node node_modules/prisma/build/index.js validate`: PASS.
+- `pnpm typecheck`: PASS.
+- `pnpm build`: PASS, 33 application routes/pages.
+- Database-independent Vitest selection: PASS, 15 files / 86 tests.
+- `tests/ai-content-pipeline-safety.test.ts`: PASS, 1 test.
+- Database-backed tests: attempted but blocked before assertions because Docker Desktop could not keep its Linux engine running; PostgreSQL at `localhost:54329` was unreachable. Host logs first showed a stale Model Runner socket and, after disabling Docker AI, a Docker resume/cgroup failure.
+- GitHub Actions PR #6 `verify`: PASS. The CI PostgreSQL job completed install, Prisma generate/migrate, seed twice, migrate status, typecheck, the full test suite, and production build.
+- `git diff --check`: PASS before and after final staging.
