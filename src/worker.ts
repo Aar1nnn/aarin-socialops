@@ -1,5 +1,6 @@
 import { db } from "./lib/db";
 import { claimNextJob, processPublishJob, recoverStaleJobs } from "./services/publish-worker-service";
+import { dispatchPendingNotificationDeliveries } from "./services/notification-service";
 import { safeErrorMessage } from "./lib/token-vault";
 
 const once = process.argv.includes("--once");
@@ -11,7 +12,8 @@ async function tick() {
   await recoverStaleJobs(lockTimeout);
   const job = await claimNextJob(workerId);
   if (job) await processPublishJob(job.id);
-  return Boolean(job);
+  const notificationDeliveries = await dispatchPendingNotificationDeliveries(5);
+  return Boolean(job || notificationDeliveries.length);
 }
 
 async function main() {

@@ -142,7 +142,7 @@ export async function updateProductFacts(context: RequestContext, productId: str
         plan: { productId },
         status: { notIn: [ContentStatus.PUBLISHED, ContentStatus.CANCELLED] },
       },
-      data: { status: ContentStatus.CHANGES_REQUESTED },
+      data: { status: ContentStatus.CHANGES_REQUESTED, scheduledAt: null },
     });
     const cancelledJobs = await tx.publishJob.updateMany({
       where: {

@@ -979,6 +979,8 @@ model NotificationDelivery {
   attemptCount   Int                        @default(0)
   lastError      String?
   deliveredAt    DateTime?
+  lockedAt       DateTime?
+  lockedBy       String?
   createdAt      DateTime                   @default(now())
   updatedAt      DateTime                   @updatedAt
   client         Client                     @relation(fields: [clientId], references: [id], onDelete: Cascade)
@@ -987,6 +989,7 @@ model NotificationDelivery {
 
   @@index([notificationId, channelId, createdAt])
   @@index([clientId, status, updatedAt])
+  @@index([status, lockedAt, createdAt])
 }
 
 model IntegrationConfig {

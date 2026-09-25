@@ -14,7 +14,7 @@ import {
   confirmBrandAutofill,
   createBrandAutofillDraft,
 } from "../src/services/brand-autofill-service";
-import { getBrandProfile } from "../src/services/brand-service";
+import { getBrandProfile, upsertBrandProfile } from "../src/services/brand-service";
 import {
   compareContentVersions,
   regeneratePlatformVariant,
@@ -241,6 +241,45 @@ describe("brand autofill", () => {
     expect(confirmed.profile.audience).toBe("Confirmed audience");
     expect(confirmed.profile.tone).toBeNull();
     expect(confirmed.profile.goals).toEqual(["Leads"]);
+  });
+
+  it("serializes concurrent reviewers accepting different brand fields", async () => {
+    const reviewer = await db.user.create({ data: { email: `phase-a-reviewer-${randomUUID()}@example.local`, displayName: "Phase A Reviewer", passwordHash: "unused" } });
+    userIds.push(reviewer.id);
+    await db.clientMembership.create({ data: { clientId: fixture.client.id, userId: reviewer.id, role: "OPERATOR" } });
+    const reviewerContext: RequestContext = { clientId: fixture.client.id, userId: reviewer.id, role: "OPERATOR" };
+
+    await Promise.all([
+      confirmBrandAutofill(fixture.context, {
+        suggestions: { audience: "Wholesale distributors" },
+        acceptedFields: ["audience"],
+      }),
+      confirmBrandAutofill(reviewerContext, {
+        suggestions: { tone: "Practical and precise" },
+        acceptedFields: ["tone"],
+      }),
+    ]);
+
+    expect(await getBrandProfile(fixture.context)).toMatchObject({
+      audience: "Wholesale distributors",
+      tone: "Practical and precise",
+    });
+    expect(await db.auditLog.count({ where: { clientId: fixture.client.id, action: "BRAND_PROFILE_UPDATED" } })).toBe(2);
+  });
+
+  it("uses the same tenant lock for autofill confirmation and manual brand updates", async () => {
+    await Promise.all([
+      confirmBrandAutofill(fixture.context, {
+        suggestions: { audience: "Confirmed distributor audience" },
+        acceptedFields: ["audience"],
+      }),
+      upsertBrandProfile(fixture.context, { tone: "Manually saved tone" }),
+    ]);
+
+    expect(await getBrandProfile(fixture.context)).toMatchObject({
+      audience: "Confirmed distributor audience",
+      tone: "Manually saved tone",
+    });
   });
 
   it("keeps confirmation tenant scoped", async () => {

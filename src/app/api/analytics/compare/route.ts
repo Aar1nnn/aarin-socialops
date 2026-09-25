@@ -7,7 +7,7 @@ export async function POST(request: Request) {
   try {
     const context = await requireContext();
     const body = await requestData(request);
-    if (body.type === "posts" && Array.isArray(body.ids)) return Response.json(await comparePosts(context, body.ids.map(String)));
+    if (body.type === "posts" && Array.isArray(body.ids)) return Response.json(await comparePosts(context, body.ids));
     if (body.type === "accounts" && Array.isArray(body.ids) && canonicalMetricKeys.includes(body.metric as never)) {
       return Response.json(await compareAccounts(context, body.ids.map(String), body.metric as never, body.from ? new Date(String(body.from)) : undefined, body.to ? new Date(String(body.to)) : undefined));
     }

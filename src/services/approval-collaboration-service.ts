@@ -66,7 +66,7 @@ export async function requestContentChanges(context: RequestContext, contentItem
       },
       data: { status: PublishJobStatus.CANCELLED, lastErrorCode: "APPROVAL_REVOKED" },
     });
-    await tx.contentItem.update({ where: { id: item.id }, data: { status: ContentStatus.CHANGES_REQUESTED } });
+    await tx.contentItem.update({ where: { id: item.id }, data: { status: ContentStatus.CHANGES_REQUESTED, scheduledAt: null } });
     await recordDomainEvent(context, {
       type: "CHANGES_REQUESTED",
       entityType: "ContentVersion",

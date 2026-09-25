@@ -3,6 +3,7 @@ import { z } from "zod";
 import { db } from "../lib/db";
 import type { RequestContext } from "../lib/context";
 import { AppError } from "../lib/errors";
+import { assertValidTimeZone } from "../lib/timezone";
 
 export const canonicalMetricKeys = [
   "impressions", "reach", "views", "video_views", "watch_time",
@@ -29,8 +30,8 @@ const aliases: Record<string, CanonicalMetricKey> = {
 };
 
 export function canonicalizeMetricKey(raw: string): { key: CanonicalMetricKey | null; postId: string | null } {
-  const [base, ...rest] = raw.toLocaleLowerCase().split(":");
-  const normalized = base.replace(/^(real_|mock_)/, "");
+  const [base, ...rest] = raw.split(":");
+  const normalized = base.toLocaleLowerCase().replace(/^(real_|mock_)/, "");
   const direct = canonicalMetricKeys.includes(normalized as CanonicalMetricKey) ? normalized as CanonicalMetricKey : aliases[normalized] || null;
   return { key: direct, postId: rest.length ? rest.join(":") : null };
 }
@@ -216,6 +217,12 @@ export function selectLatestMetricSnapshots<T extends Pick<MetricSnapshot, "metr
   return [...latest.values()];
 }
 
+type PublishedPostIdentity = { accountId: string; remotePostId: string };
+
+function publishedPostMetricKey(identity: PublishedPostIdentity, metric: CanonicalMetricKey) {
+  return JSON.stringify([identity.accountId, identity.remotePostId, metric]);
+}
+
 export async function queryAnalyticsMetrics(context: RequestContext, raw: unknown = {}) {
   const input = analyticsQuerySchema.parse(raw);
   if (input.from && input.to && input.from >= input.to) throw new AppError("Analytics date range is invalid.", 400, "INVALID_DATE_RANGE");
@@ -223,10 +230,13 @@ export async function queryAnalyticsMetrics(context: RequestContext, raw: unknow
     const account = await db.socialAccount.findFirst({ where: { id: input.accountId, clientId: context.clientId }, select: { id: true } });
     if (!account) throw new AppError("账号不存在或无权访问。", 404, "ACCOUNT_NOT_FOUND");
   }
-  const remotePostIds = input.contentItemId
-    ? (await db.publishJob.findMany({ where: { clientId: context.clientId, contentVersion: { contentItemId: input.contentItemId } }, select: { remotePostId: true } })).map((job) => job.remotePostId).filter((id): id is string => Boolean(id))
+  const publishedPosts = input.contentItemId
+    ? (await db.publishJob.findMany({
+      where: { clientId: context.clientId, contentVersion: { contentItemId: input.contentItemId }, remotePostId: { not: null } },
+      select: { accountId: true, remotePostId: true },
+    })).map((job) => ({ accountId: job.accountId, remotePostId: job.remotePostId! }))
     : null;
-  if (input.contentItemId && remotePostIds?.length === 0) {
+  if (input.contentItemId && publishedPosts?.length === 0) {
     const item = await db.contentItem.findFirst({ where: { id: input.contentItemId, clientId: context.clientId }, select: { id: true } });
     if (!item) throw new AppError("内容不存在或无权访问。", 404, "CONTENT_NOT_FOUND");
     return [];
@@ -237,14 +247,22 @@ export async function queryAnalyticsMetrics(context: RequestContext, raw: unknow
       ...(input.from || input.to ? { fetchedAt: { ...(input.from ? { gte: input.from } : {}), ...(input.to ? { lt: input.to } : {}) } } : {}),
       ...(input.accountId ? { accountId: input.accountId } : {}),
       ...(input.platform ? { account: { platform: input.platform } } : {}),
-      ...(remotePostIds ? { OR: remotePostIds.map((postId) => ({ metricKey: { endsWith: `:${postId}` } })) } : {}),
+      ...(publishedPosts ? {
+        OR: publishedPosts.map(({ accountId, remotePostId }) => ({ accountId, metricKey: { endsWith: `:${remotePostId}` } })),
+      } : {}),
     },
     include: { account: { select: { id: true, platform: true, displayName: true } } },
     orderBy: [{ fetchedAt: "desc" }, { id: "desc" }],
   });
+  const publishedPostKeys = publishedPosts
+    ? new Set(publishedPosts.map(({ accountId, remotePostId }) => JSON.stringify([accountId, remotePostId])))
+    : null;
   const canonical = snapshots
     .map((snapshot) => ({ ...snapshot, canonical: canonicalizeMetricKey(snapshot.metricKey) }))
-    .filter((snapshot) => snapshot.canonical.key && (!input.metric || snapshot.canonical.key === input.metric));
+    .filter((snapshot) => snapshot.canonical.key
+      && (!input.metric || snapshot.canonical.key === input.metric)
+      && (!publishedPostKeys || (snapshot.canonical.postId !== null
+        && publishedPostKeys.has(JSON.stringify([snapshot.accountId, snapshot.canonical.postId])))));
   return input.latestOnly ? selectLatestMetricSnapshots(canonical) : canonical;
 }
 
@@ -275,22 +293,38 @@ export async function getContentPerformance(context: RequestContext, raw: unknow
     },
     orderBy: [{ publishedAt: "desc" }, { createdAt: "desc" }],
   });
-  const postIds = jobs.map((job) => job.remotePostId!).filter(Boolean);
-  const snapshots = postIds.length
-    ? await db.metricSnapshot.findMany({ where: { clientId: context.clientId, OR: postIds.map((postId) => ({ metricKey: { endsWith: `:${postId}` } })) }, orderBy: { fetchedAt: "desc" } })
+  const publishedPosts = jobs.map((job) => ({ accountId: job.accountId, remotePostId: job.remotePostId! }));
+  const snapshots = publishedPosts.length
+    ? await db.metricSnapshot.findMany({
+      where: {
+        clientId: context.clientId,
+        OR: publishedPosts.map(({ accountId, remotePostId }) => ({ accountId, metricKey: { endsWith: `:${remotePostId}` } })),
+      },
+      orderBy: { fetchedAt: "desc" },
+    })
     : [];
   const latest = selectLatestMetricSnapshots(snapshots);
-  const metricMap = new Map<string, number | null>();
+  const metricMap = new Map<string, { value: number | null; fetchedAt: Date }>();
   for (const snapshot of latest) {
     const canonical = canonicalizeMetricKey(snapshot.metricKey);
-    if (canonical.key && canonical.postId) metricMap.set(`${canonical.postId}:${canonical.key}`, snapshot.availability === "AVAILABLE" && snapshot.numericValue !== null ? Number(snapshot.numericValue) : null);
+    if (canonical.key && canonical.postId) {
+      const key = publishedPostMetricKey({ accountId: snapshot.accountId, remotePostId: canonical.postId }, canonical.key);
+      const current = metricMap.get(key);
+      if (!current || current.fetchedAt < snapshot.fetchedAt) {
+        metricMap.set(key, {
+          value: snapshot.availability === "AVAILABLE" && snapshot.numericValue !== null ? Number(snapshot.numericValue) : null,
+          fetchedAt: snapshot.fetchedAt,
+        });
+      }
+    }
   }
   const rows = jobs.map((job) => {
     const postId = job.remotePostId!;
-    const reach = metricMap.get(`${postId}:reach`) ?? null;
-    const views = metricMap.get(`${postId}:views`) ?? metricMap.get(`${postId}:video_views`) ?? null;
-    const engagement = metricMap.get(`${postId}:engagement`) ?? null;
-    const explicitRate = metricMap.get(`${postId}:engagement_rate`);
+    const identity = { accountId: job.accountId, remotePostId: postId };
+    const reach = metricMap.get(publishedPostMetricKey(identity, "reach"))?.value ?? null;
+    const views = metricMap.get(publishedPostMetricKey(identity, "views"))?.value ?? metricMap.get(publishedPostMetricKey(identity, "video_views"))?.value ?? null;
+    const engagement = metricMap.get(publishedPostMetricKey(identity, "engagement"))?.value ?? null;
+    const explicitRate = metricMap.get(publishedPostMetricKey(identity, "engagement_rate"))?.value;
     const engagementRate = explicitRate !== undefined ? explicitRate : engagement !== null && reach && reach > 0 ? engagement / reach : null;
     return {
       contentItemId: job.contentVersion.contentItemId,
@@ -313,16 +347,51 @@ export async function getContentPerformance(context: RequestContext, raw: unknow
     const leftValue = left[field] ?? Number.NEGATIVE_INFINITY;
     const rightValue = right[field] ?? Number.NEGATIVE_INFINITY;
     const delta = Number(leftValue) - Number(rightValue);
-    return (input.direction === "asc" ? delta : -delta) || left.remotePostId.localeCompare(right.remotePostId);
+    return (input.direction === "asc" ? delta : -delta)
+      || left.remotePostId.localeCompare(right.remotePostId)
+      || left.account.id.localeCompare(right.account.id);
   });
 }
 
-export async function comparePosts(context: RequestContext, postIds: string[]) {
-  const uniqueIds = [...new Set(postIds)];
-  if (uniqueIds.length < 2 || uniqueIds.length > 20) throw new AppError("Provide between 2 and 20 post ids.", 400, "INVALID_COMPARISON_SET");
+const postComparisonReferenceSchema = z.union([
+  z.string().trim().min(1),
+  z.object({ accountId: z.string().min(1), remotePostId: z.string().trim().min(1) }).strict(),
+]);
+
+type PostComparisonReference = z.infer<typeof postComparisonReferenceSchema>;
+
+function postComparisonReferenceKey(reference: PostComparisonReference) {
+  return typeof reference === "string"
+    ? JSON.stringify(["legacy", reference])
+    : JSON.stringify(["exact", reference.accountId, reference.remotePostId]);
+}
+
+export async function comparePosts(context: RequestContext, raw: unknown) {
+  const parsed = z.array(postComparisonReferenceSchema).min(2).max(20).safeParse(raw);
+  if (!parsed.success) throw new AppError("Provide between 2 and 20 valid post identities.", 400, "INVALID_COMPARISON_SET");
+  const references = [...new Map(parsed.data.map((reference) => [postComparisonReferenceKey(reference), reference])).values()];
+  if (references.length < 2) throw new AppError("Provide between 2 and 20 distinct post identities.", 400, "INVALID_COMPARISON_SET");
   const rows = await getContentPerformance(context);
-  const selected = rows.filter((row) => uniqueIds.includes(row.remotePostId));
-  if (selected.length !== uniqueIds.length) throw new AppError("One or more posts are missing or outside the tenant.", 404, "POST_NOT_FOUND");
+  const selected = [] as typeof rows;
+  const selectedIdentities = new Set<string>();
+  for (const reference of references) {
+    const matches = rows.filter((row) => typeof reference === "string"
+      ? row.remotePostId === reference
+      : row.account.id === reference.accountId && row.remotePostId === reference.remotePostId);
+    if (matches.length === 0) throw new AppError("One or more posts are missing or outside the tenant.", 404, "POST_NOT_FOUND");
+    if (matches.length > 1) {
+      throw new AppError(
+        "The remote post id is ambiguous. Provide accountId and remotePostId.",
+        409,
+        "AMBIGUOUS_POST_ID",
+      );
+    }
+    const match = matches[0];
+    const identityKey = JSON.stringify([match.account.id, match.remotePostId]);
+    if (selectedIdentities.has(identityKey)) throw new AppError("Provide distinct post identities.", 400, "INVALID_COMPARISON_SET");
+    selectedIdentities.add(identityKey);
+    selected.push(match);
+  }
   return selected;
 }
 
@@ -333,13 +402,22 @@ export async function compareAccounts(context: RequestContext, accountIds: strin
   if (accounts.length !== uniqueIds.length) throw new AppError("One or more accounts are missing or outside the tenant.", 404, "ACCOUNT_NOT_FOUND");
   return Promise.all(accounts.map(async (account) => {
     const metrics = await queryAnalyticsMetrics(context, { accountId: account.id, metric, from, to, latestOnly: false });
-    const available = selectLatestMetricSnapshots(metrics).filter((snapshot) => snapshot.availability === "AVAILABLE" && snapshot.numericValue !== null);
+    const available = selectLatestMetricSnapshots(metrics).filter((snapshot) => (
+      snapshot.canonical.postId === null
+      && snapshot.availability === "AVAILABLE"
+      && snapshot.numericValue !== null
+    ));
     return { account, metric, value: available.length ? available.reduce((sum, snapshot) => sum + Number(snapshot.numericValue), 0) : null, sampleSize: available.length };
   }));
 }
 
 export async function analyzePerformancePatterns(context: RequestContext, raw: unknown) {
   const input = z.object({ dimension: z.enum(["media_type", "content_theme", "product", "platform", "publish_day", "publish_hour"]), metric: z.enum(["reach", "views", "engagement", "engagement_rate"]), minimumSampleSize: z.number().int().min(2).max(100).default(3) }).parse(raw);
+  const client = await db.client.findUnique({ where: { id: context.clientId }, select: { timezone: true } });
+  if (!client) throw new AppError("客户不存在或无权访问。", 404, "CLIENT_NOT_FOUND");
+  assertValidTimeZone(client.timezone);
+  const publishDay = new Intl.DateTimeFormat("en-US", { weekday: "long", timeZone: client.timezone });
+  const publishHour = new Intl.DateTimeFormat("en-US", { hour: "2-digit", hourCycle: "h23", timeZone: client.timezone });
   const rows = await getContentPerformance(context);
   const groups = new Map<string, number[]>();
   for (const row of rows) {
@@ -347,14 +425,14 @@ export async function analyzePerformancePatterns(context: RequestContext, raw: u
       : input.dimension === "content_theme" ? row.theme
         : input.dimension === "product" ? row.product?.name || "UNASSIGNED"
           : input.dimension === "platform" ? row.platform
-            : input.dimension === "publish_day" ? new Intl.DateTimeFormat("en-US", { weekday: "long", timeZone: "UTC" }).format(row.publishTime)
-              : String(row.publishTime.getUTCHours());
+            : input.dimension === "publish_day" ? publishDay.format(row.publishTime)
+              : publishHour.formatToParts(row.publishTime).find((part) => part.type === "hour")?.value || "00";
     const value = input.metric === "engagement_rate" ? row.engagementRate : row[input.metric];
     if (value !== null) groups.set(key, [...(groups.get(key) || []), Number(value)]);
   }
   return [...groups.entries()].map(([group, values]) => values.length < input.minimumSampleSize
-    ? { group, metric: input.metric, sampleSize: values.length, status: "INSUFFICIENT_DATA" as const, average: null }
-    : { group, metric: input.metric, sampleSize: values.length, status: "AVAILABLE" as const, average: values.reduce((sum, value) => sum + value, 0) / values.length });
+    ? { group, metric: input.metric, sampleSize: values.length, status: "INSUFFICIENT_DATA" as const, average: null, timezone: client.timezone }
+    : { group, metric: input.metric, sampleSize: values.length, status: "AVAILABLE" as const, average: values.reduce((sum, value) => sum + value, 0) / values.length, timezone: client.timezone });
 }
 
 export async function getAnalyticsDataHealth(context: RequestContext, now = new Date()) {
@@ -366,8 +444,19 @@ export async function getAnalyticsDataHealth(context: RequestContext, now = new 
   const syncStates = await db.analyticsSyncState.findMany({ where: { clientId: context.clientId } });
   return accounts.map((account) => {
     const sync = syncStates.find((state) => state.accountId === account.id && state.scope === "metrics");
-    const latest = account.metricSnapshots[0] || null;
-    const availability = account.metricSnapshots.map((snapshot) => snapshot.availability);
+    const latestByDimension = new Map<string, (typeof account.metricSnapshots)[number]>();
+    for (const snapshot of account.metricSnapshots) {
+      const canonical = canonicalizeMetricKey(snapshot.metricKey);
+      const dimensionKey = JSON.stringify([snapshot.accountId, canonical.key || snapshot.metricKey, canonical.postId || "account"]);
+      const current = latestByDimension.get(dimensionKey);
+      if (!current || current.fetchedAt < snapshot.fetchedAt) latestByDimension.set(dimensionKey, snapshot);
+    }
+    const currentSnapshots = [...latestByDimension.values()];
+    const latest = currentSnapshots.reduce<(typeof currentSnapshots)[number] | null>(
+      (current, snapshot) => !current || current.fetchedAt < snapshot.fetchedAt ? snapshot : current,
+      null,
+    );
+    const availability = currentSnapshots.map((snapshot) => snapshot.availability);
     const status = sync?.status === "SYNCING" ? "syncing"
       : sync?.status === "FAILED" ? "failed"
         : availability.includes("PERMISSION_DENIED") ? "permission_denied"

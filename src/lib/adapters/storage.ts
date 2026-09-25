@@ -26,7 +26,8 @@ export type ExternalReadReason =
   | "SIGNED_URL_EXPIRY_UNKNOWN"
   | "SIGNED_URL_EXPIRY_INVALID"
   | "SIGNED_URL_EXPIRED"
-  | "SIGNED_URL_EXPIRES_TOO_SOON";
+  | "SIGNED_URL_EXPIRES_TOO_SOON"
+  | "STORAGE_RESOLUTION_FAILED";
 export type ExternalReadAssessment = {
   availability: MediaAvailability;
   ready: boolean;
@@ -190,6 +191,32 @@ export async function resolveStorageExternalRead(
   options: ExternalReadOptions = {},
 ) {
   return getStorageAdapter(asset.storageProvider || "local").getExternalRead(asset.storageKey, options);
+}
+
+/**
+ * Resolve the exact external-read candidate used by both asset presentation
+ * and platform publishing. Metadata URLs are validated first; configured
+ * remote storage may then issue a fresh signed URL when a stored candidate is
+ * missing or stale. The result is still only a locally validated candidate.
+ */
+export async function resolveAssetExternalRead(
+  asset: AssetExternalReadInput,
+  options: ExternalReadOptions = {},
+): Promise<ExternalReadAssessment> {
+  const assessed = assessAssetExternalRead(asset, options);
+  if (assessed.ready || !asset.storageKey || (asset.storageProvider || "local") === "local") return assessed;
+  try {
+    return await resolveStorageExternalRead(asset, options);
+  } catch {
+    return {
+      ...assessed,
+      ready: false,
+      reason: "STORAGE_RESOLUTION_FAILED",
+      message: "远端存储当前无法生成可供外部平台拉取的 HTTPS 地址。",
+      url: null,
+      expiresAt: null,
+    };
+  }
 }
 
 export function assessAssetExternalRead(asset: AssetExternalReadInput, options: ExternalReadOptions = {}): ExternalReadAssessment {

@@ -1,7 +1,7 @@
 import { AssetKind, Prisma } from "@prisma/client";
 import { z } from "zod";
 import { assertCanWrite, type RequestContext } from "../lib/context";
-import { assessAssetExternalRead, externalReadDescriptor, type MediaAvailability } from "../lib/adapters/storage";
+import { resolveAssetExternalRead, externalReadDescriptor, type MediaAvailability } from "../lib/adapters/storage";
 import { db } from "../lib/db";
 import { AppError } from "../lib/errors";
 
@@ -25,17 +25,17 @@ function metadataObject(metadata: Prisma.JsonValue | null): Prisma.JsonObject {
   return metadata && typeof metadata === "object" && !Array.isArray(metadata) ? metadata as Prisma.JsonObject : {};
 }
 
-export function classifyMediaAvailability(asset: {
+export async function classifyMediaAvailability(asset: {
   storageProvider: string;
   storageKey: string;
   metadata: Prisma.JsonValue | null;
-}): MediaAvailability {
-  return assessAssetExternalRead(asset).availability;
+}): Promise<MediaAvailability> {
+  return (await resolveAssetExternalRead(asset)).availability;
 }
 
-function presentAsset<T extends { metadata: Prisma.JsonValue | null; storageProvider: string; storageKey: string }>(asset: T, now = new Date()) {
+async function presentAsset<T extends { metadata: Prisma.JsonValue | null; storageProvider: string; storageKey: string }>(asset: T, now = new Date()) {
   const metadata = metadataObject(asset.metadata);
-  const externalRead = assessAssetExternalRead(asset, { now });
+  const externalRead = await resolveAssetExternalRead(asset, { now });
   return {
     ...asset,
     filename: "originalName" in asset ? asset.originalName : undefined,
@@ -67,7 +67,7 @@ export async function searchAssets(context: RequestContext, raw: unknown = {}) {
   const assessedAt = new Date();
   if (!input.availability) {
     const assets = await db.asset.findMany({ where, include, orderBy, take: input.limit });
-    return assets.map((asset) => presentAsset(asset, assessedAt));
+    return Promise.all(assets.map((asset) => presentAsset(asset, assessedAt)));
   }
 
   const results = [];
@@ -81,8 +81,8 @@ export async function searchAssets(context: RequestContext, raw: unknown = {}) {
       take: batchSize,
       ...(cursor ? { cursor: { id: cursor }, skip: 1 } : {}),
     });
-    for (const asset of batch) {
-      const presented = presentAsset(asset, assessedAt);
+    const presentedBatch = await Promise.all(batch.map((asset) => presentAsset(asset, assessedAt)));
+    for (const presented of presentedBatch) {
       if (presented.availability === input.availability) results.push(presented);
       if (results.length === input.limit) break;
     }
@@ -123,7 +123,7 @@ export async function detectDuplicateAsset(context: RequestContext, checksum: st
     where: { clientId: context.clientId, checksum, ...(excludeAssetId ? { id: { not: excludeAssetId } } : {}) },
     orderBy: [{ createdAt: "asc" }, { id: "asc" }],
   });
-  return duplicate ? { duplicate: true as const, asset: presentAsset(duplicate) } : { duplicate: false as const, asset: null };
+  return duplicate ? { duplicate: true as const, asset: await presentAsset(duplicate) } : { duplicate: false as const, asset: null };
 }
 
 export async function getAssetUsage(context: RequestContext, assetId: string) {
@@ -154,7 +154,7 @@ export async function getAssetUsage(context: RequestContext, assetId: string) {
     usedAt: link.createdAt,
   }));
   return {
-    asset: presentAsset(asset),
+    asset: await presentAsset(asset),
     linkedProducts: asset.productLinks.map((link) => link.product),
     linkedContent: content,
     platformUsage: Object.entries(content.reduce<Record<string, number>>((counts, entry) => ({ ...counts, [entry.platform]: (counts[entry.platform] || 0) + 1 }), {})).map(([platform, count]) => ({ platform, count })),

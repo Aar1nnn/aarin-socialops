@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { NotificationSeverity, Prisma } from "@prisma/client";
 import { z } from "zod";
 import { assertCanWrite, type RequestContext } from "../lib/context";
@@ -10,6 +11,7 @@ export const notificationEventTypes = [
 ] as const;
 export const notificationChannelTypes = ["IN_APP", "EMAIL", "WEBHOOK"] as const;
 const externalNotificationChannelTypes = ["EMAIL", "WEBHOOK"] as const;
+const defaultDeliveryLeaseSeconds = 60;
 
 const notificationEventSchema = z.object({
   eventType: z.enum(notificationEventTypes),
@@ -33,8 +35,22 @@ const inboxFilterSchema = z.object({
 });
 
 export type NotificationEvent = z.input<typeof notificationEventSchema>;
-export type ExternalNotificationPayload = { title: string; body: string; eventType: string; relatedType?: string; relatedId?: string };
-export type NotificationTransport = (input: { type: string; endpoint: string; displayName: string; payload: ExternalNotificationPayload }) => Promise<void>;
+export type ExternalNotificationPayload = {
+  title: string;
+  body: string;
+  eventType: string;
+  relatedType?: string;
+  relatedId?: string;
+  dedupeKey?: string;
+};
+export type NotificationTransport = (input: {
+  type: string;
+  endpoint: string;
+  displayName: string;
+  deliveryId: string;
+  notificationId: string;
+  payload: ExternalNotificationPayload;
+}) => Promise<void>;
 
 function resolveCredentialRef(ref: string | null) {
   if (!ref?.startsWith("env:")) return null;
@@ -53,10 +69,12 @@ function requireHttpsEndpoint(endpoint: string | null) {
   throw new Error("Channel endpoint must be an HTTPS URL");
 }
 
-const defaultTransport: NotificationTransport = async ({ type, endpoint, displayName, payload }) => {
+const defaultTransport: NotificationTransport = async ({ type, endpoint, displayName, deliveryId, notificationId, payload }) => {
   const response = await fetch(endpoint, {
-    method: "POST", headers: { "content-type": "application/json" },
-    body: JSON.stringify(type === "EMAIL" ? { channel: displayName, subject: payload.title, text: payload.body, metadata: payload } : payload),
+    method: "POST", headers: { "content-type": "application/json", "x-aarin-delivery-id": deliveryId },
+    body: JSON.stringify(type === "EMAIL"
+      ? { channel: displayName, subject: payload.title, text: payload.body, metadata: { ...payload, deliveryId, notificationId } }
+      : { ...payload, deliveryId, notificationId }),
     redirect: "error",
     signal: AbortSignal.timeout(10_000),
   });
@@ -131,16 +149,135 @@ export type PreparedNotificationEvent = Awaited<ReturnType<typeof prepareNotific
 
 export async function dispatchPreparedNotification(prepared: PreparedNotificationEvent, transport: NotificationTransport = defaultTransport) {
   const deliveries = [];
-  for (const { delivery, channel } of prepared.pendingDeliveries) {
-    try {
-      const endpoint = requireHttpsEndpoint(resolveCredentialRef(channel.credentialRef));
-      await transport({ type: channel.type, endpoint, displayName: channel.displayName, payload: prepared.payload });
-      deliveries.push(await db.notificationDelivery.update({ where: { id: delivery.id }, data: { status: "DELIVERED", attemptCount: 1, deliveredAt: new Date(), lastError: null } }));
-    } catch (error) {
-      deliveries.push(await db.notificationDelivery.update({ where: { id: delivery.id }, data: { status: "FAILED", attemptCount: 1, lastError: error instanceof Error ? error.message.slice(0, 1000) : "Unknown delivery failure" } }));
-    }
+  for (const { delivery } of prepared.pendingDeliveries) {
+    const claimed = await claimNotificationDelivery(delivery.id, defaultDeliveryLeaseSeconds);
+    const dispatched = claimed
+      ? await dispatchClaimedNotificationDelivery(claimed, transport)
+      : await db.notificationDelivery.findUnique({ where: { id: delivery.id } });
+    if (dispatched) deliveries.push(dispatched);
   }
   return { notification: prepared.notification, deliveries, deduplicated: prepared.deduplicated, selectedChannels: prepared.selectedChannels };
+}
+
+export async function dispatchPendingNotificationDeliveries(
+  limit = 20,
+  transport: NotificationTransport = defaultTransport,
+  leaseSeconds = defaultDeliveryLeaseSeconds,
+) {
+  if (!Number.isSafeInteger(limit) || limit < 1 || limit > 200) {
+    throw new AppError("通知投递批次大小无效。", 400, "INVALID_NOTIFICATION_BATCH_SIZE");
+  }
+  if (!Number.isSafeInteger(leaseSeconds) || leaseSeconds < 15 || leaseSeconds > 15 * 60) {
+    throw new AppError("通知投递租约时长无效。", 400, "INVALID_NOTIFICATION_LEASE_SECONDS");
+  }
+  const deliveries = [];
+  for (let index = 0; index < limit; index += 1) {
+    const claimed = await claimNextNotificationDelivery(leaseSeconds);
+    if (!claimed) break;
+    const delivery = await dispatchClaimedNotificationDelivery(claimed, transport);
+    if (delivery) deliveries.push(delivery);
+  }
+  return deliveries;
+}
+
+type ClaimedNotificationDelivery = { id: string; leaseToken: string };
+
+function deliveryLease(leaseSeconds: number) {
+  const lockedAt = new Date();
+  return {
+    lockedAt,
+    staleBefore: new Date(lockedAt.getTime() - leaseSeconds * 1000),
+    leaseToken: `notification-delivery:${randomUUID()}`,
+  };
+}
+
+async function claimNotificationDelivery(deliveryId: string, leaseSeconds: number): Promise<ClaimedNotificationDelivery | null> {
+  const lease = deliveryLease(leaseSeconds);
+  const claimed = await db.$queryRaw<Array<{ id: string }>>`
+    UPDATE "NotificationDelivery"
+    SET
+      "lockedAt" = ${lease.lockedAt},
+      "lockedBy" = ${lease.leaseToken},
+      "attemptCount" = "attemptCount" + 1,
+      "updatedAt" = ${lease.lockedAt}
+    WHERE
+      "id" = ${deliveryId}
+      AND "status" = 'PENDING'::"NotificationDeliveryStatus"
+      AND ("lockedAt" IS NULL OR "lockedAt" < ${lease.staleBefore})
+    RETURNING "id"
+  `;
+  return claimed[0] ? { id: claimed[0].id, leaseToken: lease.leaseToken } : null;
+}
+
+async function claimNextNotificationDelivery(leaseSeconds: number): Promise<ClaimedNotificationDelivery | null> {
+  const lease = deliveryLease(leaseSeconds);
+  const claimed = await db.$queryRaw<Array<{ id: string }>>`
+    WITH candidate AS (
+      SELECT "id"
+      FROM "NotificationDelivery"
+      WHERE
+        "status" = 'PENDING'::"NotificationDeliveryStatus"
+        AND ("lockedAt" IS NULL OR "lockedAt" < ${lease.staleBefore})
+      ORDER BY "createdAt" ASC, "id" ASC
+      FOR UPDATE SKIP LOCKED
+      LIMIT 1
+    )
+    UPDATE "NotificationDelivery" AS delivery
+    SET
+      "lockedAt" = ${lease.lockedAt},
+      "lockedBy" = ${lease.leaseToken},
+      "attemptCount" = delivery."attemptCount" + 1,
+      "updatedAt" = ${lease.lockedAt}
+    FROM candidate
+    WHERE delivery."id" = candidate."id"
+    RETURNING delivery."id"
+  `;
+  return claimed[0] ? { id: claimed[0].id, leaseToken: lease.leaseToken } : null;
+}
+
+async function dispatchClaimedNotificationDelivery(
+  claimed: ClaimedNotificationDelivery,
+  transport: NotificationTransport,
+) {
+  const delivery = await db.notificationDelivery.findUnique({
+    where: { id: claimed.id },
+    include: { channel: true, notification: true },
+  });
+  if (!delivery || delivery.status !== "PENDING" || delivery.lockedBy !== claimed.leaseToken) return delivery;
+  const payload: ExternalNotificationPayload = {
+    title: delivery.notification.title,
+    body: delivery.notification.body,
+    eventType: delivery.notification.eventType,
+    relatedType: delivery.notification.relatedType ?? undefined,
+    relatedId: delivery.notification.relatedId ?? undefined,
+    dedupeKey: delivery.notification.dedupeKey ?? undefined,
+  };
+  try {
+    const endpoint = requireHttpsEndpoint(resolveCredentialRef(delivery.channel.credentialRef));
+    await transport({
+      type: delivery.channel.type,
+      endpoint,
+      displayName: delivery.channel.displayName,
+      deliveryId: delivery.id,
+      notificationId: delivery.notificationId,
+      payload,
+    });
+    await db.notificationDelivery.updateMany({
+      where: { id: delivery.id, status: "PENDING", lockedBy: claimed.leaseToken },
+      data: { status: "DELIVERED", deliveredAt: new Date(), lastError: null, lockedAt: null, lockedBy: null },
+    });
+  } catch (error) {
+    await db.notificationDelivery.updateMany({
+      where: { id: delivery.id, status: "PENDING", lockedBy: claimed.leaseToken },
+      data: {
+        status: "FAILED",
+        lastError: error instanceof Error ? error.message.slice(0, 1000) : "Unknown delivery failure",
+        lockedAt: null,
+        lockedBy: null,
+      },
+    });
+  }
+  return db.notificationDelivery.findUnique({ where: { id: delivery.id } });
 }
 
 export async function createAndDispatchNotification(context: Pick<RequestContext, "clientId">, raw: NotificationEvent, transport: NotificationTransport = defaultTransport) {

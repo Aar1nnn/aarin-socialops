@@ -17,7 +17,7 @@ import {
   getQueueOccurrences,
   upsertScheduleQueue,
 } from "../src/services/schedule-queue-service";
-import { generateContentPlan, reviewContent, schedulePublication, submitForReview } from "../src/services/content-service";
+import { editContentVersion, generateContentPlan, reviewContent, schedulePublication, submitForReview } from "../src/services/content-service";
 
 type Fixture = { client: Client; account: SocialAccount; context: RequestContext; productId: string; promptId: string };
 const clientIds: string[] = [];
@@ -105,12 +105,12 @@ describe("asset library", () => {
     expect(usage.platformUsage).toEqual([{ platform: "facebook", count: 1 }]);
   });
 
-  it("classifies local, private, public, signed and unavailable media", () => {
-    expect(classifyMediaAvailability({ storageProvider: "local", storageKey: "x", metadata: null })).toBe("LOCAL_ONLY");
-    expect(classifyMediaAvailability({ storageProvider: "s3", storageKey: "x", metadata: {} })).toBe("PRIVATE_REMOTE");
-    expect(classifyMediaAvailability({ storageProvider: "s3", storageKey: "x", metadata: { publicUrl: "https://cdn.example/x" } })).toBe("PUBLIC_HTTPS");
-    expect(classifyMediaAvailability({ storageProvider: "s3", storageKey: "x", metadata: { signedUrl: "https://signed.example/x" } })).toBe("SIGNED_HTTPS");
-    expect(classifyMediaAvailability({ storageProvider: "s3", storageKey: "", metadata: null })).toBe("UNAVAILABLE");
+  it("classifies local, private, public, signed and unavailable media", async () => {
+    expect(await classifyMediaAvailability({ storageProvider: "local", storageKey: "x", metadata: null })).toBe("LOCAL_ONLY");
+    expect(await classifyMediaAvailability({ storageProvider: "s3", storageKey: "x", metadata: {} })).toBe("PRIVATE_REMOTE");
+    expect(await classifyMediaAvailability({ storageProvider: "s3", storageKey: "x", metadata: { publicUrl: "https://cdn.example/x" } })).toBe("PUBLIC_HTTPS");
+    expect(await classifyMediaAvailability({ storageProvider: "s3", storageKey: "x", metadata: { signedUrl: "https://signed.example/x" } })).toBe("SIGNED_HTTPS");
+    expect(await classifyMediaAvailability({ storageProvider: "s3", storageKey: "", metadata: null })).toBe("UNAVAILABLE");
   });
 
   it("applies the derived availability filter before the result limit", async () => {
@@ -182,6 +182,35 @@ describe("calendar queues", () => {
     expect((await db.publishJob.findUniqueOrThrow({ where: { id: assignment.publishJobId } })).nextAttemptAt.toISOString()).toBe(assignment.scheduledAt.toISOString());
   });
 
+  it("releases a superseded version's old slot after edit and reapproval", async () => {
+    const oldSlot = new Date(Date.now() + 24 * 60 * 60 * 1000);
+    const first = await createItem();
+    const oldJob = await schedulePublication(fixture.context, first.id, oldSlot);
+
+    const revised = await editContentVersion(fixture.context, first.id, {
+      text: `${first.currentVersion!.text}\nRevised after scheduling.`,
+      expectedVersionId: first.currentVersionId!,
+      reason: "SCHEDULED_CONTENT_REVISED",
+    });
+    await submitForReview(fixture.context, first.id);
+    await reviewContent(fixture.context, first.id, "APPROVED");
+
+    expect((await db.publishJob.findUniqueOrThrow({ where: { id: oldJob.id } })).status).toBe("CANCELLED");
+    expect((await db.contentItem.findUniqueOrThrow({ where: { id: first.id } }))).toMatchObject({
+      currentVersionId: revised.id,
+      status: "APPROVED",
+      scheduledAt: null,
+    });
+    expect(await detectScheduleConflict(fixture.context, {
+      accountId: fixture.account.id,
+      scheduledAt: oldSlot,
+    })).toMatchObject({ conflict: false });
+
+    const second = await createItem();
+    const replacementJob = await schedulePublication(fixture.context, second.id, oldSlot);
+    expect(replacementJob.nextAttemptAt.toISOString()).toBe(oldSlot.toISOString());
+  });
+
   it("serializes concurrent assignments across queues for the same account", async () => {
     const after = new Date(Date.now() + 60_000);
     const slot = nextLocalSlot(after);
@@ -223,6 +252,14 @@ describe("calendar queues", () => {
     const draft = await createItem(fixture, false);
     await expect(assignContentToQueue(fixture.context, { queueId: queue.id, contentItemId: draft.id, after })).rejects.toMatchObject({ code: "APPROVAL_REQUIRED" });
     await expect(upsertScheduleQueue(fixture.context, null, { accountId: fixture.account.id, name: "Wrong zone", timezone: "UTC", slots: [nextLocalSlot(after)] })).rejects.toMatchObject({ code: "SCHEDULE_TIMEZONE_MISMATCH" });
+  });
+
+  it("rejects a past instant through the legacy scheduledAt API path", async () => {
+    const item = await createItem();
+    await expect(schedulePublication(fixture.context, item.id, new Date(Date.now() - 60_000))).rejects.toMatchObject({
+      code: "SCHEDULE_TIME_IN_PAST",
+    });
+    expect(await db.publishJob.count({ where: { clientId: fixture.client.id, contentVersion: { contentItemId: item.id } } })).toBe(0);
   });
 
   it("returns explicit per-item bulk results and never mutates protected jobs", async () => {

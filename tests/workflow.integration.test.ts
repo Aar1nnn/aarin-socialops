@@ -15,6 +15,9 @@ import {
   submitForReview,
 } from "../src/services/content-service";
 import { importInteraction } from "../src/services/interaction-service";
+import { updateLeadStatus } from "../src/services/interaction-service";
+import { requestContentChanges } from "../src/services/approval-collaboration-service";
+import { queryAnalyticsMetrics } from "../src/services/analytics-service";
 import { claimNextJob, processPublishJob, reconcileUnknownPublish, recoverStaleJobs } from "../src/services/publish-worker-service";
 import { generateOperationReport } from "../src/services/report-service";
 import { createProduct, updateProductFacts, uploadAsset } from "../src/services/product-service";
@@ -116,7 +119,10 @@ beforeEach(async () => {
 });
 
 afterEach(async () => {
-  for (const clientId of createdClientIds.splice(0)) await db.client.deleteMany({ where: { id: clientId } });
+  for (const clientId of createdClientIds.splice(0)) {
+    await db.contentVersionAsset.deleteMany({ where: { clientId } });
+    await db.client.deleteMany({ where: { id: clientId } });
+  }
   for (const userId of createdUserIds.splice(0)) await db.user.deleteMany({ where: { id: userId } });
 });
 
@@ -125,6 +131,63 @@ afterAll(async () => {
 });
 
 describe("approval and persistent publishing", () => {
+  it("completes an isolated DEMO workflow without external publishing", async () => {
+    const item = await generatedItem();
+    const firstVersion = await db.contentVersion.findUniqueOrThrow({ where: { id: item.currentVersionId! } });
+    expect(firstVersion.text).toContain("confirmed steel");
+    expect(firstVersion.text).not.toContain("invented proposed size");
+
+    await submitForReview(fixture.context, item.id);
+    await requestContentChanges(fixture.context, item.id, {
+      expectedVersionId: firstVersion.id,
+      comment: "Clarify the distributor audience",
+      requestedChanges: [{ instruction: "Mention wholesale buyers" }],
+    });
+    const revised = await editContentVersion(fixture.context, item.id, {
+      text: `${firstVersion.text}\nFor wholesale buyers.`,
+      expectedVersionId: firstVersion.id,
+    });
+    await submitForReview(fixture.context, item.id);
+    await reviewContent(fixture.context, item.id, "APPROVED", "DEMO test approval");
+    const job = await schedulePublication(fixture.context, item.id, new Date(Date.now() + 1000));
+    expect(job.simulated).toBe(true);
+    expect(job.contentVersionId).toBe(revised.id);
+    expect((await schedulePublication(fixture.context, item.id)).id).toBe(job.id);
+
+    await new Promise((resolve) => setTimeout(resolve, 1100));
+    const claimed = await claimNextJob(`controlled-demo-${randomUUID()}`);
+    expect(claimed?.id).toBe(job.id);
+    const published = await processPublishJob(job.id, new MockSocialPublishAdapter());
+    expect(published.status).toBe("PUBLISHED");
+    expect(published.simulated).toBe(true);
+    expect(published.remotePostId).toBeTruthy();
+
+    await db.metricSnapshot.create({ data: {
+      clientId: fixture.client.id,
+      accountId: fixture.accounts[0].id,
+      metricKey: `reach:${published.remotePostId}`,
+      numericValue: 42,
+      availability: "AVAILABLE",
+      dataKind: "MOCK",
+      fetchedAt: new Date(),
+      source: "controlled-demo-test",
+    } });
+    const metrics = await queryAnalyticsMetrics(fixture.context, { contentItemId: item.id });
+    expect(metrics.some((metric) => metric.metricKey === `reach:${published.remotePostId}` && metric.dataKind === "MOCK")).toBe(true);
+
+    const imported = await importInteraction(fixture.context, {
+      platform: "facebook",
+      platformRecordId: `controlled-demo-lead-${randomUUID()}`,
+      interactionType: "COMMENT",
+      body: "We need a wholesale catalog and MOQ.",
+      occurredAt: new Date(),
+    });
+    expect(imported.lead).toBeTruthy();
+    await updateLeadStatus(fixture.context, imported.lead!.id, "HANDED_OFF", "DEMO operator handoff");
+    expect(await db.inAppNotification.count({ where: { clientId: fixture.client.id, eventType: "URGENT_LEAD", relatedId: imported.lead!.id } })).toBe(1);
+    expect(await db.manualTask.count({ where: { clientId: fixture.client.id, leadId: imported.lead!.id, status: "COMPLETED" } })).toBe(1);
+  });
+
   it("blocks unapproved content in the backend", async () => {
     const item = await generatedItem();
     await expect(schedulePublication(fixture.context, item.id)).rejects.toMatchObject({ code: "APPROVAL_REQUIRED" });
@@ -291,6 +354,44 @@ describe("approval and persistent publishing", () => {
     expect(recoveredDuringDispatch).toBe(0);
     expect(result.status).toBe("PUBLISHED");
     expect(await db.publishAttempt.count({ where: { publishJobId: job.id } })).toBe(1);
+  });
+
+  it("passes stored asset metadata through the publish boundary", async () => {
+    const item = await generatedItem();
+    const current = await db.contentItem.findUniqueOrThrow({ where: { id: item.id }, select: { currentVersionId: true } });
+    const asset = await db.asset.create({
+      data: {
+        clientId: fixture.client.id,
+        kind: "IMAGE",
+        originalName: "external.jpg",
+        mimeType: "image/jpeg",
+        byteSize: 10,
+        storageProvider: "local",
+        storageKey: "external.jpg",
+        checksum: randomUUID(),
+        metadata: { publicUrl: "https://cdn.example.test/external.jpg" },
+      },
+    });
+    await db.productAsset.create({ data: { clientId: fixture.client.id, productId: fixture.product.id, assetId: asset.id } });
+    await db.contentVersionAsset.create({ data: { clientId: fixture.client.id, contentVersionId: current.currentVersionId!, assetId: asset.id } });
+    await submitForReview(fixture.context, item.id);
+    await reviewContent(fixture.context, item.id, "APPROVED");
+    const job = await schedulePublication(fixture.context, item.id);
+    await claimNextJob("asset-metadata-worker");
+    let receivedMetadata: unknown;
+    const adapter: SocialPublishAdapter = {
+      name: "metadata-observer",
+      simulated: true,
+      async publish(request) {
+        receivedMetadata = request.assets[0]?.metadata;
+        return { status: "published", remotePostId: "metadata-safe", remotePostUrl: null, publishedAt: new Date() };
+      },
+    };
+
+    const result = await processPublishJob(job.id, adapter);
+
+    expect(result.status).toBe("PUBLISHED");
+    expect(receivedMetadata).toEqual({ publicUrl: "https://cdn.example.test/external.jpg" });
   });
 
   it("keeps a long-running job leased through heartbeat", async () => {

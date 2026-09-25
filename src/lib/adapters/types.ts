@@ -78,6 +78,7 @@ export type PublishRequest = {
     storageKey: string;
     mimeType: string;
     originalName: string;
+    metadata?: unknown;
   }>;
   idempotencyKey: string;
 };

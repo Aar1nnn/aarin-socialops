@@ -3,6 +3,7 @@ import {
   assessAssetExternalRead,
   assessExternalReadUrl,
   externalReadDescriptor,
+  resolveAssetExternalRead,
   S3CompatibleStorageAdapter,
 } from "../src/lib/adapters/storage";
 
@@ -145,5 +146,54 @@ describe("asset external-read availability", () => {
       reason: "READY_CANDIDATE",
     });
     expect(assessment.url).toContain("X-Amz-Signature=");
+  });
+
+  it("uses one asset resolver for metadata URLs and fresh remote-storage URLs", async () => {
+    const metadataCandidate = await resolveAssetExternalRead({
+      storageProvider: "local",
+      storageKey: "tenant/photo.jpg",
+      metadata: { publicUrl: "https://cdn.example.test/tenant/photo.jpg" },
+    }, { now });
+    expect(metadataCandidate).toMatchObject({
+      availability: "PUBLIC_HTTPS",
+      ready: true,
+      source: "METADATA_PUBLIC_URL",
+      externalValidation: "NOT_EXTERNALLY_VERIFIED",
+    });
+
+    const previous = {
+      endpoint: process.env.S3_ENDPOINT,
+      bucket: process.env.S3_BUCKET,
+      region: process.env.S3_REGION,
+      accessKey: process.env.S3_ACCESS_KEY_ID,
+      secretKey: process.env.S3_SECRET_ACCESS_KEY,
+    };
+    Object.assign(process.env, {
+      S3_ENDPOINT: "https://objects.example.test",
+      S3_BUCKET: "media",
+      S3_REGION: "test-1",
+      S3_ACCESS_KEY_ID: "test-access-key",
+      S3_SECRET_ACCESS_KEY: "test-secret-key",
+    });
+    try {
+      const storageCandidate = await resolveAssetExternalRead({ storageProvider: "s3", storageKey: "tenant/photo.jpg", metadata: {} }, { now, expiresSeconds: 3_600 });
+      expect(storageCandidate).toMatchObject({
+        availability: "SIGNED_HTTPS",
+        ready: true,
+        source: "STORAGE_SIGNED_URL",
+        externalValidation: "NOT_EXTERNALLY_VERIFIED",
+      });
+    } finally {
+      for (const [key, value] of Object.entries({
+        S3_ENDPOINT: previous.endpoint,
+        S3_BUCKET: previous.bucket,
+        S3_REGION: previous.region,
+        S3_ACCESS_KEY_ID: previous.accessKey,
+        S3_SECRET_ACCESS_KEY: previous.secretKey,
+      })) {
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
+    }
   });
 });

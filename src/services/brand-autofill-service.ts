@@ -4,7 +4,7 @@ import type { StructuredTextGenerationAdapter } from "../lib/adapters/types";
 import { assertCanWrite, type RequestContext } from "../lib/context";
 import { db } from "../lib/db";
 import { AppError } from "../lib/errors";
-import { brandProfileInputSchema, getBrandProfile, upsertBrandProfile } from "./brand-service";
+import { brandProfileInputSchema, writeBrandProfileWithLock } from "./brand-service";
 import { releaseUsage, reserveUsage, settleUsage } from "./usage-service";
 
 const textList = z.array(z.string().trim().min(1).max(300)).max(50);
@@ -189,18 +189,19 @@ export async function confirmBrandAutofill(context: RequestContext, raw: unknown
     throw new AppError(`Accepted brand fields require a suggestion or human override: ${fieldsWithoutValues.join(", ")}`, 400, "BRAND_FIELD_VALUE_REQUIRED");
   }
 
-  const current = await getBrandProfile(context);
-  const merged: Record<string, unknown> = {};
-  for (const field of brandFields) {
-    const existing = current[field];
-    merged[field] = existing ?? (listFields.has(field) ? [] : null);
-  }
-  for (const fieldName of input.acceptedFields) {
-    const field = fieldName as keyof z.infer<typeof suggestedBrandSchema>;
-    const value = hasValue(input.overrides?.[field]) ? input.overrides?.[field] : input.suggestions[field];
-    if (value !== undefined) merged[field] = value;
-  }
-  const profile = await upsertBrandProfile(context, brandProfileInputSchema.parse(merged));
+  const profile = await writeBrandProfileWithLock(context, (current) => {
+    const merged: Record<string, unknown> = {};
+    for (const field of brandFields) {
+      const existing = current?.[field];
+      merged[field] = existing ?? (listFields.has(field) ? [] : null);
+    }
+    for (const fieldName of input.acceptedFields) {
+      const field = fieldName as keyof z.infer<typeof suggestedBrandSchema>;
+      const value = hasValue(input.overrides?.[field]) ? input.overrides?.[field] : input.suggestions[field];
+      if (value !== undefined) merged[field] = value;
+    }
+    return brandProfileInputSchema.parse(merged);
+  });
   return {
     status: "CONFIRMED" as const,
     profile,

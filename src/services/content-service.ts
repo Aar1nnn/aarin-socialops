@@ -249,7 +249,7 @@ export async function submitForReview(context: RequestContext, contentItemId: st
       },
       data: { status: PublishJobStatus.CANCELLED, lastErrorCode: "APPROVAL_REOPENED" },
     });
-    const updated = await tx.contentItem.update({ where: { id: item.id }, data: { status: ContentStatus.REVIEW_PENDING } });
+    const updated = await tx.contentItem.update({ where: { id: item.id }, data: { status: ContentStatus.REVIEW_PENDING, scheduledAt: null } });
     await tx.auditLog.create({
       data: { clientId: context.clientId, userId: context.userId, action: "CONTENT_SUBMITTED_FOR_REVIEW", entityType: "ContentItem", entityId: item.id },
     });
@@ -321,7 +321,7 @@ export async function editContentVersion(
     });
     await tx.contentItem.update({
       where: { id: item.id },
-      data: { currentVersionId: version.id, accountId, platform: account.platform, status: ContentStatus.DRAFT },
+      data: { currentVersionId: version.id, accountId, platform: account.platform, status: ContentStatus.DRAFT, scheduledAt: null },
     });
     await tx.auditLog.create({
       data: {
@@ -374,7 +374,7 @@ export async function reviewContent(
     });
     await tx.contentItem.update({
       where: { id: item.id },
-      data: { status: decision === ApprovalDecision.APPROVED ? ContentStatus.APPROVED : ContentStatus.CHANGES_REQUESTED },
+      data: { status: decision === ApprovalDecision.APPROVED ? ContentStatus.APPROVED : ContentStatus.CHANGES_REQUESTED, scheduledAt: null },
     });
     await tx.auditLog.create({
       data: {
@@ -396,7 +396,7 @@ export type SchedulePublicationInput = Date | {
   timezone?: string;
 };
 
-const conflictItemStatuses: ContentStatus[] = [ContentStatus.APPROVED, ContentStatus.SCHEDULED, ContentStatus.REVIEW_PENDING];
+const conflictItemStatuses: ContentStatus[] = [ContentStatus.SCHEDULED];
 const conflictJobStatuses: PublishJobStatus[] = [PublishJobStatus.PENDING, PublishJobStatus.RETRY, PublishJobStatus.WAITING_CONFIGURATION, PublishJobStatus.RUNNING];
 
 class PublicationGateError extends AppError {
@@ -647,6 +647,7 @@ export async function schedulePublication(context: RequestContext, contentItemId
 function resolveScheduledAt(input: SchedulePublicationInput | undefined, clientTimezone: string) {
   if (input instanceof Date) {
     if (Number.isNaN(input.getTime())) throw new AppError("排期时间无效。", 400, "INVALID_SCHEDULE_TIME");
+    if (input.getTime() <= Date.now()) throw new AppError("计划发布时间必须晚于当前时间。", 400, "SCHEDULE_TIME_IN_PAST");
     return input;
   }
   if (!input || input.publishMode === "NOW") return new Date();

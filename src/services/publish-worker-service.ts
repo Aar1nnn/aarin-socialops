@@ -190,7 +190,7 @@ export async function processPublishJob(jobId: string, injectedAdapter?: SocialP
   let result;
   const heartbeat = startLeaseHeartbeat(job.id, leaseToken);
   try {
-    result = await adapter.publish({ clientId: job.clientId, platform: job.account.platform, accountExternalId: job.account.externalAccountId, text: job.contentVersion.text, assets: job.contentVersion.assetLinks.map((link) => ({ storageProvider: link.asset.storageProvider, storageKey: link.asset.storageKey, mimeType: link.asset.mimeType, originalName: link.asset.originalName })), idempotencyKey: job.idempotencyKey });
+    result = await adapter.publish({ clientId: job.clientId, platform: job.account.platform, accountExternalId: job.account.externalAccountId, text: job.contentVersion.text, assets: job.contentVersion.assetLinks.map((link) => ({ storageProvider: link.asset.storageProvider, storageKey: link.asset.storageKey, mimeType: link.asset.mimeType, originalName: link.asset.originalName, metadata: link.asset.metadata })), idempotencyKey: job.idempotencyKey });
   } catch (error) {
     result = { status: "unknown" as const, code: "ADAPTER_THROW_AFTER_DISPATCH", message: safeErrorMessage(error) };
   } finally {

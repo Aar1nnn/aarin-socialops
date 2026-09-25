@@ -6,7 +6,7 @@
  * adapter, media resolves through StorageAdapter, and mutating requests are
  * never automatically retried so POST_DISPATCH uncertainty remains UNKNOWN.
  */
-import { resolveStorageExternalRead, type ExternalReadAssessment } from "./storage";
+import { resolveAssetExternalRead, type ExternalReadAssessment } from "./storage";
 import type { PublishRequest, PublishResult, SocialPublishAdapter } from "./types";
 import { normalizeMetaGraphFailure, PlatformHttpError } from "../platforms/errors";
 import { requestPlatformJson } from "../platforms/http-client";
@@ -154,7 +154,7 @@ export class InstagramGraphAdapter implements SocialPublishAdapter {
   private async resolveMedia(asset: PublishRequest["assets"][number]): Promise<ResolvedMedia> {
     const externalRead = this.config.resolveExternalRead
       ? await this.config.resolveExternalRead(asset)
-      : await resolveStorageExternalRead(asset, { expiresSeconds: 3_600 });
+      : await resolveAssetExternalRead(asset, { expiresSeconds: 3_600 });
     if (!externalRead.ready || !externalRead.url) throw new Error(externalRead.message);
     return {
       url: externalRead.url,
