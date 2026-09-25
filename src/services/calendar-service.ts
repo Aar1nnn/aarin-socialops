@@ -3,6 +3,14 @@ import { z } from "zod";
 import { db } from "../lib/db";
 import { AppError } from "../lib/errors";
 import { assertCanWrite, type RequestContext } from "../lib/context";
+import {
+  findScheduleConflictsInTransaction,
+  lockContentItemForScheduling,
+  lockSchedulingAccount,
+  lockSchedulingClient,
+  persistPublicationGateTask,
+  validatePublicationInTransaction,
+} from "./content-service";
 
 const calendarFilterSchema = z.object({
   from: z.coerce.date().optional(),
@@ -27,6 +35,7 @@ const protectedItemStatuses = new Set<ContentStatus>([
 ]);
 
 const activeJobStatuses: PublishJobStatus[] = [PublishJobStatus.PENDING, PublishJobStatus.RETRY, PublishJobStatus.WAITING_CONFIGURATION];
+const mutableJobStatuses = new Set(activeJobStatuses);
 
 export async function listCalendarEntries(context: RequestContext, raw: unknown = {}) {
   const input = calendarFilterSchema.parse(raw);
@@ -82,55 +91,96 @@ export async function rescheduleCalendarItems(context: RequestContext, raw: unkn
   assertCanWrite(context);
   const input = rescheduleSchema.parse(raw);
   if (input.scheduledAt.getTime() <= Date.now()) throw new AppError("排期时间必须晚于当前时间。", 400, "SCHEDULE_TIME_IN_PAST");
-  return db.$transaction(async (tx) => {
-    const items = await tx.contentItem.findMany({
-      where: { clientId: context.clientId, id: { in: input.contentItemIds } },
-      include: {
-        currentVersion: {
-          include: {
-            approvals: { orderBy: { createdAt: "desc" } },
-            publishJobs: { orderBy: { createdAt: "desc" } },
+  try {
+    return await db.$transaction(async (tx) => {
+      await lockSchedulingClient(tx, context.clientId);
+      const contentItemIds = [...new Set(input.contentItemIds)];
+      const scopedItems = await tx.contentItem.findMany({
+        where: { clientId: context.clientId, id: { in: contentItemIds } },
+        select: { id: true },
+      });
+      if (scopedItems.length !== contentItemIds.length) {
+        throw new AppError("包含不存在或其他客户的内容。", 403, "CONTENT_SCOPE_VIOLATION");
+      }
+      for (const contentItemId of [...contentItemIds].sort()) {
+        await lockContentItemForScheduling(tx, context, contentItemId);
+      }
+      const currentItems = await tx.contentItem.findMany({
+        where: { clientId: context.clientId, id: { in: contentItemIds } },
+        select: { id: true, accountId: true, status: true },
+      });
+      for (const item of currentItems) {
+        if (protectedItemStatuses.has(item.status)) {
+          throw new AppError(`内容 ${item.id} 当前状态不允许重排。`, 409, "CALENDAR_ITEM_LOCKED");
+        }
+        if (item.status !== ContentStatus.SCHEDULED) {
+          throw new AppError(`内容 ${item.id} 不是已有排期，不能通过 Calendar 创建新排期。`, 409, "CALENDAR_ITEM_NOT_RESCHEDULABLE");
+        }
+      }
+      for (const accountId of [...new Set(currentItems.map((item) => item.accountId))].sort()) {
+        await lockSchedulingAccount(tx, context.clientId, accountId);
+      }
+
+      const validatedItems = [];
+      for (const contentItemId of contentItemIds) {
+        const validated = await validatePublicationInTransaction(tx, context, contentItemId, input.scheduledAt);
+        if (!validated.existing || !mutableJobStatuses.has(validated.existing.status)) {
+          throw new AppError(`内容 ${contentItemId} 没有可重排的当前发布任务。`, 409, "CALENDAR_JOB_LOCKED");
+        }
+        validatedItems.push(validated);
+      }
+
+      const accountIds = validatedItems.map((validated) => validated.item.accountId);
+      if (new Set(accountIds).size !== accountIds.length) {
+        throw new AppError("同一账号的多条内容不能重排到同一时间。", 409, "SCHEDULE_CONFLICT");
+      }
+      for (const validated of validatedItems) {
+        const conflict = await findScheduleConflictsInTransaction(tx, {
+          clientId: context.clientId,
+          accountId: validated.item.accountId,
+          scheduledAt: input.scheduledAt,
+          excludeContentItemIds: contentItemIds,
+        });
+        if (conflict.conflict) throw new AppError("该账号的目标时间附近已有排期。", 409, "SCHEDULE_CONFLICT");
+      }
+
+      for (const validated of validatedItems) {
+        const updated = await tx.publishJob.updateMany({
+          where: {
+            id: validated.existing!.id,
+            clientId: context.clientId,
+            contentVersionId: validated.currentVersionId,
+            accountId: validated.item.accountId,
+            status: { in: activeJobStatuses },
           },
+          data: { nextAttemptAt: input.scheduledAt },
+        });
+        if (updated.count !== 1) throw new AppError("发布任务已被其他操作更新，请刷新后重试。", 409, "STALE_OPERATION");
+        const movedItem = await tx.contentItem.updateMany({
+          where: {
+            id: validated.item.id,
+            clientId: context.clientId,
+            status: ContentStatus.SCHEDULED,
+            currentVersionId: validated.currentVersionId,
+            accountId: validated.item.accountId,
+          },
+          data: { scheduledAt: input.scheduledAt },
+        });
+        if (movedItem.count !== 1) throw new AppError(`内容 ${validated.item.id} 的排期状态已变化。`, 409, "CALENDAR_ITEM_LOCKED");
+      }
+      await tx.auditLog.create({
+        data: {
+          clientId: context.clientId,
+          userId: context.userId,
+          action: contentItemIds.length > 1 ? "CALENDAR_BULK_RESCHEDULED" : "CALENDAR_ITEM_RESCHEDULED",
+          entityType: "ContentItem",
+          metadata: { contentItemIds, scheduledAt: input.scheduledAt.toISOString() },
         },
-      },
-    });
-    if (items.length !== new Set(input.contentItemIds).size) {
-      throw new AppError("包含不存在或其他客户的内容。", 403, "CONTENT_SCOPE_VIOLATION");
-    }
-    for (const item of items) {
-      if (protectedItemStatuses.has(item.status)) throw new AppError(`内容 ${item.id} 当前状态不允许重排。`, 409, "CALENDAR_ITEM_LOCKED");
-      if (item.status !== ContentStatus.SCHEDULED || !item.currentVersion) {
-        throw new AppError(`内容 ${item.id} 不是已有排期，不能通过 Calendar 创建新排期。`, 409, "CALENDAR_ITEM_NOT_RESCHEDULABLE");
-      }
-      const approval = item.currentVersion.approvals.find((candidate) => candidate.accountId === item.accountId);
-      if (!approval || approval.decision !== ApprovalDecision.APPROVED) {
-        throw new AppError(`内容 ${item.id} 的当前版本没有有效人工批准。`, 409, "APPROVAL_REQUIRED");
-      }
-      const job = item.currentVersion.publishJobs.find((candidate) => candidate.accountId === item.accountId && activeJobStatuses.includes(candidate.status));
-      if (!job) throw new AppError(`内容 ${item.id} 没有可移动的现有发布任务。`, 409, "PUBLISH_JOB_REQUIRED");
-    }
-    for (const item of items) {
-      const job = item.currentVersion!.publishJobs.find((candidate) => candidate.accountId === item.accountId && activeJobStatuses.includes(candidate.status))!;
-      const movedItem = await tx.contentItem.updateMany({
-        where: { id: item.id, clientId: context.clientId, status: ContentStatus.SCHEDULED, currentVersionId: item.currentVersionId, accountId: item.accountId },
-        data: { scheduledAt: input.scheduledAt },
       });
-      if (movedItem.count !== 1) throw new AppError(`内容 ${item.id} 的排期状态已变化。`, 409, "CALENDAR_ITEM_LOCKED");
-      const movedJob = await tx.publishJob.updateMany({
-        where: { id: job.id, clientId: context.clientId, contentVersionId: item.currentVersionId!, accountId: item.accountId, status: { in: activeJobStatuses } },
-        data: { nextAttemptAt: input.scheduledAt },
-      });
-      if (movedJob.count !== 1) throw new AppError(`内容 ${item.id} 的发布任务状态已变化。`, 409, "CALENDAR_JOB_LOCKED");
-    }
-    await tx.auditLog.create({
-      data: {
-        clientId: context.clientId,
-        userId: context.userId,
-        action: input.contentItemIds.length > 1 ? "CALENDAR_BULK_RESCHEDULED" : "CALENDAR_ITEM_RESCHEDULED",
-        entityType: "ContentItem",
-        metadata: { contentItemIds: input.contentItemIds, scheduledAt: input.scheduledAt.toISOString() },
-      },
+      return { updated: validatedItems.length, scheduledAt: input.scheduledAt };
     });
-    return { updated: items.length, scheduledAt: input.scheduledAt };
-  });
+  } catch (error) {
+    await persistPublicationGateTask(context.clientId, error);
+    throw error;
+  }
 }

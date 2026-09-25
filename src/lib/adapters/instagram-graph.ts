@@ -6,7 +6,7 @@
  * adapter, media resolves through StorageAdapter, and mutating requests are
  * never automatically retried so POST_DISPATCH uncertainty remains UNKNOWN.
  */
-import { getStorageAdapter } from "./storage";
+import { resolveAssetExternalRead, type ExternalReadAssessment } from "./storage";
 import type { PublishRequest, PublishResult, SocialPublishAdapter } from "./types";
 import { normalizeMetaGraphFailure, PlatformHttpError } from "../platforms/errors";
 import { requestPlatformJson } from "../platforms/http-client";
@@ -21,7 +21,7 @@ type InstagramGraphConfig = {
   fetchImpl?: typeof fetch;
   pollIntervalMs?: number;
   pollMaxAttempts?: number;
-  resolveAssetUrl?: (asset: PublishRequest["assets"][number]) => Promise<string | null>;
+  resolveExternalRead?: (asset: PublishRequest["assets"][number]) => Promise<ExternalReadAssessment>;
 };
 
 type GraphIdResponse = { id?: string; error?: unknown };
@@ -152,19 +152,12 @@ export class InstagramGraphAdapter implements SocialPublishAdapter {
   }
 
   private async resolveMedia(asset: PublishRequest["assets"][number]): Promise<ResolvedMedia> {
-    const url = this.config.resolveAssetUrl
-      ? await this.config.resolveAssetUrl(asset)
-      : await getStorageAdapter(asset.storageProvider || "local").getSignedUrl(asset.storageKey, 3_600);
-    if (!url) throw new Error("Instagram 要求 Meta 可访问的公开 HTTPS 素材 URL；本地存储无法直接发布。");
-    let parsed: URL;
-    try {
-      parsed = new URL(url);
-    } catch {
-      throw new Error("素材签名 URL 无效。");
-    }
-    if (parsed.protocol !== "https:") throw new Error("Instagram 素材 URL 必须使用 HTTPS。");
+    const externalRead = this.config.resolveExternalRead
+      ? await this.config.resolveExternalRead(asset)
+      : await resolveAssetExternalRead(asset, { expiresSeconds: 3_600 });
+    if (!externalRead.ready || !externalRead.url) throw new Error(externalRead.message);
     return {
-      url: parsed.toString(),
+      url: externalRead.url,
       mimeType: asset.mimeType,
       kind: asset.mimeType.startsWith("video/") ? "video" : "image",
     };

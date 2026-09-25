@@ -50,6 +50,24 @@ export interface TextGenerationAdapter {
   generate(input: DraftGenerationInput): Promise<DraftGenerationResult>;
 }
 
+export type StructuredTextGenerationInput = {
+  instruction: string;
+  schemaDescription: string;
+  input: unknown;
+};
+
+export type StructuredTextGenerationResult = {
+  output: unknown;
+  provider: string;
+  model: string | null;
+  simulated: boolean;
+  usage: { inputUnits: number; outputUnits: number };
+};
+
+export interface StructuredTextGenerationAdapter {
+  generateStructured(input: StructuredTextGenerationInput): Promise<StructuredTextGenerationResult>;
+}
+
 export type PublishRequest = {
   clientId: string;
   platform: string;
@@ -60,6 +78,7 @@ export type PublishRequest = {
     storageKey: string;
     mimeType: string;
     originalName: string;
+    metadata?: unknown;
   }>;
   idempotencyKey: string;
 };

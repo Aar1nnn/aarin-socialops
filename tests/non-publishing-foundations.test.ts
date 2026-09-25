@@ -9,7 +9,7 @@ import { buildContentEngineMemory } from "../src/services/memory-service";
 import { runAIContentPipeline } from "../src/services/ai-content-pipeline-service";
 import { listCalendarEntries, rescheduleCalendarItems } from "../src/services/calendar-service";
 import { aggregateMetricSnapshots, canonicalizeMetricKey, markAnalyticsSyncFailed, markAnalyticsSyncStarted, markAnalyticsSyncSucceeded, periodBounds, resolveFreshness } from "../src/services/analytics-service";
-import { createAndDispatchNotification } from "../src/services/notification-service";
+import { createAndDispatchNotification, upsertNotificationRule } from "../src/services/notification-service";
 import { generateContentPlan } from "../src/services/content-service";
 
 type Fixture = { client: Client; context: RequestContext; account: SocialAccount; promptId: string };
@@ -133,7 +133,15 @@ describe("calendar foundation", () => {
     const original = new Date(Date.now() + 2 * 24 * 60 * 60 * 1000);
     const target = new Date(Date.now() + 3 * 24 * 60 * 60 * 1000);
     const { item, version } = await createContent({ status: "SCHEDULED", scheduledAt: original });
-    await db.approval.create({ data: { clientId: fixture.client.id, contentVersionId: version.id, accountId: fixture.account.id, reviewerId: fixture.context.userId, decision: "APPROVED" } });
+    await db.approval.create({
+      data: {
+        clientId: fixture.client.id,
+        contentVersionId: version.id,
+        accountId: fixture.account.id,
+        reviewerId: fixture.context.userId,
+        decision: "APPROVED",
+      },
+    });
     const job = await db.publishJob.create({ data: { clientId: fixture.client.id, contentVersionId: version.id, accountId: fixture.account.id, idempotencyKey: randomUUID(), adapter: "mock", nextAttemptAt: original } });
     expect(await listCalendarEntries(fixture.context, { platform: "linkedin" })).toHaveLength(0);
     expect(await listCalendarEntries(fixture.context, { platform: "facebook", status: "SCHEDULED" })).toEqual([expect.objectContaining({ id: item.id, reschedulable: true })]);
@@ -181,7 +189,7 @@ describe("calendar foundation", () => {
     });
     await claimHasLock;
     const move = expect(rescheduleCalendarItems(fixture.context, { contentItemIds: [item.id], scheduledAt: target }))
-      .rejects.toMatchObject({ code: expect.stringMatching(/^(CALENDAR_JOB_LOCKED|PUBLISH_JOB_REQUIRED)$/) });
+      .rejects.toMatchObject({ code: expect.stringMatching(/^(CALENDAR_JOB_LOCKED|PUBLISH_JOB_REQUIRED|STALE_OPERATION)$/) });
     await new Promise((resolve) => setTimeout(resolve, 50));
     releaseClaim();
     await claim;
@@ -232,6 +240,8 @@ describe("notifications foundation", () => {
       { clientId: fixture.client.id, type: "WEBHOOK", displayName: "Ops webhook", credentialRef: "env:TEST_WEBHOOK_ENDPOINT", status: "VERIFIED" },
       { clientId: fixture.client.id, type: "EMAIL", displayName: "Ops email", credentialRef: "env:TEST_EMAIL_ENDPOINT", status: "VERIFIED" },
     ] });
+    await upsertNotificationRule(fixture.context, { eventType: "PUBLISH_UNKNOWN", severity: "URGENT", channelType: "WEBHOOK", cooldownMinutes: 60 });
+    await upsertNotificationRule(fixture.context, { eventType: "PUBLISH_UNKNOWN", severity: "URGENT", channelType: "EMAIL", cooldownMinutes: 60 });
     const result = await createAndDispatchNotification(fixture.context, { eventType: "PUBLISH_UNKNOWN", title: "Remote result unknown", body: "Manual reconciliation required", urgent: true }, async ({ type }) => {
       if (type === "EMAIL") throw new Error("provider unavailable");
     });
@@ -244,6 +254,7 @@ describe("notifications foundation", () => {
   it("rejects an endpoint changed to HTTP after channel verification without calling transport", async () => {
     process.env.TEST_HTTP_ENDPOINT = "http://notify.example.test/webhook";
     await db.notificationChannel.create({ data: { clientId: fixture.client.id, type: "WEBHOOK", displayName: "Changed endpoint", credentialRef: "env:TEST_HTTP_ENDPOINT", status: "VERIFIED" } });
+    await upsertNotificationRule(fixture.context, { eventType: "PUBLISH_FAILED", severity: "NORMAL", channelType: "WEBHOOK", enabled: true, cooldownMinutes: 0 });
     let called = false;
     const result = await createAndDispatchNotification(fixture.context, { eventType: "PUBLISH_FAILED", title: "Failed", body: "Investigate" }, async () => { called = true; });
     expect(called).toBe(false);

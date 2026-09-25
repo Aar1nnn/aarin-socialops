@@ -12,7 +12,7 @@ import { AppError } from "../lib/errors";
 import { getTextGenerationAdapter } from "../lib/adapters/text-generation";
 import type { TextGenerationAdapter } from "../lib/adapters/types";
 import { sha256 } from "../lib/security";
-import { zonedLocalDateTimeToUtc } from "../lib/timezone";
+import { assertValidTimeZone, zonedLocalDateTimeToUtc } from "../lib/timezone";
 import { assertCanWrite, type RequestContext } from "../lib/context";
 import { releaseUsage, reserveUsage, settleUsage } from "./usage-service";
 import { prepareAIContentPipelineInput, runPreparedAIContentPipeline } from "./ai-content-pipeline-service";
@@ -179,6 +179,9 @@ export async function generateContentPlan(context: RequestContext, raw: unknown,
           generator: generated.provider,
           simulated: generated.simulated,
           generationLabel: generated.simulated ? "模拟生成" : "真实模型生成",
+          createdByUserId: context.userId,
+          source: "AI",
+          reason: "INITIAL_GENERATION",
           sourceFacts: {
             confirmedFacts,
             missingFields: draft.missingInformation,
@@ -246,7 +249,7 @@ export async function submitForReview(context: RequestContext, contentItemId: st
       },
       data: { status: PublishJobStatus.CANCELLED, lastErrorCode: "APPROVAL_REOPENED" },
     });
-    const updated = await tx.contentItem.update({ where: { id: item.id }, data: { status: ContentStatus.REVIEW_PENDING } });
+    const updated = await tx.contentItem.update({ where: { id: item.id }, data: { status: ContentStatus.REVIEW_PENDING, scheduledAt: null } });
     await tx.auditLog.create({
       data: { clientId: context.clientId, userId: context.userId, action: "CONTENT_SUBMITTED_FOR_REVIEW", entityType: "ContentItem", entityId: item.id },
     });
@@ -257,7 +260,19 @@ export async function submitForReview(context: RequestContext, contentItemId: st
 export async function editContentVersion(
   context: RequestContext,
   contentItemId: string,
-  input: { text: string; title?: string | null; assetIds?: string[]; accountId?: string },
+  input: {
+    text: string;
+    title?: string | null;
+    assetIds?: string[];
+    accountId?: string;
+    expectedVersionId?: string;
+    previousVersionId?: string;
+    reason?: string;
+    source?: "MANUAL" | "AUTOSAVE" | "RESTORE" | "AI_REWRITE" | "AI_REGENERATE";
+    generator?: string;
+    generationLabel?: string;
+    sourceFacts?: Prisma.InputJsonValue;
+  },
 ) {
   assertCanWrite(context);
   const item = await getScopedItem(context, contentItemId);
@@ -268,6 +283,9 @@ export async function editContentVersion(
   const assetIds = input.assetIds ?? item.currentVersion.assetLinks.map((link) => link.assetId);
   const assets = await db.asset.count({ where: { id: { in: assetIds }, clientId: context.clientId } });
   if (assets !== new Set(assetIds).size) throw new AppError("素材不属于当前客户。", 403, "ASSET_SCOPE_VIOLATION");
+  if (input.expectedVersionId && input.expectedVersionId !== item.currentVersion.id) {
+    throw new AppError("草稿已被其他操作更新，请刷新后重试。", 409, "VERSION_CONFLICT");
+  }
   return db.$transaction(async (tx) => {
     await tx.$queryRaw`SELECT "id" FROM "ContentItem" WHERE "id" = ${item.id} FOR UPDATE`;
     const liveItem = await tx.contentItem.findUniqueOrThrow({ where: { id: item.id } });
@@ -282,10 +300,14 @@ export async function editContentVersion(
         text: input.text,
         productDataVersion: item.currentVersion!.productDataVersion,
         promptVersionId: item.currentVersion!.promptVersionId,
-        generator: "operator-edit",
+        generator: input.generator || "operator-edit",
         simulated: item.currentVersion!.simulated,
-        generationLabel: "人工编辑版本",
-        sourceFacts: item.currentVersion!.sourceFacts as Prisma.InputJsonValue,
+        generationLabel: input.generationLabel || "人工编辑版本",
+        sourceFacts: input.sourceFacts || item.currentVersion!.sourceFacts as Prisma.InputJsonValue,
+        previousVersionId: input.previousVersionId || item.currentVersion!.id,
+        createdByUserId: context.userId,
+        source: input.source || "MANUAL",
+        reason: input.reason || "CONTENT_EDITED",
         assetLinks: { create: assetIds.map((assetId) => ({ clientId: context.clientId, assetId })) },
       },
     });
@@ -299,7 +321,7 @@ export async function editContentVersion(
     });
     await tx.contentItem.update({
       where: { id: item.id },
-      data: { currentVersionId: version.id, accountId, platform: account.platform, status: ContentStatus.DRAFT },
+      data: { currentVersionId: version.id, accountId, platform: account.platform, status: ContentStatus.DRAFT, scheduledAt: null },
     });
     await tx.auditLog.create({
       data: {
@@ -352,7 +374,7 @@ export async function reviewContent(
     });
     await tx.contentItem.update({
       where: { id: item.id },
-      data: { status: decision === ApprovalDecision.APPROVED ? ContentStatus.APPROVED : ContentStatus.CHANGES_REQUESTED },
+      data: { status: decision === ApprovalDecision.APPROVED ? ContentStatus.APPROVED : ContentStatus.CHANGES_REQUESTED, scheduledAt: null },
     });
     await tx.auditLog.create({
       data: {
@@ -368,21 +390,97 @@ export async function reviewContent(
   });
 }
 
-type SchedulePublicationInput = Date | {
+export type SchedulePublicationInput = Date | {
   publishMode: "NOW" | "SCHEDULED";
   localDateTime?: string;
   timezone?: string;
 };
 
-export async function schedulePublication(context: RequestContext, contentItemId: string, scheduleInput?: SchedulePublicationInput) {
-  assertCanWrite(context);
-  const item = await getScopedItem(context, contentItemId);
+const conflictItemStatuses: ContentStatus[] = [ContentStatus.SCHEDULED];
+const conflictJobStatuses: PublishJobStatus[] = [PublishJobStatus.PENDING, PublishJobStatus.RETRY, PublishJobStatus.WAITING_CONFIGURATION, PublishJobStatus.RUNNING];
+
+class PublicationGateError extends AppError {
+  constructor(
+    message: string,
+    code: string,
+    readonly contentItemId: string,
+    readonly taskReason: string,
+    readonly taskAction: string,
+  ) {
+    super(message, 409, code);
+  }
+}
+
+export async function lockSchedulingClient(tx: Prisma.TransactionClient, clientId: string) {
+  const rows = await tx.$queryRaw<Array<{ id: string }>>`
+    SELECT "id" FROM "Client" WHERE "id" = ${clientId} FOR SHARE
+  `;
+  if (!rows.length) throw new AppError("客户不存在或无权访问。", 404, "CLIENT_NOT_FOUND");
+}
+
+export async function lockContentItemForScheduling(tx: Prisma.TransactionClient, context: RequestContext, contentItemId: string) {
+  const rows = await tx.$queryRaw<Array<{ id: string; accountId: string }>>`
+    SELECT "id", "accountId" FROM "ContentItem"
+    WHERE "id" = ${contentItemId} AND "clientId" = ${context.clientId}
+    FOR UPDATE
+  `;
+  if (!rows.length) throw new AppError("内容不存在或无权访问。", 404, "CONTENT_NOT_FOUND");
+  return rows[0];
+}
+
+export async function lockSchedulingAccount(tx: Prisma.TransactionClient, clientId: string, accountId: string) {
+  const rows = await tx.$queryRaw<Array<{ id: string }>>`
+    SELECT "id" FROM "SocialAccount"
+    WHERE "id" = ${accountId} AND "clientId" = ${clientId}
+    FOR UPDATE
+  `;
+  if (!rows.length) throw new AppError("账号不存在或无权访问。", 404, "ACCOUNT_NOT_FOUND");
+}
+
+export async function findScheduleConflictsInTransaction(
+  tx: Pick<Prisma.TransactionClient, "contentItem">,
+  input: {
+    clientId: string;
+    accountId: string;
+    scheduledAt: Date;
+    excludeContentItemIds?: string[];
+    windowMinutes?: number;
+  },
+) {
+  const windowMinutes = input.windowMinutes ?? 5;
+  const from = new Date(input.scheduledAt.getTime() - windowMinutes * 60_000);
+  const to = new Date(input.scheduledAt.getTime() + windowMinutes * 60_000);
+  const excludedIds = input.excludeContentItemIds || [];
+  const conflicts = await tx.contentItem.findMany({
+    where: {
+      clientId: input.clientId,
+      accountId: input.accountId,
+      ...(excludedIds.length ? { id: { notIn: excludedIds } } : {}),
+      OR: [
+        { status: { in: conflictItemStatuses }, scheduledAt: { gte: from, lte: to } },
+        { currentVersion: { publishJobs: { some: { clientId: input.clientId, status: { in: conflictJobStatuses }, nextAttemptAt: { gte: from, lte: to } } } } },
+      ],
+    },
+    select: { id: true, status: true, scheduledAt: true, accountId: true, platform: true },
+    orderBy: [{ scheduledAt: "asc" }, { id: "asc" }],
+  });
+  return { conflict: conflicts.length > 0, conflicts, window: { from, to } };
+}
+
+export async function validatePublicationInTransaction(
+  tx: Prisma.TransactionClient,
+  context: RequestContext,
+  contentItemId: string,
+  scheduleInput?: SchedulePublicationInput,
+) {
+  const item = await getScopedItem(context, contentItemId, tx);
   if (!item.currentVersion) throw new AppError("内容版本缺失。", 409, "VERSION_MISSING");
-  const blockingIssues = (await checkContent(context, contentItemId)).filter((issue) => issue.level === "ERROR");
+  const currentVersionId = item.currentVersion.id;
+  const blockingIssues = (await checkContentWithClient(context, contentItemId, tx)).filter((issue) => issue.level === "ERROR");
   if (blockingIssues.length) {
     throw new AppError(`内容检查未通过：${blockingIssues.map((issue) => issue.message).join("；")}`, 409, "CONTENT_CHECK_FAILED");
   }
-  const approval = await db.approval.findFirst({
+  const approval = await tx.approval.findFirst({
     where: {
       clientId: context.clientId,
       contentVersionId: item.currentVersion.id,
@@ -393,14 +491,19 @@ export async function schedulePublication(context: RequestContext, contentItemId
   if (!approval || approval.decision !== ApprovalDecision.APPROVED) {
     throw new AppError("当前平台、账号和内容版本没有有效批准。", 409, "APPROVAL_REQUIRED");
   }
-  const client = await db.client.findUniqueOrThrow({ where: { id: context.clientId } });
+  const client = await tx.client.findUniqueOrThrow({ where: { id: context.clientId } });
+  assertValidTimeZone(client.timezone);
   const scheduledAt = resolveScheduledAt(scheduleInput, client.timezone);
   if (client.mode === ClientMode.DRAFT) {
-    await ensureManualTask(context.clientId, item.id, "草稿模式禁止对外发布", "切换正式模式前验证发布适配器与账号能力。" );
-    throw new AppError("草稿模式只能生成和审核内容，不能发布。", 409, "DRAFT_MODE_PUBLISH_BLOCKED");
+    throw new PublicationGateError(
+      "草稿模式只能生成和审核内容，不能发布。",
+      "DRAFT_MODE_PUBLISH_BLOCKED",
+      item.id,
+      "草稿模式禁止对外发布",
+      "切换正式模式前验证发布适配器与账号能力。",
+    );
   }
-  const idempotencyKey = sha256(`${context.clientId}:${item.currentVersion.id}:${item.accountId}`);
-  const existing = await db.publishJob.findUnique({
+  const existing = await tx.publishJob.findUnique({
     where: { clientId_contentVersionId_accountId: {
       clientId: context.clientId,
       contentVersionId: item.currentVersion.id,
@@ -435,67 +538,116 @@ export async function schedulePublication(context: RequestContext, contentItemId
       })
     : null;
   if (!registration || (!isDemo && !liveTarget)) {
-    await ensureManualTask(context.clientId, item.id, "社媒账号真实连接尚未验证", "在平台连接页完成 OAuth、账号选择和发布能力验证。" );
-    throw new AppError("正式模式只允许已验证且已选择的社媒账号进入真实发布队列。", 409, "LIVE_CONNECTION_REQUIRED");
+    throw new PublicationGateError(
+      "正式模式只允许已验证且已选择的社媒账号进入真实发布队列。",
+      "LIVE_CONNECTION_REQUIRED",
+      item.id,
+      "社媒账号真实连接尚未验证",
+      "在平台连接页完成 OAuth、账号选择和发布能力验证。",
+    );
   }
-  const provider = registration.definition.provider;
-  const adapterName = isDemo ? "mock-social" : liveTarget!.adapterName;
+  return {
+    item,
+    currentVersionId,
+    client,
+    scheduledAt,
+    existing,
+    provider: registration.definition.provider,
+    adapterName: isDemo ? "mock-social" : liveTarget!.adapterName,
+    isDemo,
+  };
+}
+
+export async function schedulePublicationInTransaction(
+  tx: Prisma.TransactionClient,
+  context: RequestContext,
+  contentItemId: string,
+  scheduleInput?: SchedulePublicationInput,
+) {
+  const validated = await validatePublicationInTransaction(tx, context, contentItemId, scheduleInput);
+  const { item, currentVersionId, scheduledAt, existing, provider, adapterName, isDemo } = validated;
   const status = PublishJobStatus.PENDING;
   if (existing) {
     if (existing.status === PublishJobStatus.CANCELLED && existing.attemptCount === 0) {
-      const revived = await db.publishJob.update({
-        where: { id: existing.id },
-        data: { status, provider, platform: item.platform, adapter: adapterName, simulated: isDemo, environment: isDemo ? "SIMULATED" : "LIVE", nextAttemptAt: scheduledAt || new Date(), lastErrorCode: null, lastErrorMessage: null },
-      });
-      await db.contentItem.update({
-        where: { id: item.id },
-        data: { scheduledAt: scheduledAt || new Date(), status: ContentStatus.SCHEDULED },
-      });
-      return revived;
-    }
-    return existing;
-  }
-  let job;
-  try {
-    job = await db.publishJob.create({
-      data: {
+      const conflict = await findScheduleConflictsInTransaction(tx, {
         clientId: context.clientId,
-        contentVersionId: item.currentVersion.id,
         accountId: item.accountId,
-        provider,
-        platform: item.platform,
-        idempotencyKey,
-        status,
-        adapter: adapterName,
-        simulated: isDemo,
-        environment: isDemo ? "SIMULATED" : "LIVE",
-        nextAttemptAt: scheduledAt || new Date(),
-      },
-    });
-  } catch (error) {
-    if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === "P2002") {
-      return db.publishJob.findUniqueOrThrow({
-        where: { clientId_contentVersionId_accountId: { clientId: context.clientId, contentVersionId: item.currentVersion.id, accountId: item.accountId } },
+        scheduledAt,
+        excludeContentItemIds: [item.id],
       });
+      if (conflict.conflict) throw new AppError("该账号的目标时间附近已有排期。", 409, "SCHEDULE_CONFLICT");
+      const revived = await tx.publishJob.update({
+        where: { id: existing.id },
+        data: { status, provider, platform: item.platform, adapter: adapterName, simulated: isDemo, environment: isDemo ? "SIMULATED" : "LIVE", nextAttemptAt: scheduledAt, lastErrorCode: null, lastErrorMessage: null },
+      });
+      await tx.contentItem.update({
+        where: { id: item.id },
+        data: { scheduledAt, status: ContentStatus.SCHEDULED },
+      });
+      await tx.auditLog.create({
+        data: { clientId: context.clientId, userId: context.userId, action: "PUBLICATION_SCHEDULED", entityType: "PublishJob", entityId: revived.id, metadata: { simulated: revived.simulated, scheduledAt: scheduledAt.toISOString(), revived: true } },
+      });
+      return { job: revived, scheduledAt, changed: true };
     }
-    throw error;
+    return { job: existing, scheduledAt: item.scheduledAt || existing.nextAttemptAt, changed: false };
   }
-  await db.contentItem.update({
-    where: { id: item.id },
+  const conflict = await findScheduleConflictsInTransaction(tx, {
+    clientId: context.clientId,
+    accountId: item.accountId,
+    scheduledAt,
+    excludeContentItemIds: [item.id],
+  });
+  if (conflict.conflict) throw new AppError("该账号的目标时间附近已有排期。", 409, "SCHEDULE_CONFLICT");
+  const job = await tx.publishJob.create({
     data: {
-      scheduledAt: scheduledAt || new Date(),
-      status: ContentStatus.SCHEDULED,
+      clientId: context.clientId,
+      contentVersionId: currentVersionId,
+      accountId: item.accountId,
+      provider,
+      platform: item.platform,
+      idempotencyKey: sha256(`${context.clientId}:${currentVersionId}:${item.accountId}`),
+      status,
+      adapter: adapterName,
+      simulated: isDemo,
+      environment: isDemo ? "SIMULATED" : "LIVE",
+      nextAttemptAt: scheduledAt,
     },
   });
-  await db.auditLog.create({
-    data: { clientId: context.clientId, userId: context.userId, action: "PUBLICATION_SCHEDULED", entityType: "PublishJob", entityId: job.id, metadata: { simulated: job.simulated } },
+  await tx.contentItem.update({
+    where: { id: item.id },
+    data: { scheduledAt, status: ContentStatus.SCHEDULED },
   });
-  return job;
+  await tx.auditLog.create({
+    data: { clientId: context.clientId, userId: context.userId, action: "PUBLICATION_SCHEDULED", entityType: "PublishJob", entityId: job.id, metadata: { simulated: job.simulated, scheduledAt: scheduledAt.toISOString() } },
+  });
+  return { job, scheduledAt, changed: true };
+}
+
+export async function persistPublicationGateTask(clientId: string, error: unknown) {
+  if (!(error instanceof PublicationGateError)) return;
+  await ensureManualTask(clientId, error.contentItemId, error.taskReason, error.taskAction);
+}
+
+export async function schedulePublication(context: RequestContext, contentItemId: string, scheduleInput?: SchedulePublicationInput) {
+  assertCanWrite(context);
+  try {
+    const result = await db.$transaction(async (tx) => {
+      await lockSchedulingClient(tx, context.clientId);
+      const lockedItem = await lockContentItemForScheduling(tx, context, contentItemId);
+      await lockSchedulingAccount(tx, context.clientId, lockedItem.accountId);
+      return schedulePublicationInTransaction(tx, context, contentItemId, scheduleInput);
+    });
+    return result.job;
+  } catch (error) {
+    await persistPublicationGateTask(context.clientId, error);
+    throw error;
+  }
 }
 
 function resolveScheduledAt(input: SchedulePublicationInput | undefined, clientTimezone: string) {
   if (input instanceof Date) {
     if (Number.isNaN(input.getTime())) throw new AppError("排期时间无效。", 400, "INVALID_SCHEDULE_TIME");
+    if (input.getTime() <= Date.now()) throw new AppError("计划发布时间必须晚于当前时间。", 400, "SCHEDULE_TIME_IN_PAST");
     return input;
   }
   if (!input || input.publishMode === "NOW") return new Date();
@@ -509,7 +661,15 @@ function resolveScheduledAt(input: SchedulePublicationInput | undefined, clientT
 }
 
 export async function checkContent(context: RequestContext, contentItemId: string) {
-  const item = await getScopedItem(context, contentItemId);
+  return checkContentWithClient(context, contentItemId, db);
+}
+
+async function checkContentWithClient(
+  context: RequestContext,
+  contentItemId: string,
+  database: Pick<Prisma.TransactionClient, "contentItem" | "platformPolicy" | "contentVersion">,
+) {
+  const item = await getScopedItem(context, contentItemId, database);
   if (!item.currentVersion) return [{ level: "ERROR" as const, code: "NO_VERSION", message: "内容版本缺失", evidence: item.id }];
   const issues: Array<{ level: "ERROR" | "WARNING"; code: string; message: string; evidence: string }> = [];
   const sourceFacts = item.currentVersion.sourceFacts as { missingFields?: string[] };
@@ -555,7 +715,7 @@ export async function checkContent(context: RequestContext, contentItemId: strin
       }
     }
   }
-  const policy = await db.platformPolicy.findUnique({
+  const policy = await database.platformPolicy.findUnique({
     where: { clientId_platform: { clientId: context.clientId, platform: item.platform } },
   });
   if (policy?.maxTextLength && item.currentVersion.text.length > policy.maxTextLength) {
@@ -566,7 +726,7 @@ export async function checkContent(context: RequestContext, contentItemId: strin
       evidence: `policy:${policy.id}`,
     });
   }
-  const duplicate = await db.contentVersion.findFirst({
+  const duplicate = await database.contentVersion.findFirst({
     where: {
       clientId: context.clientId,
       id: { not: item.currentVersion.id },
@@ -579,8 +739,12 @@ export async function checkContent(context: RequestContext, contentItemId: strin
   return issues;
 }
 
-async function getScopedItem(context: RequestContext, contentItemId: string) {
-  const item = await db.contentItem.findFirst({
+async function getScopedItem(
+  context: RequestContext,
+  contentItemId: string,
+  database: Pick<Prisma.TransactionClient, "contentItem"> = db,
+) {
+  const item = await database.contentItem.findFirst({
     where: { id: contentItemId, clientId: context.clientId },
     include: {
       account: { include: { facebookConnection: true, platformConnection: true } },

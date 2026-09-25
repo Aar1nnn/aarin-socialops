@@ -57,7 +57,16 @@ export async function uploadAsset(
       ? AssetKind.VIDEO
       : AssetKind.DOCUMENT;
   if (kind === AssetKind.DOCUMENT) {
+    await getStorageAdapter(stored.storageProvider).delete(stored.storageKey).catch(() => undefined);
     throw new AppError("第一阶段只接受图片和已剪辑视频。", 400, "UNSUPPORTED_ASSET_TYPE");
+  }
+  const duplicate = await db.asset.findFirst({
+    where: { clientId: context.clientId, checksum: stored.checksum },
+    select: { id: true },
+  });
+  if (duplicate) {
+    await getStorageAdapter(stored.storageProvider).delete(stored.storageKey).catch(() => undefined);
+    throw new AppError(`同一素材已存在（${duplicate.id}）。`, 409, "DUPLICATE_ASSET");
   }
   const inspection = kind === AssetKind.VIDEO
     ? await inspectVideo(stored.storageProvider, stored.storageKey)
@@ -133,7 +142,7 @@ export async function updateProductFacts(context: RequestContext, productId: str
         plan: { productId },
         status: { notIn: [ContentStatus.PUBLISHED, ContentStatus.CANCELLED] },
       },
-      data: { status: ContentStatus.CHANGES_REQUESTED },
+      data: { status: ContentStatus.CHANGES_REQUESTED, scheduledAt: null },
     });
     const cancelledJobs = await tx.publishJob.updateMany({
       where: {
