@@ -25,7 +25,7 @@ Implement the grouped operator navigation and stable shell from `ui-architecture
 3. [x] Add `/accounts` alias/entry and account-first summary without changing connection actions.
 4. [x] Add read-first `/publishing` and shift only essential dashboard/content/page links and copy.
 5. [x] Verify typecheck, focused and full tests, production build, route/login contracts, responsive widths, permissions, and final diff.
-6. [ ] Commit, push, open Phase 1 PR, and wait for remote CI; do not merge this PR.
+6. [x] Commit, push, open Phase 1 PR, and wait for remote CI; do not merge this PR.
 
 ## Verification log
 
@@ -37,6 +37,7 @@ Implement the grouped operator navigation and stable shell from `ui-architecture
 - The isolated DEMO workflow created four simulated publish jobs, a lead, mock metrics, and a report. One simulated job was marked `UNKNOWN` solely in that isolated database: `/publishing` showed one “结果待确认” row and no retry button. A test `VIEWER` had no Quick Create and a disabled Meta connection control. Owner workspace switch returned 303 and displayed the other test client; viewer cross-client switch returned 403. Declined Meta callback returned 400 from the existing route, not a 404.
 - Local visual screenshots (not committed): `C:/Users/aarinsim/AppData/Local/Temp/aarin-ui-v2-phase1-visual/`.
 - Defect-first review found and fixed the 390px grid overflow. Remaining Phase 1 risk: a real Meta OAuth success callback was not exercised because no external account authorization was performed; the path, form return value, and denied callback were verified.
+- PR [#8](https://github.com/Aar1nnn/aarin-socialops/pull/8) was opened against unchanged `main` at `e4d6e8e`; code-head CI runs `36222995741` and `36223018859` both passed PostgreSQL `verify`. PR remains open and unmerged.
 
 ## Open risks
 
