@@ -228,9 +228,10 @@ export async function generateContentPlan(context: RequestContext, raw: unknown,
   return { ...result, generation: { simulated: generated.simulated, provider: generated.provider } };
 }
 
-export async function submitForReview(context: RequestContext, contentItemId: string) {
+export async function submitForReview(context: RequestContext, contentItemId: string, expectedVersionId?: string) {
   assertCanWrite(context);
   const item = await getScopedItem(context, contentItemId);
+  if (expectedVersionId && item.currentVersionId !== expectedVersionId) throw new AppError("内容版本已变化，请刷新后重试。", 409, "VERSION_CONFLICT");
   const issues = await checkContent(context, contentItemId);
   const blocking = issues.filter((issue) => issue.level === "ERROR");
   if (blocking.length) {
@@ -240,7 +241,7 @@ export async function submitForReview(context: RequestContext, contentItemId: st
     await tx.$queryRaw`SELECT "id" FROM "ContentItem" WHERE "id" = ${item.id} FOR UPDATE`;
     const liveItem = await tx.contentItem.findUniqueOrThrow({ where: { id: item.id } });
     if (liveItem.status === ContentStatus.RUNNING) throw new AppError("发布已经开始，必须等待结果或执行远端对账。", 409, "PUBLISH_IN_PROGRESS");
-    if (liveItem.currentVersionId !== item.currentVersionId) throw new AppError("内容已被其他操作更新，请刷新后重试。", 409, "STALE_OPERATION");
+    if (liveItem.currentVersionId !== item.currentVersionId || (expectedVersionId && liveItem.currentVersionId !== expectedVersionId)) throw new AppError("内容已被其他操作更新，请刷新后重试。", 409, "VERSION_CONFLICT");
     await tx.publishJob.updateMany({
       where: {
         clientId: context.clientId,
@@ -342,10 +343,12 @@ export async function reviewContent(
   contentItemId: string,
   decision: ApprovalDecision,
   note?: string,
+  expectedVersionId?: string,
 ) {
   assertCanWrite(context);
   const item = await getScopedItem(context, contentItemId);
   if (!item.currentVersion) throw new AppError("内容版本缺失。", 409, "VERSION_MISSING");
+  if (expectedVersionId && item.currentVersion.id !== expectedVersionId) throw new AppError("审核版本已变化，请刷新后重试。", 409, "VERSION_CONFLICT");
   if (item.status !== ContentStatus.REVIEW_PENDING) {
     throw new AppError("只有待审核状态的当前版本可以批准或拒绝。", 409, "NOT_REVIEW_PENDING");
   }
@@ -353,7 +356,7 @@ export async function reviewContent(
     await tx.$queryRaw`SELECT "id" FROM "ContentItem" WHERE "id" = ${item.id} FOR UPDATE`;
     const liveItem = await tx.contentItem.findUniqueOrThrow({ where: { id: item.id } });
     if (liveItem.status === ContentStatus.RUNNING) throw new AppError("发布已经开始，不能更改审核决定；请等待结果或执行远端对账。", 409, "PUBLISH_IN_PROGRESS");
-    if (liveItem.currentVersionId !== item.currentVersion!.id || liveItem.accountId !== item.accountId || liveItem.status !== ContentStatus.REVIEW_PENDING) throw new AppError("审核对象已变化，请刷新后重试。", 409, "STALE_OPERATION");
+    if (liveItem.currentVersionId !== item.currentVersion!.id || (expectedVersionId && liveItem.currentVersionId !== expectedVersionId) || liveItem.accountId !== item.accountId || liveItem.status !== ContentStatus.REVIEW_PENDING) throw new AppError("审核对象已变化，请刷新后重试。", 409, "VERSION_CONFLICT");
     const approval = await tx.approval.create({
       data: {
         clientId: context.clientId,
@@ -628,12 +631,16 @@ export async function persistPublicationGateTask(clientId: string, error: unknow
   await ensureManualTask(clientId, error.contentItemId, error.taskReason, error.taskAction);
 }
 
-export async function schedulePublication(context: RequestContext, contentItemId: string, scheduleInput?: SchedulePublicationInput) {
+export async function schedulePublication(context: RequestContext, contentItemId: string, scheduleInput?: SchedulePublicationInput, expectedVersionId?: string) {
   assertCanWrite(context);
   try {
     const result = await db.$transaction(async (tx) => {
       await lockSchedulingClient(tx, context.clientId);
       const lockedItem = await lockContentItemForScheduling(tx, context, contentItemId);
+      if (expectedVersionId) {
+        const liveItem = await tx.contentItem.findUniqueOrThrow({ where: { id: contentItemId }, select: { currentVersionId: true } });
+        if (liveItem.currentVersionId !== expectedVersionId) throw new AppError("排期版本已变化，请刷新后重试。", 409, "VERSION_CONFLICT");
+      }
       await lockSchedulingAccount(tx, context.clientId, lockedItem.accountId);
       return schedulePublicationInTransaction(tx, context, contentItemId, scheduleInput);
     });

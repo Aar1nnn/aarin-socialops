@@ -14,8 +14,8 @@ export async function POST(request: Request, { params }: { params: Promise<{ id:
           publishMode: String(body.publishMode || "NOW") === "SCHEDULED" ? "SCHEDULED" : "NOW",
           localDateTime: body.localDateTime ? String(body.localDateTime) : undefined,
           timezone: body.timezone ? String(body.timezone) : undefined,
-        });
-    return actionResponse(request, result, "/content");
+        }, typeof body.expectedVersionId === "string" ? body.expectedVersionId : undefined);
+    return actionResponse(request, result, `/content/${id}`);
   } catch (error) {
     return errorResponse(error);
   }

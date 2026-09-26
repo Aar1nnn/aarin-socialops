@@ -22,7 +22,8 @@ import {
   rewriteContent,
   updateDraftContent,
 } from "../src/services/content-composition-service";
-import { generateContentPlan, reviewContent, submitForReview } from "../src/services/content-service";
+import { generateContentPlan, reviewContent, schedulePublication, submitForReview } from "../src/services/content-service";
+import { getContentOperationsDetail, listContentOperations } from "../src/services/content-operations-view";
 import { getContentTimeline, requestContentChanges } from "../src/services/approval-collaboration-service";
 
 type Fixture = { client: Client; account: SocialAccount; context: RequestContext; productId: string };
@@ -139,10 +140,53 @@ describe("content composition engine", () => {
     expect(await db.contentVersion.count({ where: { contentItemId: item.id } })).toBe(4);
   });
 
+  it("keeps long current copy in model context without overflowing DEMO-generated titles", async () => {
+    const item = await createItem();
+    const long = await updateDraftContent(fixture.context, item.id, { expectedVersionId: item.currentVersionId, text: `Verified steel chair. ${"Buyer context. ".repeat(40)}` });
+    const rewritten = await rewriteContent(fixture.context, item.id, { expectedVersionId: long.id, action: "rewrite" });
+    expect(rewritten.version).toBe(long.version + 1);
+    expect(rewritten.title?.length).toBeLessThanOrEqual(200);
+    expect(rewritten.source).toBe("AI_REWRITE");
+  });
+
   it("denies cross-tenant version access", async () => {
     const item = await createItem();
     const other = await makeFixture();
     await expect(updateDraftContent(other.context, item.id, { expectedVersionId: item.currentVersionId, text: "Cross tenant." })).rejects.toMatchObject({ code: "CONTENT_NOT_FOUND" });
+  });
+
+  it("rejects stale submit, human approval and scheduling without changing the newer version", async () => {
+    const item = await createItem();
+    const saved = await updateDraftContent(fixture.context, item.id, { expectedVersionId: item.currentVersionId, text: "Confirmed verified steel chair for wholesale." });
+    await expect(submitForReview(fixture.context, item.id, item.currentVersionId!)).rejects.toMatchObject({ code: "VERSION_CONFLICT" });
+    await submitForReview(fixture.context, item.id, saved.id);
+    await expect(reviewContent(fixture.context, item.id, "APPROVED", "stale", item.currentVersionId!)).rejects.toMatchObject({ code: "VERSION_CONFLICT" });
+    expect(await db.approval.count({ where: { clientId: fixture.client.id } })).toBe(0);
+    await reviewContent(fixture.context, item.id, "APPROVED", "current", saved.id);
+    await expect(schedulePublication(fixture.context, item.id, { publishMode: "SCHEDULED", localDateTime: "2030-01-01T12:00", timezone: "Asia/Shanghai" }, item.currentVersionId!)).rejects.toMatchObject({ code: "VERSION_CONFLICT" });
+    expect(await db.publishJob.count({ where: { clientId: fixture.client.id } })).toBe(0);
+    const job = await schedulePublication(fixture.context, item.id, { publishMode: "SCHEDULED", localDateTime: "2030-01-01T12:00", timezone: "Asia/Shanghai" }, saved.id);
+    expect(job.contentVersionId).toBe(saved.id);
+    const newer = await updateDraftContent(fixture.context, item.id, { expectedVersionId: saved.id, text: "A later version with verified steel." });
+    expect(newer.version).toBe(saved.version + 1);
+    expect((await db.publishJob.findUniqueOrThrow({ where: { id: job.id } })).status).toBe("CANCELLED");
+    await expect(schedulePublication(fixture.context, item.id, undefined, newer.id)).rejects.toMatchObject({ code: "APPROVAL_REQUIRED" });
+  });
+
+  it("limits content operations reads to the selected client and writes to non-viewers", async () => {
+    const item = await createItem();
+    const other = await makeFixture();
+    expect((await listContentOperations(fixture.context, { q: "Wholesale chair" })).items.some((entry) => entry.id === item.id)).toBe(true);
+    await db.socialAccount.update({ where: { id: fixture.account.id }, data: { isSelected: false } });
+    const historical = await listContentOperations(fixture.context, { accountId: fixture.account.id });
+    expect(historical.items.some((entry) => entry.id === item.id)).toBe(true);
+    expect(historical.filterAccounts.some((account) => account.id === fixture.account.id)).toBe(true);
+    expect(historical.accounts.some((account) => account.id === fixture.account.id)).toBe(false);
+    expect((await listContentOperations(other.context, { q: "Wholesale chair" })).items.some((entry) => entry.id === item.id)).toBe(false);
+    expect(await getContentOperationsDetail(other.context, item.id)).toBeNull();
+    const viewer = { ...fixture.context, role: "VIEWER" as const };
+    await expect(updateDraftContent(viewer, item.id, { expectedVersionId: item.currentVersionId, text: "Viewer edit" })).rejects.toMatchObject({ status: 403 });
+    await expect(submitForReview(viewer, item.id, item.currentVersionId!)).rejects.toMatchObject({ status: 403 });
   });
 });
 
