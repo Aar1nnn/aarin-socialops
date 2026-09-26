@@ -246,6 +246,17 @@ export async function generateContentPlan(context: RequestContext, raw: unknown,
   return { ...result, generation: { simulated: generated.simulated, provider: generated.provider, ...strategyProvenanceFacts(strategyBinding) } };
 }
 
+async function assertNoUnresolvedManualPublish(tx: Prisma.TransactionClient, clientId: string, contentVersionId: string | null) {
+  if (!contentVersionId) return;
+  const unresolved = await tx.publishJob.findFirst({
+    where: { clientId, contentVersionId, adapter: "manual", status: PublishJobStatus.UNKNOWN },
+    select: { id: true },
+  });
+  if (unresolved) {
+    throw new AppError("人工发布结果仍不确定；先核实外部平台并在发布中心对账。", 409, "MANUAL_RECONCILIATION_REQUIRED");
+  }
+}
+
 export async function submitForReview(context: RequestContext, contentItemId: string, expectedVersionId?: string) {
   assertCanWrite(context);
   const item = await getScopedItem(context, contentItemId);
@@ -259,6 +270,7 @@ export async function submitForReview(context: RequestContext, contentItemId: st
     await tx.$queryRaw`SELECT "id" FROM "ContentItem" WHERE "id" = ${item.id} FOR UPDATE`;
     const liveItem = await tx.contentItem.findUniqueOrThrow({ where: { id: item.id } });
     if (liveItem.status === ContentStatus.RUNNING) throw new AppError("发布已经开始，必须等待结果或执行远端对账。", 409, "PUBLISH_IN_PROGRESS");
+    await assertNoUnresolvedManualPublish(tx, context.clientId, liveItem.currentVersionId);
     if (liveItem.currentVersionId !== item.currentVersionId || (expectedVersionId && liveItem.currentVersionId !== expectedVersionId)) throw new AppError("内容已被其他操作更新，请刷新后重试。", 409, "VERSION_CONFLICT");
     await tx.publishJob.updateMany({
       where: {
@@ -315,6 +327,7 @@ export async function editContentVersion(
     await tx.$queryRaw`SELECT "id" FROM "ContentItem" WHERE "id" = ${item.id} FOR UPDATE`;
     const liveItem = await tx.contentItem.findUniqueOrThrow({ where: { id: item.id } });
     if (liveItem.status === ContentStatus.RUNNING) throw new AppError("发布已经开始，不能编辑；请等待结果或执行远端对账。", 409, "PUBLISH_IN_PROGRESS");
+    await assertNoUnresolvedManualPublish(tx, context.clientId, liveItem.currentVersionId);
     if (liveItem.currentVersionId !== item.currentVersionId) throw new AppError("内容已被其他操作更新，请刷新后重试。", 409, "STALE_OPERATION");
     if (aiEdit) {
       const usedPrompt = await tx.promptVersion.findFirst({ where: { id: input.promptVersionId!, clientId: context.clientId } });
@@ -558,7 +571,9 @@ export async function validatePublicationInTransaction(
     } },
   });
   const isDemo = client.mode === ClientMode.DEMO;
-  const manualPublish = client.mode === ClientMode.LIVE && resolveAccountPublishingMode(item.account) === "MANUAL";
+  const manualPublish = client.mode === ClientMode.LIVE && (existing
+    ? existing.adapter === "manual"
+    : resolveAccountPublishingMode(item.account) === "MANUAL");
   if (manualPublish && !item.account.isSelected) {
     throw new AppError("人工管理账号尚未选中。", 409, "MANUAL_ACCOUNT_NOT_SELECTED");
   }

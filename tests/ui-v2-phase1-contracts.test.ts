@@ -57,9 +57,18 @@ describe("UI V2 Phase 1 route contracts", () => {
     expect(page).toContain('title="发布中心"');
     expect(page).toContain('UNKNOWN 表示外部是否已收到发布尚不确定');
     expect(page).toContain('writable && manual');
+    expect(page).toContain('const manual = job.adapter === "manual"');
+    expect(page).toContain('action={`/api/publish-jobs/${job.id}/start-manual`}');
+    expect(page).not.toContain('resolveAccountPublishingMode(job.account)');
     expect(page).toContain('writable && !manual && job.status === "UNKNOWN"');
     expect(page).toContain('本页面不恢复执行');
     expect(page).not.toContain('恢复执行</button>');
+  });
+
+  it("shows the existing job adapter on the content detail page", () => {
+    const page = source("../src/app/content/[id]/page.tsx");
+    expect(page).toContain('currentJob.adapter === "manual" ? "MANUAL" : "API"');
+    expect(page).toContain('publishingMode={publishingMode}');
   });
 
   it("does not collapse UNKNOWN into failed or link to untrusted remote schemes", () => {

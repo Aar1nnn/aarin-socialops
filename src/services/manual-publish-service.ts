@@ -3,14 +3,13 @@ import { z } from "zod";
 import { assertCanWrite, type RequestContext } from "../lib/context";
 import { db } from "../lib/db";
 import { AppError } from "../lib/errors";
-import { resolveAccountPublishingMode } from "../lib/manual-account";
-import { OPEN_MANUAL_TASK_STATUSES } from "../lib/publishing-status";
+import { MANUAL_PLATFORMS, type ManualPlatform } from "../lib/manual-account";
 import { sha256 } from "../lib/security";
 import { zonedLocalDateTimeToUtc } from "../lib/timezone";
 
 const manualResultSchema = z.object({
   expectedContentVersionId: z.string().min(1),
-  expectedJobStatus: z.enum(["MANUAL_PENDING", "UNKNOWN"]),
+  expectedJobStatus: z.enum(["RUNNING", "UNKNOWN"]),
   outcome: z.enum(["PUBLISHED", "FAILED", "UNKNOWN"]),
   publishedAt: z.coerce.date().optional(),
   publishedLocalDateTime: z.string().optional(),
@@ -50,6 +49,78 @@ function resultFingerprint(input: z.infer<typeof manualResultSchema>, publishedA
   }));
 }
 
+async function lockManualJob(tx: Prisma.TransactionClient, context: RequestContext, jobId: string) {
+  const scoped = await tx.publishJob.findFirst({
+    where: { id: jobId, clientId: context.clientId },
+    select: { contentVersion: { select: { contentItemId: true } } },
+  });
+  if (!scoped) throw new AppError("发布任务不存在或无权访问。", 404, "PUBLISH_JOB_NOT_FOUND");
+  await tx.$queryRaw`SELECT "id" FROM "ContentItem" WHERE "id" = ${scoped.contentVersion.contentItemId} AND "clientId" = ${context.clientId} FOR UPDATE`;
+  await tx.$queryRaw`SELECT "id" FROM "PublishJob" WHERE "id" = ${jobId} AND "clientId" = ${context.clientId} FOR UPDATE`;
+  const job = await tx.publishJob.findFirst({
+    where: { id: jobId, clientId: context.clientId },
+    include: { account: true, contentVersion: { include: { item: true } } },
+  });
+  if (!job || job.adapter !== "manual") throw new AppError("这不是人工发布任务。", 409, "NOT_MANUAL_PUBLISH_JOB");
+  if (job.account.clientId !== context.clientId || job.contentVersion.clientId !== context.clientId
+    || job.contentVersion.item.clientId !== context.clientId || job.accountId !== job.contentVersion.item.accountId) {
+    throw new AppError("任务账号或内容客户范围不一致。", 409, "TENANT_SCOPE_MISMATCH");
+  }
+  return job;
+}
+
+const manualStartSchema = z.object({
+  expectedContentVersionId: z.string().min(1),
+  expectedJobStatus: z.literal("MANUAL_PENDING"),
+});
+
+export async function startManualPublish(context: RequestContext, jobId: string, raw: unknown) {
+  assertCanWrite(context);
+  const input = manualStartSchema.parse(raw);
+  return db.$transaction(async (tx) => {
+    await tx.$queryRaw`SELECT "id" FROM "Client" WHERE "id" = ${context.clientId} FOR SHARE`;
+    const client = await tx.client.findUniqueOrThrow({ where: { id: context.clientId }, select: { mode: true } });
+    if (client.mode !== ClientMode.LIVE) throw new AppError("只有正式客户可开始真实人工发布。", 409, "LIVE_MODE_REQUIRED");
+    const job = await lockManualJob(tx, context, jobId);
+    if (job.contentVersionId !== input.expectedContentVersionId || job.contentVersion.item.currentVersionId !== job.contentVersionId) {
+      throw new AppError("发布内容版本已变化，请刷新。", 409, "VERSION_CONFLICT");
+    }
+    if (!MANUAL_PLATFORMS.includes(job.account.platform as ManualPlatform) || !job.account.isSelected) {
+      throw new AppError("人工发布目标账号不再可用。", 409, "MANUAL_ACCOUNT_REQUIRED");
+    }
+    const approval = await tx.approval.findFirst({
+      where: { clientId: context.clientId, contentVersionId: job.contentVersionId, accountId: job.accountId },
+      orderBy: { createdAt: "desc" },
+    });
+    if (approval?.decision !== ApprovalDecision.APPROVED) {
+      throw new AppError("当前版本与账号缺少有效人工批准。", 409, "APPROVAL_REQUIRED");
+    }
+    const task = await tx.manualTask.findFirst({
+      where: { clientId: context.clientId, publishJobId: job.id }, orderBy: { createdAt: "desc" },
+    });
+    if (!task || task.contentItemId !== job.contentVersion.item.id || task.accountId !== job.accountId) {
+      throw new AppError("人工发布任务不存在或绑定已变化。", 409, "MANUAL_TASK_MISSING");
+    }
+    if (job.status === PublishJobStatus.RUNNING && job.contentVersion.item.status === ContentStatus.RUNNING
+      && task.status === "IN_PROGRESS" && !job.lockedAt && !job.lockedBy) return job;
+    if (job.status !== PublishJobStatus.MANUAL_PENDING || job.contentVersion.item.status !== ContentStatus.SCHEDULED
+      || task.status !== "TODO" || job.lockedAt || job.lockedBy || job.attemptCount !== 0) {
+      throw new AppError("人工发布状态已变化，请刷新。", 409, "MANUAL_START_CONFLICT");
+    }
+    const started = await tx.publishJob.update({ where: { id: job.id }, data: { status: PublishJobStatus.RUNNING } });
+    await tx.contentItem.update({ where: { id: job.contentVersion.item.id }, data: { status: ContentStatus.RUNNING } });
+    await tx.manualTask.update({ where: { id: task.id }, data: { status: "IN_PROGRESS" } });
+    await tx.auditLog.create({
+      data: {
+        clientId: context.clientId, userId: context.userId, action: "MANUAL_PUBLISH_STARTED",
+        entityType: "PublishJob", entityId: job.id,
+        metadata: { contentVersionId: job.contentVersionId, accountId: job.accountId, manualTaskId: task.id },
+      },
+    });
+    return started;
+  });
+}
+
 export async function recordManualPublishResult(context: RequestContext, jobId: string, raw: unknown) {
   assertCanWrite(context);
   const input = manualResultSchema.parse(raw);
@@ -64,27 +135,7 @@ export async function recordManualPublishResult(context: RequestContext, jobId: 
     if (publishedAt && publishedAt.getTime() > Date.now()) throw new AppError("实际发布时间不能在未来。", 400, "INVALID_PUBLISHED_AT");
     const fingerprint = resultFingerprint(input, publishedAt);
 
-    const scoped = await tx.publishJob.findFirst({
-      where: { id: jobId, clientId: context.clientId },
-      select: { contentVersion: { select: { contentItemId: true } } },
-    });
-    if (!scoped) throw new AppError("发布任务不存在或无权访问。", 404, "PUBLISH_JOB_NOT_FOUND");
-    await tx.$queryRaw`SELECT "id" FROM "ContentItem" WHERE "id" = ${scoped.contentVersion.contentItemId} AND "clientId" = ${context.clientId} FOR UPDATE`;
-    await tx.$queryRaw`SELECT "id" FROM "PublishJob" WHERE "id" = ${jobId} AND "clientId" = ${context.clientId} FOR UPDATE`;
-    const job = await tx.publishJob.findFirst({
-      where: { id: jobId, clientId: context.clientId },
-      include: {
-        account: true,
-        contentVersion: { include: { item: true } },
-      },
-    });
-    if (!job || job.adapter !== "manual" || resolveAccountPublishingMode(job.account) !== "MANUAL") {
-      throw new AppError("这不是人工发布任务。", 409, "NOT_MANUAL_PUBLISH_JOB");
-    }
-    if (job.account.clientId !== context.clientId || job.contentVersion.clientId !== context.clientId
-      || job.contentVersion.item.clientId !== context.clientId || job.accountId !== job.contentVersion.item.accountId) {
-      throw new AppError("任务账号或内容客户范围不一致。", 409, "TENANT_SCOPE_MISMATCH");
-    }
+    const job = await lockManualJob(tx, context, jobId);
     if (job.contentVersionId !== input.expectedContentVersionId) {
       throw new AppError("发布内容版本已变化，请刷新。", 409, "VERSION_CONFLICT");
     }
@@ -95,14 +146,17 @@ export async function recordManualPublishResult(context: RequestContext, jobId: 
     const priorMetadata = prior?.metadata && typeof prior.metadata === "object" && !Array.isArray(prior.metadata)
       ? prior.metadata as Record<string, unknown> : null;
     if (job.status === input.outcome && priorMetadata?.resultFingerprint === fingerprint) return job;
+    if (job.status === PublishJobStatus.UNKNOWN && input.outcome === "UNKNOWN") {
+      throw new AppError("UNKNOWN 的现有证据不能覆盖；请核实后记录已发布或明确未发布。", 409, "MANUAL_RESULT_CONFLICT");
+    }
     if (job.status !== input.expectedJobStatus) {
       throw new AppError("发布结果已被其他操作记录，请刷新。", 409, "MANUAL_RESULT_CONFLICT");
     }
-    if (job.status !== PublishJobStatus.MANUAL_PENDING && job.status !== PublishJobStatus.UNKNOWN) {
+    if (job.status !== PublishJobStatus.RUNNING && job.status !== PublishJobStatus.UNKNOWN) {
       throw new AppError("任务已经终结，不能覆盖发布结果。", 409, "MANUAL_RESULT_CONFLICT");
     }
     if (job.contentVersion.item.currentVersionId !== job.contentVersionId
-      || job.contentVersion.item.status !== (job.status === PublishJobStatus.UNKNOWN ? ContentStatus.UNKNOWN : ContentStatus.SCHEDULED)) {
+      || job.contentVersion.item.status !== (job.status === PublishJobStatus.UNKNOWN ? ContentStatus.UNKNOWN : ContentStatus.RUNNING)) {
       throw new AppError("内容状态已变化，请刷新。", 409, "STALE_OPERATION");
     }
     const approval = await tx.approval.findFirst({
@@ -113,7 +167,7 @@ export async function recordManualPublishResult(context: RequestContext, jobId: 
       throw new AppError("当前版本与账号缺少有效人工批准。", 409, "APPROVAL_REQUIRED");
     }
     const task = await tx.manualTask.findFirst({
-      where: { clientId: context.clientId, publishJobId: job.id, status: { in: [...OPEN_MANUAL_TASK_STATUSES] } },
+      where: { clientId: context.clientId, publishJobId: job.id, status: job.status === PublishJobStatus.UNKNOWN ? "WAITING_EXTERNAL" : "IN_PROGRESS" },
       orderBy: { createdAt: "desc" },
     });
     if (!task || task.contentItemId !== job.contentVersion.item.id || task.accountId !== job.accountId) {

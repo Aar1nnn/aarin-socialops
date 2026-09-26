@@ -110,6 +110,10 @@ export async function updateProductFacts(context: RequestContext, productId: str
     `;
     const running = await tx.contentItem.count({ where: { clientId: context.clientId, plan: { productId }, status: ContentStatus.RUNNING } });
     if (running > 0) throw new AppError("关联内容正在发布，不能修改产品事实；请等待发布结果或先完成对账。", 409, "PUBLISH_IN_PROGRESS");
+    const unresolvedManual = await tx.publishJob.count({
+      where: { clientId: context.clientId, adapter: "manual", status: PublishJobStatus.UNKNOWN, contentVersion: { item: { plan: { productId } } } },
+    });
+    if (unresolvedManual > 0) throw new AppError("关联人工发布结果仍不确定；先核实外部平台并在发布中心对账。", 409, "MANUAL_RECONCILIATION_REQUIRED");
     for (const field of input.fields) {
       await tx.productField.upsert({
         where: { productId_key: { productId, key: field.key } },

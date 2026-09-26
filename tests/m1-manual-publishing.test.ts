@@ -11,7 +11,8 @@ import { regeneratePlatformVariant, rewriteContent } from "../src/services/conte
 import { editContentVersion, reviewContent, schedulePublication, submitForReview } from "../src/services/content-service";
 import { createManualAccount } from "../src/services/manual-account-service";
 import { createManualContent } from "../src/services/manual-content-service";
-import { recordManualPublishResult } from "../src/services/manual-publish-service";
+import { recordManualPublishResult, startManualPublish } from "../src/services/manual-publish-service";
+import { updateProductFacts } from "../src/services/product-service";
 import { queryPlatformPublish } from "../src/services/platform-publish-query-service";
 import { reconcileUnknownPublish } from "../src/services/publish-worker-service";
 import { claimPublishJob } from "../src/services/publish-worker-service";
@@ -131,8 +132,18 @@ describe("M1 manual publishing", () => {
     expect((await schedulePublication(f.roles.OWNER, item.item.id)).id).toBe(job.id);
     await db.publishJob.update({ where: { id: job.id }, data: { nextAttemptAt: new Date(0) } });
     expect(await claimPublishJob(job.id, "must-not-claim-manual")).toBeNull();
+    await expect(startManualPublish(f.roles.VIEWER, job.id, { expectedContentVersionId: item.version.id, expectedJobStatus: "MANUAL_PENDING" })).rejects.toMatchObject({ code: "FORBIDDEN" });
+    await expect(startManualPublish(f.roles.OWNER, job.id, { expectedContentVersionId: "stale-version", expectedJobStatus: "MANUAL_PENDING" })).rejects.toMatchObject({ code: "VERSION_CONFLICT" });
+    await expect(recordManualPublishResult(f.roles.OPERATOR, job.id, { expectedContentVersionId: item.version.id, expectedJobStatus: "RUNNING", outcome: "UNKNOWN", evidence: "Not started" })).rejects.toMatchObject({ code: "MANUAL_RESULT_CONFLICT" });
+    const started = await startManualPublish(f.roles.OPERATOR, job.id, { expectedContentVersionId: item.version.id, expectedJobStatus: "MANUAL_PENDING" });
+    expect(started).toMatchObject({ status: "RUNNING", lockedAt: null, lockedBy: null, attemptCount: 0 });
+    expect((await startManualPublish(f.roles.OWNER, job.id, { expectedContentVersionId: item.version.id, expectedJobStatus: "MANUAL_PENDING" })).id).toBe(job.id);
+    expect((await db.contentItem.findUniqueOrThrow({ where: { id: item.item.id } })).status).toBe("RUNNING");
+    expect(await db.manualTask.count({ where: { publishJobId: job.id, status: "IN_PROGRESS" } })).toBe(1);
+    expect(await db.auditLog.count({ where: { clientId: f.client.id, entityId: job.id, action: "MANUAL_PUBLISH_STARTED" } })).toBe(1);
+    expect(await claimPublishJob(job.id, "must-not-claim-running-manual")).toBeNull();
     expect(await db.publishAttempt.count({ where: { publishJobId: job.id } })).toBe(0);
-    const submitted = { expectedContentVersionId: item.version.id, expectedJobStatus: "MANUAL_PENDING", outcome: "PUBLISHED", publishedAt: new Date(Date.now() - 60_000).toISOString(), remotePostUrl: "https://www.linkedin.com/posts/verified-1", evidence: "Checked the public post in the target account." };
+    const submitted = { expectedContentVersionId: item.version.id, expectedJobStatus: "RUNNING", outcome: "PUBLISHED", publishedAt: new Date(Date.now() - 60_000).toISOString(), remotePostUrl: "https://www.linkedin.com/posts/verified-1", evidence: "Checked the public post in the target account." };
     await expect(recordManualPublishResult(f.roles.VIEWER, job.id, submitted)).rejects.toMatchObject({ code: "FORBIDDEN" });
     const published = await recordManualPublishResult(f.roles.OPERATOR, job.id, submitted);
     expect(published.status).toBe("PUBLISHED");
@@ -148,9 +159,11 @@ describe("M1 manual publishing", () => {
     const target = await account(f);
     const item = await approvedContent(f, target.id);
     const job = await schedulePublication(f.roles.OPERATOR, item.item.id, new Date(Date.now() + 86_400_000));
-    await expect(recordManualPublishResult(f.roles.OPERATOR, job.id, { expectedContentVersionId: item.version.id, expectedJobStatus: "MANUAL_PENDING", outcome: "FAILED", evidence: "Could not verify outcome." })).rejects.toThrow();
-    const unknown = { expectedContentVersionId: item.version.id, expectedJobStatus: "MANUAL_PENDING", outcome: "UNKNOWN", evidence: "Platform confirmation timed out; external result uncertain." };
+    await startManualPublish(f.roles.OPERATOR, job.id, { expectedContentVersionId: item.version.id, expectedJobStatus: "MANUAL_PENDING" });
+    await expect(recordManualPublishResult(f.roles.OPERATOR, job.id, { expectedContentVersionId: item.version.id, expectedJobStatus: "RUNNING", outcome: "FAILED", evidence: "Could not verify outcome." })).rejects.toThrow();
+    const unknown = { expectedContentVersionId: item.version.id, expectedJobStatus: "RUNNING", outcome: "UNKNOWN", evidence: "Platform confirmation timed out; external result uncertain." };
     expect((await recordManualPublishResult(f.roles.OPERATOR, job.id, unknown)).status).toBe("UNKNOWN");
+    await expect(recordManualPublishResult(f.roles.OPERATOR, job.id, { ...unknown, expectedJobStatus: "UNKNOWN", evidence: "Different uncertain evidence" })).rejects.toMatchObject({ code: "MANUAL_RESULT_CONFLICT" });
     await expect(reconcileUnknownPublish(f.roles.OWNER, job.id, { outcome: "PUBLISHED", remotePostId: "fake", note: "wrong route" })).rejects.toMatchObject({ code: "MANUAL_RECONCILIATION_REQUIRED" });
     await expect(queryPlatformPublish(f.roles.OWNER, job.id)).rejects.toMatchObject({ code: "MANUAL_QUERY_UNSUPPORTED" });
     expect((await recordManualPublishResult(f.roles.OPERATOR, job.id, unknown)).status).toBe("UNKNOWN");
@@ -163,6 +176,44 @@ describe("M1 manual publishing", () => {
     expect((await db.publishJob.findUniqueOrThrow({ where: { id: job.id } })).attemptCount).toBe(0);
   });
 
+  it("keeps manual dispatch immutable and uses the job adapter after account metadata changes", async () => {
+    const f = await fixture();
+    const target = await account(f);
+    const item = await approvedContent(f, target.id, f.product.id);
+    const job = await schedulePublication(f.roles.OPERATOR, item.item.id, new Date(Date.now() + 86_400_000));
+    await db.socialAccount.update({ where: { id: target.id }, data: { metadata: { managementMode: "API" } } });
+    expect(resolveAccountPublishingMode(await db.socialAccount.findUniqueOrThrow({ where: { id: target.id } }))).toBe("API");
+    expect((await listCalendarEntries(f.roles.VIEWER, { view: "list" })).find((entry) => entry.id === item.item.id)?.publishingMode).toBe("MANUAL");
+    await rescheduleCalendarItems(f.roles.OPERATOR, { contentItemIds: [item.item.id], scheduledAt: new Date(Date.now() + 2 * 86_400_000) });
+    expect((await db.publishJob.findUniqueOrThrow({ where: { id: job.id } })).adapter).toBe("manual");
+    const startInput = { expectedContentVersionId: item.version.id, expectedJobStatus: "MANUAL_PENDING" };
+    const starts = await Promise.allSettled([
+      startManualPublish(f.roles.OPERATOR, job.id, startInput),
+      startManualPublish(f.roles.OWNER, job.id, startInput),
+    ]);
+    expect(starts.every((entry) => entry.status === "fulfilled")).toBe(true);
+    expect(await db.auditLog.count({ where: { clientId: f.client.id, entityId: job.id, action: "MANUAL_PUBLISH_STARTED" } })).toBe(1);
+    await expect(editContentVersion(f.roles.OPERATOR, item.item.id, { expectedVersionId: item.version.id, text: "Unsafe replacement" })).rejects.toMatchObject({ code: "PUBLISH_IN_PROGRESS" });
+    await expect(submitForReview(f.roles.OPERATOR, item.item.id, item.version.id)).rejects.toMatchObject({ code: "PUBLISH_IN_PROGRESS" });
+    await expect(reviewContent(f.roles.OWNER, item.item.id, "APPROVED", "Repeat", item.version.id)).rejects.toMatchObject({ code: "NOT_REVIEW_PENDING" });
+    const productUpdate = { name: f.product.name, fields: [{ key: "material", value: "replacement", status: "CONFIRMED", source: "new sheet" }] };
+    await expect(updateProductFacts(f.roles.OWNER, f.product.id, productUpdate)).rejects.toMatchObject({ code: "PUBLISH_IN_PROGRESS" });
+    expect((await db.publishJob.findUniqueOrThrow({ where: { id: job.id } })).status).toBe("RUNNING");
+    expect((await db.contentItem.findUniqueOrThrow({ where: { id: item.item.id } })).status).toBe("RUNNING");
+    expect(await db.manualTask.count({ where: { publishJobId: job.id, status: "IN_PROGRESS" } })).toBe(1);
+    const unknown = { expectedContentVersionId: item.version.id, expectedJobStatus: "RUNNING", outcome: "UNKNOWN", evidence: "No platform confirmation; no retry." };
+    expect((await recordManualPublishResult(f.roles.OPERATOR, job.id, unknown)).status).toBe("UNKNOWN");
+    await expect(editContentVersion(f.roles.OPERATOR, item.item.id, { expectedVersionId: item.version.id, text: "Unsafe unknown edit" })).rejects.toMatchObject({ code: "MANUAL_RECONCILIATION_REQUIRED" });
+    await expect(submitForReview(f.roles.OPERATOR, item.item.id, item.version.id)).rejects.toMatchObject({ code: "MANUAL_RECONCILIATION_REQUIRED" });
+    await expect(updateProductFacts(f.roles.OWNER, f.product.id, productUpdate)).rejects.toMatchObject({ code: "MANUAL_RECONCILIATION_REQUIRED" });
+    expect((await db.publishJob.findUniqueOrThrow({ where: { id: job.id } })).status).toBe("UNKNOWN");
+    expect((await db.contentItem.findUniqueOrThrow({ where: { id: item.item.id } })).status).toBe("UNKNOWN");
+    expect((await recordManualPublishResult(f.roles.OWNER, job.id, {
+      expectedContentVersionId: item.version.id, expectedJobStatus: "UNKNOWN", outcome: "FAILED",
+      evidence: "Test operator confirmed no external post was created.", confirmedNoExternalPost: true,
+    })).status).toBe("FAILED");
+  });
+
   it("cancels pending manual tasks when content changes and rejects stale result submissions", async () => {
     const f = await fixture();
     const target = await account(f);
@@ -171,7 +222,7 @@ describe("M1 manual publishing", () => {
     await editContentVersion(f.roles.OPERATOR, item.item.id, { expectedVersionId: item.version.id, text: "Human changed the copy." });
     expect((await db.publishJob.findUniqueOrThrow({ where: { id: job.id } })).status).toBe("CANCELLED");
     expect(await db.manualTask.count({ where: { publishJobId: job.id, status: "CANCELLED" } })).toBe(1);
-    await expect(recordManualPublishResult(f.roles.OPERATOR, job.id, { expectedContentVersionId: item.version.id, expectedJobStatus: "MANUAL_PENDING", outcome: "UNKNOWN", evidence: "Stale operator" })).rejects.toMatchObject({ code: "MANUAL_RESULT_CONFLICT" });
+    await expect(recordManualPublishResult(f.roles.OPERATOR, job.id, { expectedContentVersionId: item.version.id, expectedJobStatus: "RUNNING", outcome: "UNKNOWN", evidence: "Stale operator" })).rejects.toMatchObject({ code: "MANUAL_RESULT_CONFLICT" });
   });
 
   it("cancels pending manual tasks when approval is reopened", async () => {
@@ -190,8 +241,9 @@ describe("M1 manual publishing", () => {
     const item = await approvedContent(f, target.id);
     const job = await schedulePublication(f.roles.OPERATOR, item.item.id, new Date(Date.now() + 86_400_000));
     const other = await fixture();
+    await expect(startManualPublish(other.roles.OWNER, job.id, { expectedContentVersionId: item.version.id, expectedJobStatus: "MANUAL_PENDING" })).rejects.toMatchObject({ code: "PUBLISH_JOB_NOT_FOUND" });
     await expect(recordManualPublishResult(other.roles.OWNER, job.id, {
-      expectedContentVersionId: item.version.id, expectedJobStatus: "MANUAL_PENDING", outcome: "UNKNOWN", evidence: "Other tenant",
+      expectedContentVersionId: item.version.id, expectedJobStatus: "RUNNING", outcome: "UNKNOWN", evidence: "Other tenant",
     })).rejects.toMatchObject({ code: "PUBLISH_JOB_NOT_FOUND" });
   });
 
@@ -205,9 +257,10 @@ describe("M1 manual publishing", () => {
       });
       const item = await approvedContent(f, target.id, undefined, [video.id]);
       const job = await schedulePublication(f.roles.OPERATOR, item.item.id, new Date(Date.now() + 86_400_000));
+      await startManualPublish(f.roles.OPERATOR, job.id, { expectedContentVersionId: item.version.id, expectedJobStatus: "MANUAL_PENDING" });
       const published = await recordManualPublishResult(f.roles.OPERATOR, job.id, {
         expectedContentVersionId: item.version.id,
-        expectedJobStatus: "MANUAL_PENDING",
+        expectedJobStatus: "RUNNING",
         outcome: "PUBLISHED",
         publishedAt: new Date(Date.now() - 60_000).toISOString(),
         remotePostUrl: platform === "tiktok" ? "https://www.tiktok.com/@m1/video/123" : "https://www.youtube.com/watch?v=m1test",

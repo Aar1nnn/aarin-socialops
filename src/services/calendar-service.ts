@@ -86,7 +86,7 @@ export async function listCalendarEntries(context: RequestContext, raw: unknown 
       platform: item.platform,
       accountId: item.accountId,
       accountName: item.account.displayName,
-      publishingMode: resolveAccountPublishingMode(item.account),
+      publishingMode: job ? job.adapter === "manual" ? "MANUAL" : "API" : resolveAccountPublishingMode(item.account),
       theme: item.plan.theme,
       productName: item.plan.product?.name || null,
       title: item.currentVersion?.title || null,
