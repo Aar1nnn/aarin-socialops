@@ -6,13 +6,13 @@ import { formatDateTime, getStatusPresentation, platformLabel, statusLabel } fro
 
 describe("operator presentation", () => {
   it.each([
-    ["REVIEW_PENDING", "待审核"],
+    ["REVIEW_PENDING", "待人工审核"],
     ["WAITING_CONFIGURATION", "待配置"],
     ["PERMISSION_MISSING", "权限不足"],
     ["CATALOG_REQUEST", "索取目录"],
     ["WAITING_EXTERNAL", "等待外部反馈"],
     ["PUBLISHED", "已发布"],
-    ["UNKNOWN", "待确认"],
+    ["UNKNOWN", "结果待确认"],
     ["LIVE", "正式"],
     ["DEMO", "演示"],
     ["READ_FAILED", "同步失败"],

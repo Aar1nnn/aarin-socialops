@@ -109,9 +109,9 @@ export default async function DashboardPage() {
         <PageHeader title="总览" description="查看内容、发布、连接与线索的最新运行状态。" />
 
         <section aria-labelledby="operational-summary-title">
-          <h2 className="eyebrow" id="operational-summary-title">Operational summary</h2>
+          <h2 className="eyebrow" id="operational-summary-title">运营概览</h2>
           <div className="summary-strip">
-            <div className="summary-item"><span>待审核</span><strong>{reviewCount}</strong></div>
+            <div className="summary-item"><span>待人工审核</span><strong>{reviewCount}</strong></div>
             <div className="summary-item"><span>已排期</span><strong>{scheduledCount}</strong></div>
             <div className="summary-item"><span>新线索</span><strong>{newLeadCount}</strong></div>
             <div className="summary-item"><span>需处理</span><strong>{attentionCount}</strong></div>
@@ -222,7 +222,7 @@ export default async function DashboardPage() {
 
                 {connectionHealthIssueCount > 0 ? (
                   <Notice title={`${connectionHealthIssueCount} 项连接或账号能力需要检查`} tone="warning">
-                    <span>完成授权和能力验证后，相关发布功能才会启用。 <a className="text-link" href="/connections">查看平台连接</a></span>
+                    <span>完成授权和能力验证后，相关发布功能才会启用。 <a className="text-link" href="/accounts">查看平台与账号</a></span>
                   </Notice>
                 ) : null}
               </div>
@@ -230,7 +230,7 @@ export default async function DashboardPage() {
           </section>
 
           <section className="panel" aria-label="平台连接">
-            <SectionHeader title="平台连接" description="当前工作区已启用账号的发布能力。" action={<a className="text-link" href="/connections">管理连接</a>} />
+            <SectionHeader title="平台与账号" description="当前工作区已启用账号的发布能力。" action={<a className="text-link" href="/accounts">管理账号</a>} />
             {accounts.length === 0 ? (
               <EmptyState title="尚未启用平台账号" description="连接并选择账号后，平台状态会显示在这里。" />
             ) : (
@@ -262,7 +262,7 @@ export default async function DashboardPage() {
         </div>
 
         <section className="panel" aria-label="近期发布">
-          <SectionHeader title="近期发布" description="最近更新的发布任务与远端状态。" action={<a className="text-link" href="/content">查看全部内容</a>} />
+          <SectionHeader title="近期发布" description="最近更新的发布任务与远端状态。" action={<a className="text-link" href="/publishing">查看发布中心</a>} />
           {jobs.length === 0 ? (
             <EmptyState title="还没有发布记录" description="内容完成审核并排期后，发布活动会显示在这里。" />
           ) : (

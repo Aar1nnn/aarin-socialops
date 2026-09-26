@@ -8,7 +8,7 @@ export default async function AnalyticsPage({ searchParams }: { searchParams: Pr
   const grain: AnalyticsGrain = query.grain === "day" || query.grain === "month" ? query.grain : "week";
   const analytics = await getAnalyticsOverview(context, grain);
   return <OperatorShell context={context}>
-    <div className="page-title"><div><h1>社媒数据分析</h1><p className="muted">统一指标来自 MetricSnapshot；缺失、无权限和读取失败不会显示成 0。</p></div></div>
+    <div className="page-title"><div><h1>数据分析</h1><p className="muted">统一指标来自 MetricSnapshot；缺失、无权限和读取失败不会显示成 0。</p></div></div>
     <div className="grid">
       <section className="card span-8"><form method="get" className="row"><label>周期<select name="grain" defaultValue={grain}><option value="day">日</option><option value="week">周</option><option value="month">月</option></select></label><button>更新视图</button></form></section>
       <section className="card span-4"><span className={`badge ${analytics.freshness === "fresh" ? "ok" : analytics.freshness === "failed" ? "urgent" : ""}`}>{analytics.freshness}</span><p>最近同步：{analytics.latestFetchedAt?.toLocaleString("zh-CN") || "未同步"}</p></section>

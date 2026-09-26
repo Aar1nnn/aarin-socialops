@@ -143,9 +143,11 @@ describe("pilot operator UI form contracts", () => {
     });
 
     it("keeps the non-publishing foundation routes in the integrated navigation", () => {
-      expect(primaryNavSource).toContain('{ href: "/calendar", label: "日历"');
-      expect(primaryNavSource).toContain('{ href: "/brand", label: "品牌"');
+      expect(primaryNavSource).toContain('{ href: "/calendar", label: "内容日历"');
+      expect(primaryNavSource).toContain('{ href: "/brand", label: "品牌与知识"');
       expect(primaryNavSource).toContain('{ href: "/analytics", label: "数据分析"');
+      expect(primaryNavSource).toContain('{ href: "/accounts", label: "平台与账号"');
+      expect(primaryNavSource).toContain('{ href: "/publishing", label: "发布中心"');
     });
 
     it("preserves external notification channel setup outside the workspace form", () => {

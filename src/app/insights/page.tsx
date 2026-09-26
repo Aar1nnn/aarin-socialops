@@ -164,7 +164,7 @@ export default async function InsightsPage() {
     <OperatorShell context={context}>
       <div className="page">
         <PageHeader
-          title="线索与数据"
+          title="互动与线索"
           description="跟进采购线索，查看互动、指标和运营复盘。"
         />
 

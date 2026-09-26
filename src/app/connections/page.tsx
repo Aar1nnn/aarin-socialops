@@ -42,9 +42,14 @@ function connectionRecoveryMessage(status: string) {
 
 export default async function ConnectionsPage() {
   const context = await requirePageContext();
-  const [connections, workspace] = await Promise.all([
+  const [connections, workspace, accounts] = await Promise.all([
     listPlatformConnections(context),
     db.client.findUniqueOrThrow({ where: { id: context.clientId }, select: { timezone: true } }),
+    db.socialAccount.findMany({
+      where: { clientId: context.clientId },
+      orderBy: [{ platform: "asc" }, { displayName: "asc" }],
+      select: { id: true, platform: true, displayName: true, accountType: true, isSelected: true, publishCapability: true, metricsCapability: true },
+    }),
   ]);
   const canManageConnections = context.role === "OWNER";
   const hasMetaConnection = connections.some((connection) => connection.provider === "META");
@@ -53,8 +58,8 @@ export default async function ConnectionsPage() {
     <OperatorShell context={context}>
       <div className="page">
         <PageHeader
-          title="平台连接"
-          description="管理用于发布和数据同步的平台账号。"
+          title="平台与账号"
+          description="查看账号可用性，并管理平台连接与授权。"
           action={(
             <form action="/api/connections/meta/start" method="post">
               <input type="hidden" name="returnTo" value="/connections" />
@@ -70,6 +75,28 @@ export default async function ConnectionsPage() {
             当前角色可查看连接和账号能力。连接、选择账号或断开授权需要工作区所有者操作。
           </Notice>
         ) : null}
+
+        <section className="panel" aria-label="工作区账号">
+          <SectionHeader title="工作区账号" description="账号状态来自现有 SocialAccount；未选中或未验证不代表可发布。" />
+          {accounts.length === 0 ? (
+            <EmptyState title="还没有账号" description="连接 Meta 并选择有权管理的账号后，这里会显示账号与能力状态。" />
+          ) : (
+            <div className="table-scroll" role="region" aria-label="工作区账号列表" tabIndex={0}>
+              <table>
+                <thead><tr><th>账号</th><th>平台</th><th>选择</th><th>发布能力</th><th>指标能力</th></tr></thead>
+                <tbody>{accounts.map((account) => (
+                  <tr key={account.id}>
+                    <td className="cell-title">{account.displayName}</td>
+                    <td>{accountTypeLabel(account.accountType, account.platform)}</td>
+                    <td>{account.isSelected ? "已选择" : "未选择"}</td>
+                    <td><StatusIndicator value={account.publishCapability} compact /></td>
+                    <td><StatusIndicator value={account.metricsCapability} compact /></td>
+                  </tr>
+                ))}</tbody>
+              </table>
+            </div>
+          )}
+        </section>
 
         {connections.length === 0 ? (
           <section className="section">
