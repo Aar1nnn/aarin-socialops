@@ -29,6 +29,7 @@ import type { PlatformAuthAdapter } from "../src/lib/adapters/platform-auth";
 import { TokenVault } from "../src/lib/token-vault";
 import { completePlatformConnection, disconnectPlatformConnection, selectPlatformAccounts, startPlatformConnection } from "../src/services/platform-connection-service";
 import { queryPlatformPublish } from "../src/services/platform-publish-query-service";
+import { confirmSocialStrategy, createSocialStrategyDraft } from "../src/services/social-strategy-service";
 
 type Fixture = {
   client: Client;
@@ -755,6 +756,18 @@ describe("platform remote query boundaries", () => {
         },
       }),
     ]);
+    const strategy = await createSocialStrategyDraft(fixture.context, { payload: {
+      businessGoal: "Verify platform query dispatch",
+      primaryBuyer: "Instagram buyers",
+      targetMarkets: ["US"],
+      platformRoles: [{ platform: "instagram", role: "Product discovery" }],
+      contentPillars: [{ name: "Confirmed facts", percentage: 100 }],
+      formatMix: [],
+      postingCadence: "Weekly",
+      coreMessage: "Verified product information",
+      ctaGuidance: [], priorityProducts: [], assetPriorities: [], experiments: [], limitations: [],
+    } });
+    await confirmSocialStrategy(fixture.context, strategy.id);
     const generated = await generateContentPlan(fixture.context, {
       productId: fixture.product.id,
       theme: "Instagram remote query",

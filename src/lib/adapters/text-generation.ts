@@ -76,6 +76,7 @@ export class OpenAICompatibleTextAdapter implements TextGenerationAdapter, Struc
         recentContent: input.recentContent,
         performanceContext: input.performanceContext,
         researchContext: input.researchContext,
+        socialStrategy: input.socialStrategy,
         strategy: input.strategy,
       },
     );

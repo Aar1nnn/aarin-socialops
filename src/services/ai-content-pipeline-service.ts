@@ -23,7 +23,7 @@ export const aiReviewSchema = z.object({
 });
 
 export type PipelineBaseInput = Omit<DraftGenerationInput,
-  "brandProfile" | "recentContent" | "performanceContext" | "researchContext" | "strategy">;
+  "brandProfile" | "recentContent" | "performanceContext" | "researchContext" | "socialStrategy" | "strategy">;
 
 export function generateStrategy(input: PipelineBaseInput, brand: Awaited<ReturnType<typeof buildCompositionContext>>["brand"]) {
   return contentStrategySchema.parse({
@@ -83,11 +83,17 @@ export async function runAIContentPipeline(
   return runPreparedAIContentPipeline(await prepareAIContentPipelineInput(context, baseInput), adapter, platformLimits);
 }
 
-export async function prepareAIContentPipelineInput(context: RequestContext, baseInput: PipelineBaseInput): Promise<DraftGenerationInput> {
+export async function prepareAIContentPipelineInput(
+  context: RequestContext,
+  baseInput: PipelineBaseInput,
+  socialStrategy: DraftGenerationInput["socialStrategy"] = null,
+): Promise<DraftGenerationInput> {
   const compositionContext = await buildCompositionContext(context);
   const strategy = generateStrategy(baseInput, compositionContext.brand);
   return {
     ...baseInput,
+    instruction: `${baseInput.instruction}\nUse only confirmed product facts for product claims. BrandProfile banned phrases, required mentions, and CTA rules are hard constraints. SocialStrategy is period guidance and never overrides confirmed product facts or BrandProfile rules.`,
+    socialStrategy,
     brandProfile: {
       businessSummary: compositionContext.brand.businessSummary || null,
       positioning: compositionContext.brand.positioning || null,

@@ -7,6 +7,7 @@ const NAV_GROUPS = [
   { label: "工作台", items: [{ href: "/", label: "总览", icon: "overview" }] },
   { label: "运营", items: [
     { href: "/content", label: "内容中心", icon: "content" },
+    { href: "/strategy", label: "运营策略", icon: "brand" },
     { href: "/calendar", label: "内容日历", icon: "calendar" },
     { href: "/publishing", label: "发布中心", icon: "publishing" },
   ] },
