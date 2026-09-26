@@ -333,7 +333,9 @@ code { overflow-wrap: anywhere; font-size: 0.88em; }
 .grid { display: grid; grid-template-columns: repeat(12, minmax(0, 1fr)); gap: 16px; }
 .span-12 { grid-column: span 12; }
 .span-8 { grid-column: span 8; }
+.span-7 { grid-column: span 7; }
 .span-6 { grid-column: span 6; }
+.span-5 { grid-column: span 5; }
 .span-4 { grid-column: span 4; }
 .span-3 { grid-column: span 3; }
 .split-layout { display: grid; grid-template-columns: minmax(0, 2fr) minmax(280px, 1fr); gap: 20px; }
@@ -682,7 +684,7 @@ details[open].disclosure > summary::after, details[open].card > summary::after {
   .toolbar-workspace-switcher { flex-wrap: wrap; }
   .toolbar-workspace-switcher select { width: min(180px, 35vw); }
   .main { padding: 26px 20px 44px; }
-  .span-8, .span-6, .span-4, .span-3 { grid-column: span 12; }
+  .span-8, .span-7, .span-6, .span-5, .span-4, .span-3 { grid-column: span 12; }
   .settings-section { grid-template-columns: 1fr; gap: 10px; }
   .calendar-board { grid-template-columns: repeat(7, minmax(145px, 1fr)); }
 }
