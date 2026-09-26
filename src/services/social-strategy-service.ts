@@ -35,6 +35,7 @@ export type SocialStrategyPayload = z.infer<typeof socialStrategyPayloadSchema>;
 
 const draftSchema = z.object({
   payload: socialStrategyPayloadSchema,
+  expectedDraftId: z.string().min(1).nullable().default(null),
   effectiveFrom: z.coerce.date().nullable().optional(),
   effectiveTo: z.coerce.date().nullable().optional(),
 }).refine((value) => !value.effectiveFrom || !value.effectiveTo || value.effectiveFrom <= value.effectiveTo, {
@@ -88,6 +89,9 @@ export async function createSocialStrategyDraft(context: RequestContext, raw: un
   return db.$transaction(async (tx) => {
     await lockClient(tx, context.clientId);
     const existing = await tx.socialStrategy.findFirst({ where: { clientId: context.clientId, status: SocialStrategyStatus.DRAFT } });
+    if ((existing?.id ?? null) !== input.expectedDraftId) {
+      throw new AppError("策略草稿已被其他人更新，请刷新页面后再编辑。", 409, "STRATEGY_VERSION_CONFLICT");
+    }
     if (existing) await tx.socialStrategy.update({ where: { id: existing.id }, data: { status: SocialStrategyStatus.ARCHIVED } });
     const latest = await tx.socialStrategy.findFirst({ where: { clientId: context.clientId }, orderBy: { version: "desc" }, select: { version: true } });
     const strategy = await tx.socialStrategy.create({
@@ -160,8 +164,8 @@ export async function resolveStrategyForComposition(clientId: string, mode: Clie
   }
   const strategy = await db.socialStrategy.findFirst({ where: { id: strategyId, clientId } });
   if (!strategy) throw new AppError("内容绑定的策略不存在。", 409, "STRATEGY_BINDING_REQUIRED");
-  if (mode === ClientMode.LIVE && strategy.status !== SocialStrategyStatus.CONFIRMED) {
-    throw new AppError("LIVE 内容绑定的策略不再是当前确认版；需要人工显式绑定新策略。", 409, "STRATEGY_BINDING_REQUIRED");
+  if (mode === ClientMode.LIVE && !strategy.confirmedAt) {
+    throw new AppError("LIVE 内容绑定的策略从未人工确认。", 409, "CONFIRMED_STRATEGY_REQUIRED");
   }
   return { strategy, provenance: strategy.confirmedAt ? "CONFIRMED_BINDING" : "DRAFT_PREVIEW" };
 }

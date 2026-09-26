@@ -319,9 +319,9 @@ export async function editContentVersion(
       if (liveClient.mode === ClientMode.LIVE && input.expectedStrategyId) {
         const liveStrategy = await tx.socialStrategy.findFirst({
           where: { id: input.expectedStrategyId, clientId: context.clientId },
-          select: { status: true },
+          select: { confirmedAt: true },
         });
-        if (liveStrategy?.status !== "CONFIRMED") throw new AppError("确认策略在模型运行期间发生变化。", 409, "STALE_OPERATION");
+        if (!liveStrategy?.confirmedAt) throw new AppError("内容绑定的策略在模型运行期间失去有效确认记录。", 409, "STALE_OPERATION");
       }
     }
     const version = await tx.contentVersion.create({

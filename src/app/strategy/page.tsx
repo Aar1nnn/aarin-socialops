@@ -10,8 +10,9 @@ function weighted(values: Array<{ name: string; percentage: number }>) {
   return values.map((item) => `${item.name} | ${item.percentage}`).join("\n");
 }
 
-export default async function StrategyPage() {
+export default async function StrategyPage({ searchParams }: { searchParams: Promise<{ error?: string }> }) {
   const context = await requirePageContext();
+  const { error } = await searchParams;
   const [strategies, client] = await Promise.all([
     listSocialStrategies(context),
     db.client.findUniqueOrThrow({ where: { id: context.clientId }, select: { name: true, mode: true, targetMarkets: true } }),
@@ -38,12 +39,14 @@ export default async function StrategyPage() {
   return <OperatorShell context={context}>
     <div className="page">
       <PageHeader title="运营策略" eyebrow={client.name} description="记录本运营周期的 Buyer、市场、平台和内容选择。产品已确认事实与 BrandProfile 硬规则始终优先。" />
-      {client.mode === "LIVE" && !confirmed ? <Notice title="AI 内容生成需要确认策略" tone="warning">LIVE 客户的 AI 初始生成需要确认版。已有内容的人工操作继续可用。</Notice> : null}
+      {client.mode === "LIVE" && !confirmed ? <div data-error-code="CONFIRMED_STRATEGY_REQUIRED"><Notice title="AI 内容生成需要确认策略" tone="warning">LIVE 客户的 AI 初始生成需要确认版。已有内容的人工操作继续可用。</Notice></div> : null}
+      {error === "STRATEGY_VERSION_CONFLICT" ? <Notice title="策略草稿已更新" tone="warning">另一位运营人员已保存新版本。请<a className="text-link" href="/strategy">刷新页面</a>，查看最新草稿后重新编辑。</Notice> : null}
       {readOnly ? <Notice title="只读访问">你可以查看策略；创建和确认需要运营权限。</Notice> : null}
       <div className="grid">
         <section className="card span-8"><h2>{draft ? `编辑草稿 v${draft.version}` : "新建策略草稿"}</h2>
           <p className="muted">每次保存都会创建新的不可变草稿版本；草稿不会自动确认。</p>
           {!readOnly ? <form action="/api/social-strategies" method="post" className="form-stack">
+            <input type="hidden" name="expectedDraftId" value={draft?.id || ""} />
             <div className="form-grid">
               {fields.map((field) => <label key={field.name}>{field.label}<textarea name={field.name} defaultValue={field.value} /></label>)}
               <label>有效期开始（可空）<input type="date" name="effectiveFrom" defaultValue={date(draft?.effectiveFrom || confirmed?.effectiveFrom || null)} /></label>

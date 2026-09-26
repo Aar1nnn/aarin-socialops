@@ -61,15 +61,31 @@ afterEach(async () => {
 afterAll(async () => { await db.$disconnect(); });
 
 describe("SocialStrategy V1", () => {
-  it("serializes concurrent draft creation and retains one active version", async () => {
+  it("serializes first draft creation and rejects a stale empty editor", async () => {
     const f = await fixture();
-    const [first, second] = await Promise.all([
+    const results = await Promise.allSettled([
       createSocialStrategyDraft(f.context.OWNER, { payload: payload() }),
       createSocialStrategyDraft(f.context.OPERATOR, { payload: payload({ coreMessage: "Another choice" }) }),
     ]);
-    expect([first.version, second.version].sort()).toEqual([1, 2]);
+    expect(results.filter((result) => result.status === "fulfilled")).toHaveLength(1);
+    expect(results.filter((result) => result.status === "rejected").map((result) => result.reason.code)).toEqual(["STRATEGY_VERSION_CONFLICT"]);
     expect(await db.socialStrategy.count({ where: { clientId: f.client.id, status: "DRAFT" } })).toBe(1);
-    expect(await db.socialStrategy.count({ where: { clientId: f.client.id, status: "ARCHIVED" } })).toBe(1);
+    expect(await db.socialStrategy.count({ where: { clientId: f.client.id } })).toBe(1);
+  }, 15_000);
+
+  it("rejects two editors saving from the same older draft", async () => {
+    const f = await fixture();
+    const first = await createSocialStrategyDraft(f.context.OWNER, { payload: payload() });
+    const results = await Promise.allSettled([
+      createSocialStrategyDraft(f.context.OWNER, { payload: payload({ coreMessage: "Owner revision" }), expectedDraftId: first.id }),
+      createSocialStrategyDraft(f.context.OPERATOR, { payload: payload({ coreMessage: "Operator revision" }), expectedDraftId: first.id }),
+    ]);
+    const saved = results.filter((result) => result.status === "fulfilled").map((result) => result.value);
+    expect(saved).toHaveLength(1);
+    expect(saved[0].version).toBe(2);
+    expect(results.filter((result) => result.status === "rejected").map((result) => result.reason.code)).toEqual(["STRATEGY_VERSION_CONFLICT"]);
+    expect(await db.socialStrategy.count({ where: { clientId: f.client.id, status: "DRAFT" } })).toBe(1);
+    expect(await db.socialStrategy.count({ where: { clientId: f.client.id } })).toBe(2);
   }, 15_000);
 
   it("confirms only after human review and records a lightweight context snapshot", async () => {
@@ -102,7 +118,7 @@ describe("SocialStrategy V1", () => {
     const f = await fixture("LIVE");
     await expect(generateContentPlan(f.context.OWNER, f.input)).rejects.toMatchObject({ code: "CONFIRMED_STRATEGY_REQUIRED" });
     expect(await db.contentPlan.count({ where: { clientId: f.client.id } })).toBe(0);
-    await db.brandProfile.create({ data: { clientId: f.client.id, bannedPhrases: ["guaranteed"], ctaRules: ["Ask for catalogue only"] } });
+    await db.brandProfile.create({ data: { clientId: f.client.id, audience: "General brand audience", bannedPhrases: ["guaranteed"], ctaRules: ["Ask for catalogue only"] } });
     const draft = await createSocialStrategyDraft(f.context.OWNER, { payload: payload({ ctaGuidance: ["Request a quote"] }) });
     await confirmSocialStrategy(f.context.OWNER, draft.id);
     let captured: DraftGenerationInput | null = null;
@@ -116,6 +132,8 @@ describe("SocialStrategy V1", () => {
     expect(JSON.stringify(captured)).not.toContain("unverified dimensions");
     expect(captured!.brandProfile?.ctaRules).toEqual(["Ask for catalogue only"]);
     expect(captured!.socialStrategy?.ctaGuidance).toEqual(["Request a quote"]);
+    expect(captured!.brandProfile?.audience).toBe("General brand audience");
+    expect(captured!.strategy).toMatchObject({ audience: "Furniture distributors", messageAngle: f.input.theme, contentGoal: f.input.objective, differentiation: ["material: verified steel"] });
     expect(captured!.instruction).toContain("BrandProfile");
     expect(await db.approval.count({ where: { clientId: f.client.id } })).toBe(0);
     expect(await db.publishJob.count({ where: { clientId: f.client.id } })).toBe(0);
@@ -136,23 +154,37 @@ describe("SocialStrategy V1", () => {
     expect(await db.publishJob.count({ where: { clientId: f.client.id } })).toBe(0);
   });
 
-  it("keeps AI rewrites on the bound current strategy and rejects replacement during model work", async () => {
+  it("keeps AI rewrite and regenerate on the bound confirmed snapshot after replacement", async () => {
     const f = await fixture("LIVE");
     const first = await createSocialStrategyDraft(f.context.OWNER, { payload: payload() });
     await confirmSocialStrategy(f.context.OWNER, first.id);
     const generated = await generateContentPlan(f.context.OWNER, f.input, mock);
     const item = generated.items[0];
-    const rewritten = await rewriteContent(f.context.OPERATOR, item.id, { expectedVersionId: item.currentVersionId, action: "shorten" }, mock);
-    expect(rewritten.sourceFacts).toMatchObject({ strategyProvenance: "CONFIRMED_BINDING", socialStrategyId: first.id, socialStrategyVersion: first.version, socialStrategyStatus: "CONFIRMED" });
     const replacement = await createSocialStrategyDraft(f.context.OWNER, { payload: payload({ coreMessage: "New confirmed choice" }) });
     const adapter: TextGenerationAdapter = { async generate(input) {
+      expect(input.socialStrategy?.id).toBe(first.id);
+      expect(input.socialStrategy?.version).toBe(first.version);
       await confirmSocialStrategy(f.context.OWNER, replacement.id);
       return mock.generate(input);
     } };
-    await expect(regeneratePlatformVariant(f.context.OPERATOR, item.id, { expectedVersionId: rewritten.id }, adapter)).rejects.toMatchObject({ code: "STALE_OPERATION" });
-    await expect(rewriteContent(f.context.OPERATOR, item.id, { expectedVersionId: rewritten.id, action: "shorten" }, mock)).rejects.toMatchObject({ code: "STRATEGY_BINDING_REQUIRED" });
+    const regenerated = await regeneratePlatformVariant(f.context.OPERATOR, item.id, { expectedVersionId: item.currentVersionId }, adapter);
+    expect(regenerated.sourceFacts).toMatchObject({ strategyProvenance: "CONFIRMED_BINDING", socialStrategyId: first.id, socialStrategyVersion: first.version });
+    const rewritten = await rewriteContent(f.context.OPERATOR, item.id, { expectedVersionId: regenerated.id, action: "shorten" }, mock);
+    expect(rewritten.sourceFacts).toMatchObject({ strategyProvenance: "CONFIRMED_BINDING", socialStrategyId: first.id, socialStrategyVersion: first.version, socialStrategyStatus: "ARCHIVED" });
+    expect((await db.contentPlan.findUniqueOrThrow({ where: { id: generated.plan.id } })).socialStrategyId).toBe(first.id);
+    expect((await db.socialStrategy.findUniqueOrThrow({ where: { id: replacement.id } })).status).toBe("CONFIRMED");
     const manual = await updateDraftContent(f.context.OPERATOR, item.id, { expectedVersionId: rewritten.id, text: "A human revision after strategy replacement." });
     expect(manual.source).toBe("AUTOSAVE");
+  });
+
+  it("rejects a never-confirmed archived draft as a LIVE historical binding", async () => {
+    const f = await fixture("DEMO");
+    const draft = await createSocialStrategyDraft(f.context.OWNER, { payload: payload() });
+    const generated = await generateContentPlan(f.context.OWNER, f.input);
+    await createSocialStrategyDraft(f.context.OWNER, { payload: payload({ coreMessage: "Later draft" }), expectedDraftId: draft.id });
+    await db.client.update({ where: { id: f.client.id }, data: { mode: "LIVE" } });
+    await expect(rewriteContent(f.context.OWNER, generated.items[0].id, { expectedVersionId: generated.items[0].currentVersionId, action: "shorten" })).rejects.toMatchObject({ code: "CONFIRMED_STRATEGY_REQUIRED" });
+    expect((await db.contentPlan.findUniqueOrThrow({ where: { id: generated.plan.id } })).socialStrategyId).toBe(draft.id);
   });
 
   it("labels DEMO draft preview and unbound fallback without auto-confirming a strategy", async () => {
@@ -162,9 +194,13 @@ describe("SocialStrategy V1", () => {
     expect(preview.generation).toMatchObject({ strategyProvenance: "DRAFT_PREVIEW", socialStrategyId: draft.id, socialStrategyVersion: 1, socialStrategyStatus: "DRAFT" });
     expect(await db.socialStrategy.count({ where: { clientId: demo.client.id, status: "CONFIRMED" } })).toBe(0);
     const other = await fixture("DRAFT");
-    const fallback = await generateContentPlan(other.context.OWNER, other.input);
+    await db.brandProfile.create({ data: { clientId: other.client.id, audience: "Default brand buyers" } });
+    let fallbackInput: DraftGenerationInput | null = null;
+    const adapter: TextGenerationAdapter = { async generate(input) { fallbackInput = input; return mock.generate(input); } };
+    const fallback = await generateContentPlan(other.context.OWNER, other.input, adapter);
     expect(fallback.generation).toMatchObject({ strategyProvenance: "UNBOUND_FALLBACK", socialStrategyId: null, socialStrategyVersion: null, socialStrategyStatus: null });
     expect(fallback.plan.socialStrategyId).toBeNull();
+    expect(fallbackInput!.strategy?.audience).toBe("Default brand buyers");
   });
 
   it("keeps legacy unbound manual flow available while rejecting LIVE AI rewrite and regenerate", async () => {

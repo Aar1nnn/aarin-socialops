@@ -28,7 +28,7 @@ export default async function ContentPage({ searchParams }: { searchParams: Prom
       <div className="page">
         <PageHeader title="内容中心" eyebrow={client.name} description="找到当前内容，判断版本、人工审核与排期状态，再进入单条内容处理。" action={readOnly ? null : <a className="button button-primary button-md" href="/content?create=1#new-content">创建内容</a>} />
         {readOnly ? <Notice title="只读访问">你可以查看内容和审核记录。创建、编辑、审核和排期需要运营权限。</Notice> : null}
-        {strategyRequired ? <Notice title="AI 内容生成需要确认策略" tone="warning">先到<a className="text-link" href="/strategy">运营策略</a>确认当前周期策略。已有内容的人工操作仍可继续。</Notice> : null}
+        {strategyRequired ? <div data-error-code="CONFIRMED_STRATEGY_REQUIRED"><Notice title="AI 内容生成需要确认策略" tone="warning">先到<a className="text-link" href="/strategy">运营策略</a>确认当前周期策略。已有内容的人工操作仍可继续。</Notice></div> : null}
         {!readOnly ? <details className="disclosure" id="new-content" open={createRequested || total === 0}>
           <summary>创建内容</summary>
           <form action="/api/content/generate" method="post" className="disclosure-body form-stack form-width">

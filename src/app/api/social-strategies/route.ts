@@ -1,5 +1,5 @@
 import { requireContext } from "@/lib/auth";
-import { errorResponse } from "@/lib/errors";
+import { AppError, errorResponse } from "@/lib/errors";
 import { actionResponse, requestData } from "@/lib/http";
 import { createSocialStrategyDraft, listSocialStrategies } from "@/services/social-strategy-service";
 
@@ -49,11 +49,15 @@ export async function POST(request: Request) {
     const body = await requestData(request);
     const input = {
       payload: request.headers.get("content-type")?.includes("application/json") ? body.payload : formPayload(body),
+      expectedDraftId: body.expectedDraftId || null,
       effectiveFrom: body.effectiveFrom || null,
       effectiveTo: body.effectiveTo || null,
     };
     return actionResponse(request, await createSocialStrategyDraft(context, input), "/strategy");
   } catch (error) {
+    if (error instanceof AppError && error.code === "STRATEGY_VERSION_CONFLICT" && (request.headers.get("accept") || "").includes("text/html")) {
+      return Response.redirect(new URL("/strategy?error=STRATEGY_VERSION_CONFLICT", request.url), 303);
+    }
     return errorResponse(error);
   }
 }

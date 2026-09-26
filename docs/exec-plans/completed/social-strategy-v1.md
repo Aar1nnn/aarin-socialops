@@ -26,3 +26,11 @@ Base: `origin/main` at `c6fb0d0ca9e2a450260c419e8cb34f651d303a6e` (PR #9 merge).
 - The single-active-version invariant is enforced by the strategy service under a Client row lock. Direct database writes that bypass the service can violate it.
 - Historical unbound LIVE content remains usable manually. AI rewrite/regenerate requires a future explicit human binding action outside this V1 scope.
 - Real model and Meta publishing side effects were not exercised.
+
+## PR #10 defect-only follow-up
+
+- Historical plans keep their original Strategy id. A formerly confirmed Strategy remains a valid AI rewrite/regenerate binding after archive; new AI plans still require the current CONFIRMED Strategy and reject replacement during model work.
+- Draft saves carry `expectedDraftId`; a stale API request receives HTTP 409 `STRATEGY_VERSION_CONFLICT`, while an HTML form submission redirects to a refresh prompt.
+- The existing `strategy` field is a per-content tactical brief. Its audience uses SocialStrategy.primaryBuyer when bound, then BrandProfile.audience as fallback; its message angle, goal, and confirmed-fact differentiation remain content-local.
+- LIVE missing-confirmation gates consistently use `CONFIRMED_STRATEGY_REQUIRED` in the service, tests, and UI contract. Unbound historical plans continue to use the distinct `STRATEGY_BINDING_REQUIRED` code.
+- No Schema or migration files changed. On the dedicated database, migrate deploy/status, Prisma generate, seed twice, typecheck, production build, and the final full suite (26 files, 241 tests) passed. The PR CI result is reported with the final head.

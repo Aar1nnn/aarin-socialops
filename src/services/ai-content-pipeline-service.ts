@@ -25,9 +25,13 @@ export const aiReviewSchema = z.object({
 export type PipelineBaseInput = Omit<DraftGenerationInput,
   "brandProfile" | "recentContent" | "performanceContext" | "researchContext" | "socialStrategy" | "strategy">;
 
-export function generateStrategy(input: PipelineBaseInput, brand: Awaited<ReturnType<typeof buildCompositionContext>>["brand"]) {
+export function generateStrategy(
+  input: PipelineBaseInput,
+  brand: Awaited<ReturnType<typeof buildCompositionContext>>["brand"],
+  socialStrategy: DraftGenerationInput["socialStrategy"] = null,
+) {
   return contentStrategySchema.parse({
-    audience: brand.audience || "Qualified business buyers defined by the operator",
+    audience: socialStrategy?.primaryBuyer || brand.audience || "Qualified business buyers defined by the operator",
     messageAngle: input.theme,
     contentGoal: input.objective,
     differentiation: input.confirmedFacts.slice(0, 5).map((fact) => `${fact.key}: ${fact.value}`),
@@ -89,7 +93,8 @@ export async function prepareAIContentPipelineInput(
   socialStrategy: DraftGenerationInput["socialStrategy"] = null,
 ): Promise<DraftGenerationInput> {
   const compositionContext = await buildCompositionContext(context);
-  const strategy = generateStrategy(baseInput, compositionContext.brand);
+  // The legacy strategy object is this content's tactical brief, not another period strategy.
+  const strategy = generateStrategy(baseInput, compositionContext.brand, socialStrategy);
   return {
     ...baseInput,
     instruction: `${baseInput.instruction}\nUse only confirmed product facts for product claims. BrandProfile banned phrases, required mentions, and CTA rules are hard constraints. SocialStrategy is period guidance and never overrides confirmed product facts or BrandProfile rules.`,
