@@ -4,6 +4,7 @@ import { requirePageContext } from "@/lib/auth";
 import { db } from "@/lib/db";
 import { formatDateTime, platformLabel } from "@/lib/presentation/status";
 import { contentLanes, listContentOperations } from "@/services/content-operations-view";
+import { resolveAccountPublishingMode } from "@/lib/manual-account";
 
 type Params = { q?: string | string[]; status?: string | string[]; platform?: string | string[]; accountId?: string | string[]; productId?: string | string[]; create?: string | string[] };
 const first = (value: string | string[] | undefined) => Array.isArray(value) ? value[0] : value;
@@ -17,6 +18,9 @@ export default async function ContentPage({ searchParams }: { searchParams: Prom
   const strategyRequired = client.mode === "LIVE" && await db.socialStrategy.count({ where: { clientId: context.clientId, status: "CONFIRMED" } }) === 0;
   const readOnly = context.role === "VIEWER";
   const eligibleProducts = products.filter((product) => product.fields.some((field) => field.status === "CONFIRMED" && field.value));
+  const manualAccounts = filterAccounts.filter((account) => account.isSelected && resolveAccountPublishingMode(account) === "MANUAL");
+  const aiAccounts = accounts.filter((account) => account.platform !== "youtube");
+  const assets = manualAccounts.length ? await db.asset.findMany({ where: { clientId: context.clientId }, orderBy: { createdAt: "desc" }, take: 100, select: { id: true, originalName: true, kind: true } }) : [];
   const createRequested = first(params.create) === "1";
   const searchUrl = (status: string) => {
     const query = new URLSearchParams();
@@ -38,10 +42,25 @@ export default async function ContentPage({ searchParams }: { searchParams: Prom
               <FormField label="业务目的" htmlFor="content-objective" className="span-full"><input id="content-objective" name="objective" defaultValue="获得经销商或批发商的有效询盘" required /></FormField>
             </div>
             <fieldset className="stack-tight content-account-options"><legend>目标账号</legend>
-              {accounts.length === 0 ? <Notice title="没有可选账号" tone="warning">先到<a className="text-link" href="/accounts">平台与账号</a>选择账号，才能生成平台版本。</Notice> : accounts.map((account) => <label className="account-option" htmlFor={`target-account-${account.id}`} key={account.id}><input id={`target-account-${account.id}`} type="checkbox" name="accountIds" value={account.id} defaultChecked /><span><strong>{platformLabel(account.platform)}</strong><span className="cell-meta">{account.displayName}</span></span><StatusIndicator value={account.publishCapability} compact /></label>)}
+              {aiAccounts.length === 0 ? <Notice title="没有可选账号" tone="warning">先到<a className="text-link" href="/accounts">平台与账号</a>选择账号，才能生成平台版本。</Notice> : aiAccounts.map((account) => <label className="account-option" htmlFor={`target-account-${account.id}`} key={account.id}><input id={`target-account-${account.id}`} type="checkbox" name="accountIds" value={account.id} defaultChecked /><span><strong>{platformLabel(account.platform)}</strong><span className="cell-meta">{account.displayName}</span></span><StatusIndicator value={account.publishCapability} compact /></label>)}
             </fieldset>
             {eligibleProducts.length === 0 ? <Notice title="先建立产品与已确认事实" tone="warning"><a className="text-link" href="/products">前往产品与素材</a>。AI 只会使用已确认的产品事实。</Notice> : null}
-            <div><Button type="submit" disabled={eligibleProducts.length === 0 || accounts.length === 0 || strategyRequired}>生成草稿</Button></div>
+            <div><Button type="submit" disabled={eligibleProducts.length === 0 || aiAccounts.length === 0 || strategyRequired}>生成草稿</Button></div>
+          </form>
+        </details> : null}
+        {!readOnly ? <details className="disclosure" id="manual-content">
+          <summary>人工创建内容</summary>
+          <form action="/api/content/manual" method="post" className="disclosure-body form-stack form-width">
+            <p className="field-helper">为人工管理账号创建正式内容版本；仍须提交并获得有效人工批准。此操作不调用 AI，缺少 SocialStrategy 不会阻止人工创建。</p>
+            <label>目标人工账号<select name="accountId" required><option value="">请选择</option>{manualAccounts.map((account) => <option key={account.id} value={account.id}>{platformLabel(account.platform)} · {account.displayName}</option>)}</select></label>
+            <label>关联产品（可选）<select name="productId"><option value="">不关联产品</option>{products.map((product) => <option key={product.id} value={product.id}>{product.name}</option>)}</select></label>
+            <label>主题<input name="theme" required maxLength={300} /></label>
+            <label>业务目的<input name="objective" required maxLength={500} /></label>
+            <label>标题<input name="title" maxLength={200} /></label>
+            <label>正文<textarea name="text" required rows={8} maxLength={100000} /></label>
+            <label>现有素材（可选，可多选）<select name="assetIds" multiple size={Math.min(4, Math.max(2, assets.length))}>{assets.map((asset) => <option key={asset.id} value={asset.id}>{asset.originalName} · {asset.kind}</option>)}</select></label>
+            {manualAccounts.length === 0 ? <Notice title="先创建人工账号" tone="warning">到<a className="text-link" href="/accounts">平台与账号</a>创建 LinkedIn、TikTok 或 YouTube 人工管理账号。</Notice> : null}
+            <Button type="submit" disabled={manualAccounts.length === 0}>创建人工内容</Button>
           </form>
         </details> : null}
         <section className="panel content-search-panel" aria-label="查找内容">

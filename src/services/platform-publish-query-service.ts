@@ -21,6 +21,7 @@ export async function queryPlatformPublish(
   if (!job || job.account.clientId !== context.clientId) {
     throw new AppError("发布任务不存在或无权访问。", 404, "PUBLISH_JOB_NOT_FOUND");
   }
+  if (job.adapter === "manual") throw new AppError("人工发布没有平台 API 查询能力，请人工核实并记录证据。", 409, "MANUAL_QUERY_UNSUPPORTED");
   if (job.environment !== "LIVE" || job.simulated) {
     throw new AppError("只有真实平台发布任务支持远端查询。", 409, "NOT_LIVE_PUBLISH_JOB");
   }

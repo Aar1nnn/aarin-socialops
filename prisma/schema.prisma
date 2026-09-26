@@ -70,6 +70,7 @@ enum ApprovalDecision {
 
 enum PublishJobStatus {
   PENDING
+  MANUAL_PENDING
   RUNNING
   RETRY
   WAITING_CONFIGURATION
@@ -681,7 +682,7 @@ model ContentVersion {
   text               String
   title              String?
   productDataVersion Int?
-  promptVersionId    String
+  promptVersionId    String?
   generator          String
   simulated          Boolean               @default(false)
   generationLabel    String
@@ -694,7 +695,7 @@ model ContentVersion {
   client             Client                @relation(fields: [clientId], references: [id], onDelete: Cascade)
   item               ContentItem           @relation("ItemVersions", fields: [contentItemId], references: [id], onDelete: Cascade)
   currentFor         ContentItem[]         @relation("CurrentVersion")
-  promptVersion      PromptVersion         @relation(fields: [promptVersionId], references: [id], onDelete: Restrict)
+  promptVersion      PromptVersion?        @relation(fields: [promptVersionId], references: [id], onDelete: Restrict)
   previousVersion    ContentVersion?       @relation("ContentVersionLineage", fields: [previousVersionId], references: [id], onDelete: SetNull)
   nextVersions       ContentVersion[]      @relation("ContentVersionLineage")
   createdBy          User?                 @relation("ContentVersionCreator", fields: [createdByUserId], references: [id], onDelete: SetNull)

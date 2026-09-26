@@ -16,6 +16,10 @@ export async function POST(request: Request, { params }: { params: Promise<{ id:
     }
     const task = await db.manualTask.findFirst({ where: { id, clientId: context.clientId } });
     if (!task) throw new AppError("任务不存在或无权访问。", 404, "TASK_NOT_FOUND");
+    if (task.publishJobId) {
+      const job = await db.publishJob.findFirst({ where: { id: task.publishJobId, clientId: context.clientId }, select: { adapter: true } });
+      if (job?.adapter === "manual") throw new AppError("人工发布任务必须在发布中心记录结果与证据。", 409, "MANUAL_PUBLISH_RESULT_REQUIRED");
+    }
     const result = await db.$transaction(async (tx) => {
       const updated = await tx.manualTask.update({ where: { id: task.id }, data: {
         status: status as typeof task.status,

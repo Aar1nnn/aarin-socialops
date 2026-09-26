@@ -1,5 +1,7 @@
 import { AssetKind, ContentStatus, FactStatus, Prisma, PublishJobStatus } from "@prisma/client";
 import { db } from "../lib/db";
+import { MUTABLE_SCHEDULED_JOB_STATUSES } from "../lib/publishing-status";
+import { cancelManualTasksForProduct } from "./manual-task-lifecycle";
 import { AppError } from "../lib/errors";
 import { createProductSchema } from "../lib/contracts";
 import { getStorageAdapter, storeAsset } from "../lib/adapters/storage";
@@ -108,6 +110,10 @@ export async function updateProductFacts(context: RequestContext, productId: str
     `;
     const running = await tx.contentItem.count({ where: { clientId: context.clientId, plan: { productId }, status: ContentStatus.RUNNING } });
     if (running > 0) throw new AppError("关联内容正在发布，不能修改产品事实；请等待发布结果或先完成对账。", 409, "PUBLISH_IN_PROGRESS");
+    const unresolvedManual = await tx.publishJob.count({
+      where: { clientId: context.clientId, adapter: "manual", status: PublishJobStatus.UNKNOWN, contentVersion: { item: { plan: { productId } } } },
+    });
+    if (unresolvedManual > 0) throw new AppError("关联人工发布结果仍不确定；先核实外部平台并在发布中心对账。", 409, "MANUAL_RECONCILIATION_REQUIRED");
     for (const field of input.fields) {
       await tx.productField.upsert({
         where: { productId_key: { productId, key: field.key } },
@@ -148,10 +154,11 @@ export async function updateProductFacts(context: RequestContext, productId: str
       where: {
         clientId: context.clientId,
         contentVersion: { item: { plan: { productId } } },
-        status: { in: [PublishJobStatus.PENDING, PublishJobStatus.RETRY, PublishJobStatus.WAITING_CONFIGURATION] },
+        status: { in: MUTABLE_SCHEDULED_JOB_STATUSES },
       },
       data: { status: PublishJobStatus.CANCELLED, lastErrorCode: "PRODUCT_FACTS_CHANGED", lastErrorMessage: "产品资料版本已更新，内容需要重新生成或编辑并审核。" },
     });
+    await cancelManualTasksForProduct(tx, context.clientId, productId);
     await tx.auditLog.create({
       data: {
         clientId: context.clientId,

@@ -161,9 +161,11 @@ async function generateVariant(
       source: input.action === "regenerate_platform" ? "AI_REGENERATE" : "AI_REWRITE",
       reason: input.action.toUpperCase(),
       generator: generated.provider,
+      promptVersionId: prompt.id,
       generationLabel: generated.simulated ? "模拟内容改写" : "AI 内容改写",
       sourceFacts: {
         ...existingFacts,
+        creationMethod: "AI_COMPOSITION",
         ...strategyProvenanceFacts(strategyBinding),
         compositionAction: input.action,
         confirmedFacts,
