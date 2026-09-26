@@ -49,13 +49,17 @@ describe("UI V2 Phase 1 route contracts", () => {
     expect(shell).toContain('where: { clientId: context.clientId, readAt: null }');
   });
 
-  it("keeps the publishing projection tenant-scoped and read-only", () => {
+  it("keeps publishing queries tenant-scoped and operator actions role-aware", () => {
     const page = source("../src/app/publishing/page.tsx");
-    expect(page.match(/where: \{ clientId: context\.clientId \}/g)).toHaveLength(2);
+    expect(page).toContain('where: { clientId: context.clientId, ...(status ? { status } : selectedLane ? { status: { in: selectedLane.statuses } } : {}) }');
+    expect(page).toContain('href={`/publishing?lane=${lane.key}`}');
+    expect(page).toContain('entityType: "PublishJob", entityId: { in: manualJobIds }');
     expect(page).toContain('title="发布中心"');
-    expect(page).toContain('UNKNOWN 表示远端结果尚未确认，不能盲目重发');
-    expect(page).not.toContain('<form');
-    expect(page).not.toContain('重试</');
+    expect(page).toContain('UNKNOWN 表示外部是否已收到发布尚不确定');
+    expect(page).toContain('writable && manual');
+    expect(page).toContain('writable && !manual && job.status === "UNKNOWN"');
+    expect(page).toContain('本页面不恢复执行');
+    expect(page).not.toContain('恢复执行</button>');
   });
 
   it("does not collapse UNKNOWN into failed or link to untrusted remote schemes", () => {

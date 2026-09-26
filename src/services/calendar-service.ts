@@ -3,6 +3,9 @@ import { z } from "zod";
 import { db } from "../lib/db";
 import { AppError } from "../lib/errors";
 import { assertCanWrite, type RequestContext } from "../lib/context";
+import { resolveAccountPublishingMode } from "../lib/manual-account";
+import { MUTABLE_SCHEDULED_JOB_STATUSES, OPEN_MANUAL_TASK_STATUSES } from "../lib/publishing-status";
+import { zonedLocalDateTimeToUtc } from "../lib/timezone";
 import {
   findScheduleConflictsInTransaction,
   lockContentItemForScheduling,
@@ -23,7 +26,11 @@ const calendarFilterSchema = z.object({
 
 const rescheduleSchema = z.object({
   contentItemIds: z.array(z.string().min(1)).min(1).max(100),
-  scheduledAt: z.coerce.date(),
+  scheduledAt: z.coerce.date().optional(),
+  localDateTime: z.string().optional(),
+  timezone: z.string().optional(),
+}).refine((input) => Boolean(input.scheduledAt) !== Boolean(input.localDateTime), {
+  message: "请提供排期时间或客户时区本地时间。",
 });
 
 const protectedItemStatuses = new Set<ContentStatus>([
@@ -34,7 +41,7 @@ const protectedItemStatuses = new Set<ContentStatus>([
   ContentStatus.CANCELLED,
 ]);
 
-const activeJobStatuses: PublishJobStatus[] = [PublishJobStatus.PENDING, PublishJobStatus.RETRY, PublishJobStatus.WAITING_CONFIGURATION];
+const activeJobStatuses: PublishJobStatus[] = MUTABLE_SCHEDULED_JOB_STATUSES;
 const mutableJobStatuses = new Set(activeJobStatuses);
 
 export async function listCalendarEntries(context: RequestContext, raw: unknown = {}) {
@@ -52,7 +59,7 @@ export async function listCalendarEntries(context: RequestContext, raw: unknown 
       ...(input.status ? { status: input.status } : {}),
     },
     include: {
-      account: { select: { id: true, displayName: true, platform: true } },
+      account: { select: { id: true, displayName: true, platform: true, metadata: true } },
       plan: { include: { product: { select: { id: true, name: true } } } },
       currentVersion: {
         include: {
@@ -67,11 +74,19 @@ export async function listCalendarEntries(context: RequestContext, raw: unknown 
     const approval = item.currentVersion?.approvals.find((candidate) => candidate.accountId === item.accountId);
     const job = item.currentVersion?.publishJobs.find((candidate) => candidate.accountId === item.accountId);
     const activeJob = item.currentVersion?.publishJobs.find((candidate) => candidate.accountId === item.accountId && activeJobStatuses.includes(candidate.status));
+    const reschedulable = item.status === ContentStatus.SCHEDULED
+      && approval?.decision === ApprovalDecision.APPROVED
+      && Boolean(activeJob);
+    const lockReason = reschedulable ? null
+      : item.status !== ContentStatus.SCHEDULED ? "仅已排期内容可以拖动。"
+      : approval?.decision !== ApprovalDecision.APPROVED ? "当前版本缺少有效人工批准。"
+      : job ? `任务状态 ${job.status} 不允许重排。` : "当前版本没有可重排的发布任务。";
     return {
       id: item.id,
       platform: item.platform,
       accountId: item.accountId,
       accountName: item.account.displayName,
+      publishingMode: resolveAccountPublishingMode(item.account),
       theme: item.plan.theme,
       productName: item.plan.product?.name || null,
       title: item.currentVersion?.title || null,
@@ -80,9 +95,8 @@ export async function listCalendarEntries(context: RequestContext, raw: unknown 
       approvalStatus: approval?.decision || null,
       publishJobStatus: job?.status || null,
       queueAt: job?.nextAttemptAt || null,
-      reschedulable: item.status === ContentStatus.SCHEDULED
-        && approval?.decision === ApprovalDecision.APPROVED
-        && Boolean(activeJob),
+      reschedulable,
+      lockReason,
     };
   });
 }
@@ -90,10 +104,17 @@ export async function listCalendarEntries(context: RequestContext, raw: unknown 
 export async function rescheduleCalendarItems(context: RequestContext, raw: unknown) {
   assertCanWrite(context);
   const input = rescheduleSchema.parse(raw);
-  if (input.scheduledAt.getTime() <= Date.now()) throw new AppError("排期时间必须晚于当前时间。", 400, "SCHEDULE_TIME_IN_PAST");
   try {
     return await db.$transaction(async (tx) => {
       await lockSchedulingClient(tx, context.clientId);
+      const client = await tx.client.findUniqueOrThrow({ where: { id: context.clientId }, select: { timezone: true } });
+      if (input.timezone && input.timezone !== client.timezone) {
+        throw new AppError("排期时区与客户配置不一致，请刷新页面。", 409, "SCHEDULE_TIMEZONE_MISMATCH");
+      }
+      const scheduledAt = input.localDateTime
+        ? zonedLocalDateTimeToUtc(input.localDateTime, client.timezone)
+        : input.scheduledAt!;
+      if (scheduledAt.getTime() <= Date.now()) throw new AppError("排期时间必须晚于当前时间。", 400, "SCHEDULE_TIME_IN_PAST");
       const contentItemIds = [...new Set(input.contentItemIds)];
       const scopedItems = await tx.contentItem.findMany({
         where: { clientId: context.clientId, id: { in: contentItemIds } },
@@ -123,7 +144,7 @@ export async function rescheduleCalendarItems(context: RequestContext, raw: unkn
 
       const validatedItems = [];
       for (const contentItemId of contentItemIds) {
-        const validated = await validatePublicationInTransaction(tx, context, contentItemId, input.scheduledAt);
+        const validated = await validatePublicationInTransaction(tx, context, contentItemId, scheduledAt);
         if (!validated.existing || !mutableJobStatuses.has(validated.existing.status)) {
           throw new AppError(`内容 ${contentItemId} 没有可重排的当前发布任务。`, 409, "CALENDAR_JOB_LOCKED");
         }
@@ -138,7 +159,7 @@ export async function rescheduleCalendarItems(context: RequestContext, raw: unkn
         const conflict = await findScheduleConflictsInTransaction(tx, {
           clientId: context.clientId,
           accountId: validated.item.accountId,
-          scheduledAt: input.scheduledAt,
+          scheduledAt,
           excludeContentItemIds: contentItemIds,
         });
         if (conflict.conflict) throw new AppError("该账号的目标时间附近已有排期。", 409, "SCHEDULE_CONFLICT");
@@ -153,7 +174,7 @@ export async function rescheduleCalendarItems(context: RequestContext, raw: unkn
             accountId: validated.item.accountId,
             status: { in: activeJobStatuses },
           },
-          data: { nextAttemptAt: input.scheduledAt },
+          data: { nextAttemptAt: scheduledAt },
         });
         if (updated.count !== 1) throw new AppError("发布任务已被其他操作更新，请刷新后重试。", 409, "STALE_OPERATION");
         const movedItem = await tx.contentItem.updateMany({
@@ -164,9 +185,15 @@ export async function rescheduleCalendarItems(context: RequestContext, raw: unkn
             currentVersionId: validated.currentVersionId,
             accountId: validated.item.accountId,
           },
-          data: { scheduledAt: input.scheduledAt },
+          data: { scheduledAt },
         });
         if (movedItem.count !== 1) throw new AppError(`内容 ${validated.item.id} 的排期状态已变化。`, 409, "CALENDAR_ITEM_LOCKED");
+        if (validated.existing!.status === PublishJobStatus.MANUAL_PENDING) {
+          await tx.manualTask.updateMany({
+            where: { clientId: context.clientId, publishJobId: validated.existing!.id, status: { in: [...OPEN_MANUAL_TASK_STATUSES] } },
+            data: { suggestedDueAt: scheduledAt },
+          });
+        }
       }
       await tx.auditLog.create({
         data: {
@@ -174,10 +201,10 @@ export async function rescheduleCalendarItems(context: RequestContext, raw: unkn
           userId: context.userId,
           action: contentItemIds.length > 1 ? "CALENDAR_BULK_RESCHEDULED" : "CALENDAR_ITEM_RESCHEDULED",
           entityType: "ContentItem",
-          metadata: { contentItemIds, scheduledAt: input.scheduledAt.toISOString() },
+          metadata: { contentItemIds, scheduledAt: scheduledAt.toISOString() },
         },
       });
-      return { updated: validatedItems.length, scheduledAt: input.scheduledAt };
+      return { updated: validatedItems.length, scheduledAt };
     });
   } catch (error) {
     await persistPublicationGateTask(context.clientId, error);

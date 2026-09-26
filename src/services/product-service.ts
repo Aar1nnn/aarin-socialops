@@ -1,5 +1,7 @@
 import { AssetKind, ContentStatus, FactStatus, Prisma, PublishJobStatus } from "@prisma/client";
 import { db } from "../lib/db";
+import { MUTABLE_SCHEDULED_JOB_STATUSES } from "../lib/publishing-status";
+import { cancelManualTasksForProduct } from "./manual-task-lifecycle";
 import { AppError } from "../lib/errors";
 import { createProductSchema } from "../lib/contracts";
 import { getStorageAdapter, storeAsset } from "../lib/adapters/storage";
@@ -148,10 +150,11 @@ export async function updateProductFacts(context: RequestContext, productId: str
       where: {
         clientId: context.clientId,
         contentVersion: { item: { plan: { productId } } },
-        status: { in: [PublishJobStatus.PENDING, PublishJobStatus.RETRY, PublishJobStatus.WAITING_CONFIGURATION] },
+        status: { in: MUTABLE_SCHEDULED_JOB_STATUSES },
       },
       data: { status: PublishJobStatus.CANCELLED, lastErrorCode: "PRODUCT_FACTS_CHANGED", lastErrorMessage: "产品资料版本已更新，内容需要重新生成或编辑并审核。" },
     });
+    await cancelManualTasksForProduct(tx, context.clientId, productId);
     await tx.auditLog.create({
       data: {
         clientId: context.clientId,

@@ -5,6 +5,7 @@ import { db } from "../lib/db";
 import { AppError } from "../lib/errors";
 import { assertValidTimeZone, zonedLocalDateTimeToUtc } from "../lib/timezone";
 import { recordDomainEvent } from "../lib/domain-events";
+import { MUTABLE_SCHEDULED_JOB_STATUSES } from "../lib/publishing-status";
 import { rescheduleCalendarItems } from "./calendar-service";
 import {
   findScheduleConflictsInTransaction,
@@ -45,7 +46,7 @@ const assignSchema = z.object({
   after: z.coerce.date().optional(),
 });
 
-const mutableJobStatuses = new Set<PublishJobStatus>([PublishJobStatus.PENDING, PublishJobStatus.RETRY, PublishJobStatus.WAITING_CONFIGURATION]);
+const mutableJobStatuses = new Set<PublishJobStatus>(MUTABLE_SCHEDULED_JOB_STATUSES);
 const immutableItemStatuses = new Set<ContentStatus>([ContentStatus.RUNNING, ContentStatus.PUBLISHED, ContentStatus.UNKNOWN, ContentStatus.FAILED, ContentStatus.CANCELLED]);
 
 function datePartsInZone(date: Date, timeZone: string) {
