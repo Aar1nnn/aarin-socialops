@@ -30,6 +30,25 @@ export type DraftGenerationInput = {
   recentContent?: Array<{ platform: string; theme: string; hook: string; cta: string | null; product: string | null }>;
   performanceContext?: Array<{ metricKey: string; platform: string; value: string | null; availability: string; dataKind: string }>;
   researchContext?: Array<{ kind: string; objective: string; observations: unknown; limitations: unknown }>;
+  socialStrategy?: {
+    id: string;
+    version: number;
+    status: string;
+    provenance: string;
+    businessGoal: string;
+    primaryBuyer: string;
+    targetMarkets: string[];
+    platformRoles: Array<{ platform: string; role: string }>;
+    contentPillars: Array<{ name: string; percentage: number }>;
+    formatMix: Array<{ name: string; percentage: number }>;
+    postingCadence: string;
+    coreMessage: string;
+    ctaGuidance: string[];
+    priorityProducts: string[];
+    assetPriorities: string[];
+    experiments: string[];
+    limitations: string[];
+  } | null;
   strategy?: {
     audience: string;
     messageAngle: string;

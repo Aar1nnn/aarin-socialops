@@ -1,6 +1,7 @@
 import { OperatorShell } from "@/components/operator-shell";
 import { Button, EmptyState, FormField, Notice, PageHeader, StatusIndicator } from "@/components/ui";
 import { requirePageContext } from "@/lib/auth";
+import { db } from "@/lib/db";
 import { formatDateTime, platformLabel } from "@/lib/presentation/status";
 import { contentLanes, listContentOperations } from "@/services/content-operations-view";
 
@@ -13,6 +14,7 @@ export default async function ContentPage({ searchParams }: { searchParams: Prom
   const params = await searchParams;
   const filters = { q: first(params.q), status: first(params.status), platform: first(params.platform), accountId: first(params.accountId), productId: first(params.productId) };
   const { items, total, products, accounts, filterAccounts, client, lane, q } = await listContentOperations(context, filters);
+  const strategyRequired = client.mode === "LIVE" && await db.socialStrategy.count({ where: { clientId: context.clientId, status: "CONFIRMED" } }) === 0;
   const readOnly = context.role === "VIEWER";
   const eligibleProducts = products.filter((product) => product.fields.some((field) => field.status === "CONFIRMED" && field.value));
   const createRequested = first(params.create) === "1";
@@ -26,6 +28,7 @@ export default async function ContentPage({ searchParams }: { searchParams: Prom
       <div className="page">
         <PageHeader title="内容中心" eyebrow={client.name} description="找到当前内容，判断版本、人工审核与排期状态，再进入单条内容处理。" action={readOnly ? null : <a className="button button-primary button-md" href="/content?create=1#new-content">创建内容</a>} />
         {readOnly ? <Notice title="只读访问">你可以查看内容和审核记录。创建、编辑、审核和排期需要运营权限。</Notice> : null}
+        {strategyRequired ? <div data-error-code="CONFIRMED_STRATEGY_REQUIRED"><Notice title="AI 内容生成需要确认策略" tone="warning">先到<a className="text-link" href="/strategy">运营策略</a>确认当前周期策略。已有内容的人工操作仍可继续。</Notice></div> : null}
         {!readOnly ? <details className="disclosure" id="new-content" open={createRequested || total === 0}>
           <summary>创建内容</summary>
           <form action="/api/content/generate" method="post" className="disclosure-body form-stack form-width">
@@ -38,7 +41,7 @@ export default async function ContentPage({ searchParams }: { searchParams: Prom
               {accounts.length === 0 ? <Notice title="没有可选账号" tone="warning">先到<a className="text-link" href="/accounts">平台与账号</a>选择账号，才能生成平台版本。</Notice> : accounts.map((account) => <label className="account-option" htmlFor={`target-account-${account.id}`} key={account.id}><input id={`target-account-${account.id}`} type="checkbox" name="accountIds" value={account.id} defaultChecked /><span><strong>{platformLabel(account.platform)}</strong><span className="cell-meta">{account.displayName}</span></span><StatusIndicator value={account.publishCapability} compact /></label>)}
             </fieldset>
             {eligibleProducts.length === 0 ? <Notice title="先建立产品与已确认事实" tone="warning"><a className="text-link" href="/products">前往产品与素材</a>。AI 只会使用已确认的产品事实。</Notice> : null}
-            <div><Button type="submit" disabled={eligibleProducts.length === 0 || accounts.length === 0}>生成草稿</Button></div>
+            <div><Button type="submit" disabled={eligibleProducts.length === 0 || accounts.length === 0 || strategyRequired}>生成草稿</Button></div>
           </form>
         </details> : null}
         <section className="panel content-search-panel" aria-label="查找内容">

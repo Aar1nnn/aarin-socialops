@@ -30,8 +30,26 @@ const contentViewSource = readSource("../src/services/content-operations-view.ts
 const insightsSource = readSource("../src/app/insights/page.tsx");
 const settingsSource = readSource("../src/app/settings/page.tsx");
 const primaryNavSource = readSource("../src/components/primary-nav.tsx");
+const strategySource = readSource("../src/app/strategy/page.tsx");
+const strategyApiSource = readSource("../src/app/api/social-strategies/route.ts");
 
 describe("pilot operator UI form contracts", () => {
+  describe("social strategy", () => {
+    it("pins draft edits and gives stale editors a refresh path", () => {
+      const form = formContaining(strategySource, 'name="expectedDraftId"');
+      expect(form).toContain('action="/api/social-strategies"');
+      expect(form).toContain('value={draft?.id || ""}');
+      expect(strategyApiSource).toContain('error.code === "STRATEGY_VERSION_CONFLICT"');
+      expect(strategySource).toContain('error === "STRATEGY_VERSION_CONFLICT"');
+      expect(strategySource).toContain('刷新页面');
+    });
+
+    it("uses the confirmed-strategy gate code on both relevant pages", () => {
+      expect(strategySource).toContain('data-error-code="CONFIRMED_STRATEGY_REQUIRED"');
+      expect(contentSource).toContain('data-error-code="CONFIRMED_STRATEGY_REQUIRED"');
+    });
+  });
+
   describe("platform connections", () => {
     it("preserves the Meta OAuth start return path and owner gate", () => {
       const form = formContaining(connectionsSource, 'action="/api/connections/meta/start"');

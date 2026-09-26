@@ -9,6 +9,7 @@ import { formatDateTime, platformLabel, statusLabel } from "@/lib/presentation/s
 import { compareContentVersions } from "@/services/content-composition-service";
 import { checkContent } from "@/services/content-service";
 import { getContentOperationsDetail } from "@/services/content-operations-view";
+import { readStrategyProvenance } from "@/services/social-strategy-service";
 
 type Fact = { key: string; value: string; source: string };
 type AIReview = { platform: string; passed: boolean; findings: { severity: string; message: string }[] };
@@ -48,6 +49,8 @@ export default async function ContentDetailPage({ params, searchParams }: { para
     checkContent(context, id),
   ]);
   const version = item.currentVersion;
+  const strategyProvenance = version ? readStrategyProvenance(version.sourceFacts) : "LEGACY_UNBOUND";
+  const sourceFacts = version?.sourceFacts && typeof version.sourceFacts === "object" && !Array.isArray(version.sourceFacts) ? version.sourceFacts : {};
   const factDetails = detailsFromFacts(version?.sourceFacts);
   const approval = version?.approvals[0];
   const approved = Boolean(approval && approval.decision === "APPROVED" && approval.accountId === item.accountId);
@@ -67,6 +70,7 @@ export default async function ContentDetailPage({ params, searchParams }: { para
     <PageHeader title={title} eyebrow={`${workspace.name} · ${platformLabel(item.platform)} · ${item.account.displayName}`} description={`当前 v${version?.version ?? "—"} · ${item.plan.product?.name || "未关联产品"}`} action={<StatusIndicator value={item.status} />} />
     <div className="content-detail-summary"><div><span>当前版本</span><strong>v{version?.version ?? "—"}</strong></div><div><span>人工审核</span><strong>{approved ? "当前版本已批准" : item.status === "REVIEW_PENDING" ? "待人工审核" : "当前版本未批准"}</strong></div><div><span>排期</span><strong>{formatDateTime(item.scheduledAt, "未排期", workspace.timezone)}</strong></div><div><span>下一步</span><strong>{nextStep}</strong></div></div>
     <Notice title="AI 检查不等于人工批准">AI 检查只是风险提示；只有绑定当前 ContentVersion 和目标账号的人工 Approval 才能进入排期。</Notice>
+    <Notice title="策略依据">{strategyProvenance}{typeof sourceFacts.socialStrategyVersion === "number" ? ` · 策略 v${sourceFacts.socialStrategyVersion}` : ""}{typeof sourceFacts.socialStrategyStatus === "string" ? ` · ${sourceFacts.socialStrategyStatus}` : ""}。历史缺失字段按 LEGACY_UNBOUND 解释，不会自动绑定最新策略。</Notice>
     <div className="content-detail-grid"><div className="content-detail-main">
       <section className="panel content-detail-panel"><SectionHeader title="当前平台版本" description={`v${version?.version ?? "—"} · ${version?.generationLabel || "—"} · ${formatDateTime(version?.createdAt, "—", workspace.timezone)}`} action={version?.simulated ? <StatusIndicator value="SIMULATED" compact /> : null} />
         {version ? <div className="content-copy"><h3>{version.title || item.plan.theme}</h3><p>{version.text}</p></div> : <Notice title="当前版本缺失" tone="danger">请联系管理员检查内容记录。</Notice>}

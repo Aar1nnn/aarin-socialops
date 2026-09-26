@@ -13,6 +13,12 @@ enum ClientMode {
   LIVE
 }
 
+enum SocialStrategyStatus {
+  DRAFT
+  CONFIRMED
+  ARCHIVED
+}
+
 enum MembershipRole {
   OWNER
   OPERATOR
@@ -217,6 +223,8 @@ model User {
   auditLogs           AuditLog[]
   platformConnections PlatformConnection[]
   oauthStates         OAuthState[]
+  createdStrategies   SocialStrategy[] @relation("SocialStrategyCreator")
+  confirmedStrategies SocialStrategy[] @relation("SocialStrategyConfirmer")
 }
 
 model Session {
@@ -258,6 +266,7 @@ model Client {
   accounts               SocialAccount[]
   platformPolicies       PlatformPolicy[]
   contentPlans           ContentPlan[]
+  socialStrategies       SocialStrategy[]
   contentItems           ContentItem[]
   contentVersions        ContentVersion[]
   approvals              Approval[]
@@ -304,6 +313,29 @@ model BrandProfile {
   createdAt        DateTime @default(now())
   updatedAt        DateTime @updatedAt
   client           Client   @relation(fields: [clientId], references: [id], onDelete: Cascade)
+}
+
+model SocialStrategy {
+  id                String               @id @default(cuid())
+  clientId          String
+  version           Int
+  status            SocialStrategyStatus @default(DRAFT)
+  payload           Json
+  effectiveFrom     DateTime?
+  effectiveTo       DateTime?
+  createdByUserId   String
+  confirmedByUserId String?
+  confirmedAt       DateTime?
+  createdAt         DateTime             @default(now())
+  updatedAt         DateTime             @updatedAt
+  client            Client               @relation(fields: [clientId], references: [id], onDelete: Cascade)
+  createdBy         User                 @relation("SocialStrategyCreator", fields: [createdByUserId], references: [id], onDelete: Restrict)
+  confirmedBy       User?                @relation("SocialStrategyConfirmer", fields: [confirmedByUserId], references: [id], onDelete: Restrict)
+  contentPlans      ContentPlan[]
+
+  @@unique([clientId, version])
+  @@unique([id, clientId])
+  @@index([clientId, status, createdAt])
 }
 
 model ResearchRecord {
@@ -564,6 +596,7 @@ model ContentPlan {
   id             String        @id @default(cuid())
   clientId       String
   productId      String?
+  socialStrategyId String?
   theme          String
   objective      String
   channels       String[]
@@ -575,9 +608,11 @@ model ContentPlan {
   updatedAt      DateTime      @updatedAt
   client         Client        @relation(fields: [clientId], references: [id], onDelete: Cascade)
   product        Product?      @relation(fields: [productId], references: [id], onDelete: SetNull)
+  socialStrategy SocialStrategy? @relation(fields: [socialStrategyId, clientId], references: [id, clientId], onDelete: Restrict)
   items          ContentItem[]
 
   @@index([clientId, plannedAt])
+  @@index([socialStrategyId, clientId])
 }
 
 model ContentItem {

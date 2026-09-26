@@ -16,6 +16,7 @@ import { assertValidTimeZone, zonedLocalDateTimeToUtc } from "../lib/timezone";
 import { assertCanWrite, type RequestContext } from "../lib/context";
 import { releaseUsage, reserveUsage, settleUsage } from "./usage-service";
 import { prepareAIContentPipelineInput, runPreparedAIContentPipeline } from "./ai-content-pipeline-service";
+import { selectStrategyForGeneration, strategyModelContext, strategyProvenanceFacts } from "./social-strategy-service";
 import { getPlatformRegistry, resolveLivePublishingTarget } from "./platform-registry-service";
 
 const platforms = ["facebook", "instagram", "tiktok", "linkedin"] as const;
@@ -90,6 +91,9 @@ export async function generateContentPlan(context: RequestContext, raw: unknown,
   }
   const targetPlatforms = platformValues as Array<(typeof platforms)[number]>;
   if (!prompt) throw new AppError("内容生成 prompt 未配置。", 500, "PROMPT_NOT_CONFIGURED");
+  const strategyBinding = await selectStrategyForGeneration(context.clientId, client.mode);
+  const socialStrategy = strategyModelContext(strategyBinding);
+  const targetMarkets = socialStrategy?.targetMarkets ?? client.targetMarkets;
   const confirmedFacts = product.fields
     .filter((field) => field.status === "CONFIRMED" && field.value)
     .map((field) => ({ key: field.key, value: field.value!, source: field.source || "未记录来源" }));
@@ -100,7 +104,7 @@ export async function generateContentPlan(context: RequestContext, raw: unknown,
   const modelInput = {
     clientName: client.name,
     mode: client.mode,
-    targetMarkets: client.targetMarkets,
+    targetMarkets,
     productFocus: client.productFocus,
     brandGuidelines: client.brandGuidelines,
     productName: product.name,
@@ -111,7 +115,7 @@ export async function generateContentPlan(context: RequestContext, raw: unknown,
     platforms: targetPlatforms,
     instruction: prompt.instruction,
   };
-  const pipelineInput = await prepareAIContentPipelineInput(context, modelInput);
+  const pipelineInput = await prepareAIContentPipelineInput(context, modelInput, socialStrategy);
   const reservation = configuredProvider === "openai-compatible"
     ? await reserveUsage({ clientId: context.clientId, capability: "multi_platform_content", provider: configuredProvider, units: Math.ceil(JSON.stringify(pipelineInput).length / 4) + Number(process.env.TEXT_MODEL_MAX_OUTPUT_UNITS || 2000) })
     : null;
@@ -133,6 +137,15 @@ export async function generateContentPlan(context: RequestContext, raw: unknown,
   }
 
   const result = await db.$transaction(async (tx) => {
+    const lockedClients = await tx.$queryRaw<Array<{ id: string; mode: ClientMode }>>`SELECT "id", "mode" FROM "Client" WHERE "id" = ${context.clientId} FOR UPDATE`;
+    if (lockedClients[0]?.mode !== client.mode) throw new AppError("客户模式在模型运行期间发生变化，请重新生成。", 409, "STALE_OPERATION");
+    const currentBinding = await selectStrategyForGeneration(context.clientId, client.mode, tx);
+    if (currentBinding.strategy?.id !== strategyBinding.strategy?.id
+      || currentBinding.strategy?.version !== strategyBinding.strategy?.version
+      || currentBinding.strategy?.status !== strategyBinding.strategy?.status
+      || currentBinding.provenance !== strategyBinding.provenance) {
+      throw new AppError("策略在模型运行期间发生变化，请重新生成。", 409, "STALE_OPERATION");
+    }
     await tx.$queryRaw`SELECT "id" FROM "Product" WHERE "id" = ${product.id} AND "clientId" = ${context.clientId} FOR UPDATE`;
     const liveProduct = await tx.product.findFirst({
       where: { id: product.id, clientId: context.clientId },
@@ -145,13 +158,14 @@ export async function generateContentPlan(context: RequestContext, raw: unknown,
       data: {
         clientId: context.clientId,
         productId: product.id,
+        socialStrategyId: strategyBinding.strategy?.id ?? null,
         theme: input.theme,
         objective: input.objective,
         channels: targetPlatforms,
         assetNeeds: assetIds.length ? null : "尚未关联素材",
         plannedAt: input.plannedAt,
-        marketScope: client.targetMarkets.length ? client.targetMarkets.join(", ") : null,
-        isGenericDraft: client.targetMarkets.length === 0,
+        marketScope: targetMarkets.length ? targetMarkets.join(", ") : null,
+        isGenericDraft: targetMarkets.length === 0,
       },
     });
     const items = [];
@@ -188,7 +202,8 @@ export async function generateContentPlan(context: RequestContext, raw: unknown,
             productId: product.id,
             productFocus: client.productFocus,
             brandGuidelines: client.brandGuidelines,
-            targetMarkets: client.targetMarkets,
+            targetMarkets,
+            ...strategyProvenanceFacts(strategyBinding),
             pipeline: generated.pipeline,
           } as Prisma.InputJsonValue,
           assetLinks: {
@@ -220,12 +235,12 @@ export async function generateContentPlan(context: RequestContext, raw: unknown,
         action: "CONTENT_PLAN_GENERATED",
         entityType: "ContentPlan",
         entityId: plan.id,
-        metadata: { simulated: generated.simulated, platforms: targetPlatforms, accountIds: accounts.map((account) => account.id), pipelineStages: generated.pipeline.stages } as Prisma.InputJsonValue,
+        metadata: { simulated: generated.simulated, platforms: targetPlatforms, accountIds: accounts.map((account) => account.id), pipelineStages: generated.pipeline.stages, ...strategyProvenanceFacts(strategyBinding) } as Prisma.InputJsonValue,
       },
     });
     return { plan, items };
   });
-  return { ...result, generation: { simulated: generated.simulated, provider: generated.provider } };
+  return { ...result, generation: { simulated: generated.simulated, provider: generated.provider, ...strategyProvenanceFacts(strategyBinding) } };
 }
 
 export async function submitForReview(context: RequestContext, contentItemId: string, expectedVersionId?: string) {
@@ -273,6 +288,8 @@ export async function editContentVersion(
     generator?: string;
     generationLabel?: string;
     sourceFacts?: Prisma.InputJsonValue;
+    expectedStrategyId?: string | null;
+    expectedClientMode?: ClientMode;
   },
 ) {
   assertCanWrite(context);
@@ -292,6 +309,21 @@ export async function editContentVersion(
     const liveItem = await tx.contentItem.findUniqueOrThrow({ where: { id: item.id } });
     if (liveItem.status === ContentStatus.RUNNING) throw new AppError("发布已经开始，不能编辑；请等待结果或执行远端对账。", 409, "PUBLISH_IN_PROGRESS");
     if (liveItem.currentVersionId !== item.currentVersionId) throw new AppError("内容已被其他操作更新，请刷新后重试。", 409, "STALE_OPERATION");
+    if (input.expectedStrategyId !== undefined) {
+      await tx.$queryRaw`SELECT "id" FROM "Client" WHERE "id" = ${context.clientId} FOR UPDATE`;
+      const livePlan = await tx.contentPlan.findUniqueOrThrow({ where: { id: item.planId }, select: { socialStrategyId: true } });
+      const liveClient = await tx.client.findUniqueOrThrow({ where: { id: context.clientId }, select: { mode: true } });
+      if (livePlan.socialStrategyId !== input.expectedStrategyId || (input.expectedClientMode && liveClient.mode !== input.expectedClientMode)) {
+        throw new AppError("内容绑定或客户模式在模型运行期间发生变化。", 409, "STALE_OPERATION");
+      }
+      if (liveClient.mode === ClientMode.LIVE && input.expectedStrategyId) {
+        const liveStrategy = await tx.socialStrategy.findFirst({
+          where: { id: input.expectedStrategyId, clientId: context.clientId },
+          select: { confirmedAt: true },
+        });
+        if (!liveStrategy?.confirmedAt) throw new AppError("内容绑定的策略在模型运行期间失去有效确认记录。", 409, "STALE_OPERATION");
+      }
+    }
     const version = await tx.contentVersion.create({
       data: {
         clientId: context.clientId,

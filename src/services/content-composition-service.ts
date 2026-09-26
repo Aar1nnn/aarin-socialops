@@ -9,6 +9,7 @@ import { AppError } from "../lib/errors";
 import { editContentVersion } from "./content-service";
 import { prepareAIContentPipelineInput, runPreparedAIContentPipeline } from "./ai-content-pipeline-service";
 import { releaseUsage, reserveUsage, settleUsage } from "./usage-service";
+import { resolveStrategyForComposition, strategyModelContext, strategyProvenanceFacts } from "./social-strategy-service";
 
 const supportedPlatforms = ["facebook", "instagram", "tiktok", "linkedin"] as const;
 
@@ -86,6 +87,8 @@ async function generateVariant(
     db.platformPolicy.findUnique({ where: { clientId_platform: { clientId: context.clientId, platform: item.platform } } }),
   ]);
   if (!prompt) throw new AppError("内容生成 prompt 未配置。", 500, "PROMPT_NOT_CONFIGURED");
+  const strategyBinding = await resolveStrategyForComposition(context.clientId, client.mode, item.plan.socialStrategyId);
+  const socialStrategy = strategyModelContext(strategyBinding);
   const confirmedFacts = item.plan.product!.fields
     .filter((field) => field.status === "CONFIRMED" && field.value)
     .map((field) => ({ key: field.key, value: field.value!, source: field.source || "未记录来源" }));
@@ -98,7 +101,7 @@ async function generateVariant(
   const pipelineInput = await prepareAIContentPipelineInput(context, {
     clientName: client.name,
     mode: client.mode,
-    targetMarkets: client.targetMarkets,
+    targetMarkets: socialStrategy?.targetMarkets ?? client.targetMarkets,
     productFocus: client.productFocus,
     brandGuidelines: client.brandGuidelines,
     productName: item.plan.product!.name,
@@ -108,7 +111,7 @@ async function generateVariant(
     missingFields,
     platforms: [item.platform as (typeof supportedPlatforms)[number]],
     instruction: prompt.instruction,
-  });
+  }, socialStrategy);
   const configuredProvider = textIntegration?.provider === "openai-compatible" ? "openai-compatible" : "mock";
   const adapter = adapterOverride || getTextGenerationAdapter(configuredProvider);
   const reservation = !adapterOverride && configuredProvider === "openai-compatible"
@@ -161,11 +164,14 @@ async function generateVariant(
       generationLabel: generated.simulated ? "模拟内容改写" : "AI 内容改写",
       sourceFacts: {
         ...existingFacts,
+        ...strategyProvenanceFacts(strategyBinding),
         compositionAction: input.action,
         confirmedFacts,
         missingFields: draft.missingInformation,
         pipeline: generated.pipeline,
       } as Prisma.InputJsonValue,
+      expectedStrategyId: strategyBinding.strategy?.id ?? null,
+      expectedClientMode: client.mode,
     });
   } catch (error) {
     if (reservation) await releaseUsage(reservation.id, context.clientId);
