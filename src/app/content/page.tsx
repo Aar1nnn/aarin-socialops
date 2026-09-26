@@ -15,7 +15,7 @@ type ContentFilter = {
 const CONTENT_FILTERS: readonly ContentFilter[] = [
   { key: "all", label: "全部", statuses: null },
   { key: "draft", label: "草稿", statuses: ["DRAFT"] },
-  { key: "review", label: "待审核", statuses: ["REVIEW_PENDING"] },
+  { key: "review", label: "待人工审核", statuses: ["REVIEW_PENDING"] },
   { key: "approved", label: "已批准", statuses: ["APPROVED"] },
   { key: "scheduled", label: "已排期", statuses: ["SCHEDULED", "RUNNING"] },
   { key: "published", label: "已发布", statuses: ["PUBLISHED"] },
@@ -133,7 +133,7 @@ export default async function ContentPage({
     <OperatorShell context={context}>
       <div className="page">
         <PageHeader
-          title="内容"
+          title="内容中心"
           description="创建、审核并安排各平台内容。"
           action={readOnly ? null : (
             <a
@@ -145,6 +145,10 @@ export default async function ContentPage({
             </a>
           )}
         />
+
+        <Notice title="AI 检查不等于人工批准">
+          AI 生成与检查结果仅供编辑参考。只有当前内容版本与目标账号获得有效人工批准后才能排期。
+        </Notice>
 
         {readOnly ? (
           <Notice title="只读访问">
@@ -174,7 +178,7 @@ export default async function ContentPage({
             <fieldset className="stack-tight" style={{ border: 0, margin: 0, padding: 0 }}>
               <legend style={{ marginBottom: "8px", fontSize: "13px", fontWeight: 600 }}>目标账号</legend>
               {accounts.length === 0 ? (
-                <Notice title="尚无可选账号" tone="warning">请先在平台连接中选择用于内容发布的账号。</Notice>
+                <Notice title="尚无可选账号" tone="warning">请先在<a className="text-link" href="/accounts">平台与账号</a>中选择用于内容发布的账号。</Notice>
               ) : accounts.map((account) => (
                 <label className="account-option" htmlFor={`target-account-${account.id}`} key={account.id}>
                   <input

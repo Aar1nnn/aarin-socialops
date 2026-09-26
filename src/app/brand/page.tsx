@@ -15,7 +15,7 @@ export default async function BrandPage() {
     buildResearchMemory(context, 8),
   ]);
   return <OperatorShell context={context}>
-    <div className="page-title"><div><h1>品牌与记忆</h1><p className="muted">结构化品牌资料是 AI 与运营的共同上下文；历史内容、表现与研究继续来自 Aarin 数据库。</p></div></div>
+    <div className="page-title"><div><h1>品牌与知识</h1><p className="muted">结构化品牌资料是 AI 与运营的共同上下文；历史内容、表现与研究继续来自 Aarin 数据库。</p></div></div>
     <div className="grid">
       <section className="card span-7"><h2>Brand Profile</h2><form action="/api/brand" method="post" className="stack">
         <label>业务摘要<textarea name="businessSummary" defaultValue={brand.businessSummary || ""} /></label>

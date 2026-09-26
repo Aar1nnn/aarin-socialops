@@ -441,7 +441,7 @@ export default async function SettingsPage() {
           <summary>高级：Legacy Facebook connection</summary>
           <div className="disclosure-body stack">
             <Notice title="兼容连接">
-              新连接请优先使用 <Link className="text-link" href="/connections">平台连接</Link> 完成 Meta OAuth。
+              新连接请优先使用 <Link className="text-link" href="/accounts">平台与账号</Link> 完成 Meta OAuth。
               此处仅用于迁移兼容和专用测试 Page 的环境变量引用方式。
             </Notice>
 

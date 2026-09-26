@@ -2,6 +2,7 @@ import { OperatorShell } from "@/components/operator-shell";
 import { CalendarBoard } from "@/components/calendar-board";
 import { requirePageContext } from "@/lib/auth";
 import { db } from "@/lib/db";
+import { statusLabel } from "@/lib/presentation/status";
 import { listCalendarEntries } from "@/services/calendar-service";
 
 function resolveRange(view: "month" | "week" | "list", anchor: Date) {
@@ -37,7 +38,7 @@ export default async function CalendarPage({ searchParams }: { searchParams: Pro
       <label>日期<input type="date" name="date" defaultValue={anchor.toISOString().slice(0, 10)} /></label>
       <label>平台<select name="platform" defaultValue={typeof query.platform === "string" ? query.platform : ""}><option value="">全部</option>{[...new Set(accounts.map((account) => account.platform))].map((platform) => <option key={platform}>{platform}</option>)}</select></label>
       <label>账号<select name="accountId" defaultValue={typeof query.accountId === "string" ? query.accountId : ""}><option value="">全部</option>{accounts.map((account) => <option value={account.id} key={account.id}>{account.platform} · {account.displayName}</option>)}</select></label>
-      <label>状态<select name="status" defaultValue={typeof query.status === "string" ? query.status : ""}><option value="">全部</option>{["DRAFT", "REVIEW_PENDING", "APPROVED", "SCHEDULED", "RUNNING", "PUBLISHED", "UNKNOWN", "FAILED"].map((status) => <option key={status}>{status}</option>)}</select></label>
+      <label>状态<select name="status" defaultValue={typeof query.status === "string" ? query.status : ""}><option value="">全部</option>{["DRAFT", "REVIEW_PENDING", "APPROVED", "SCHEDULED", "RUNNING", "PUBLISHED", "UNKNOWN", "FAILED"].map((status) => <option key={status} value={status}>{statusLabel(status)}</option>)}</select></label>
       <button>应用筛选</button>
     </form></section>
     <section className="card" style={{ marginTop: "1rem" }}><CalendarBoard entries={serialized} view={view} startDate={range.startDate} /></section>

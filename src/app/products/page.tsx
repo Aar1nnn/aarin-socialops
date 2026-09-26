@@ -79,7 +79,7 @@ export default async function ProductsPage({
     <OperatorShell context={context}>
       <div className="page">
         <PageHeader
-          title="产品"
+          title="产品与素材"
           description="产品资料与素材是内容生成的事实来源。"
           action={canWrite ? (
             <a
