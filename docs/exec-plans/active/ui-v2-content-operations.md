@@ -32,7 +32,7 @@
 - [x] Read UI architecture plan and audit PR #8, baseline and relevant API/service contracts.
 - [x] Implement and test content operations. The content list now searches/filters tenant-scoped existing items, and the detail page uses the existing version, approval and job records.
 - [x] Local browser acceptance and complete verification. In `socialops_ui_v2_content_ops`, all 12 migrations, seed, Prisma generate, typecheck, 25 test files / 228 tests and production build passed. Browser: confirmed DEMO product facts → content → AI rewrite v2 → review → change request → manual v3 → review → approval → DEMO schedule → publishing entry; separate VIEWER login saw no write controls and API returned 403. Search and scheduled filter returned expected items; stale UI write returned 409 with compare link. At 390px the detail edit/review controls were reachable with no document overflow; content list and publishing had no overflow at 390px, and publishing was also checked at 800/1366/1440/1920px.
-- [ ] Open PR and confirm CI.
+- [x] Open [PR #9](https://github.com/Aar1nnn/aarin-socialops/pull/9) for review; both initial remote `verify` checks passed on `ddaf43d`. PR remains open and unmerged.
 
 ## Defect-first review notes
 
