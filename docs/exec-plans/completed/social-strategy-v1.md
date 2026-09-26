@@ -19,4 +19,10 @@ Base: `origin/main` at `c6fb0d0ca9e2a450260c419e8cb34f651d303a6e` (PR #9 merge).
 - [x] Strategy service, API, page, and content integration.
 - [x] Tenant, concurrency, gate, legacy, bound rewrite, and role regression tests.
 - [x] Dedicated PostgreSQL migration and status clean (13 migrations); drift probe produced only an empty migration and was removed. Seed completed twice. Prisma generate, typecheck, full tests (26 files, 237 tests), production build, and diff check passed. Chrome at 390px opened the strategy page, saved draft v1, and confirmed it; document scroll width stayed 390px throughout.
-- [ ] Commit, push, PR, CI evidence and remaining risks.
+- [x] Code committed and pushed as `f1c18aafd068084e18648689aa46b80b608264da`; PR #10 opened at `https://github.com/Aar1nnn/aarin-socialops/pull/10`. Its `verify` job passed generate, migration, seed twice, migrate status, typecheck, full tests, and build.
+
+## Remaining risks
+
+- The single-active-version invariant is enforced by the strategy service under a Client row lock. Direct database writes that bypass the service can violate it.
+- Historical unbound LIVE content remains usable manually. AI rewrite/regenerate requires a future explicit human binding action outside this V1 scope.
+- Real model and Meta publishing side effects were not exercised.
