@@ -10,7 +10,7 @@ export async function POST(request: Request, { params }: { params: Promise<{ id:
     const { id } = await params;
     const body = await requestData(request);
     const decision = String(body.decision) === "APPROVED" ? ApprovalDecision.APPROVED : ApprovalDecision.REJECTED;
-    return actionResponse(request, await reviewContent(context, id, decision, String(body.note || "")), "/content");
+    return actionResponse(request, await reviewContent(context, id, decision, String(body.note || ""), typeof body.expectedVersionId === "string" ? body.expectedVersionId : undefined), `/content/${id}`);
   } catch (error) {
     return errorResponse(error);
   }

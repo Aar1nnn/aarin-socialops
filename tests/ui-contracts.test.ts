@@ -24,6 +24,9 @@ function expectNamedFields(form: string, names: string[]) {
 
 const connectionsSource = readSource("../src/app/connections/page.tsx");
 const contentSource = readSource("../src/app/content/page.tsx");
+const contentDetailSource = readSource("../src/app/content/[id]/page.tsx");
+const contentActionsSource = readSource("../src/components/content-actions.tsx");
+const contentViewSource = readSource("../src/services/content-operations-view.ts");
 const insightsSource = readSource("../src/app/insights/page.tsx");
 const settingsSource = readSource("../src/app/settings/page.tsx");
 const primaryNavSource = readSource("../src/components/primary-nav.tsx");
@@ -65,32 +68,38 @@ describe("pilot operator UI form contracts", () => {
       const form = formContaining(contentSource, 'action="/api/content/generate"');
 
       expectNamedFields(form, ["productId", "theme", "objective", "accountIds"]);
-      expect(form).toContain("disabled={readOnly}");
       expect(contentSource).toContain('const readOnly = context.role === "VIEWER"');
+      expect(contentSource).toContain('{!readOnly ? <details');
+      expect(contentSource).toContain('href={`/content/${item.id}`}');
     });
 
-    it("preserves explicit approve and reject decisions", () => {
-      expect(contentSource).toContain('name="decision" value="APPROVED"');
-      expect(contentSource).toContain('name="decision" value="REJECTED"');
-      expect(contentSource.match(/\/review`} method="post"/g)).toHaveLength(2);
+    it("scopes list and detail reads to the current client", () => {
+      expect(contentViewSource).toContain('clientId: context.clientId');
+      expect(contentViewSource).toContain('where: { id, clientId: context.clientId }');
+      expect(contentDetailSource).toContain('if (!item) notFound()');
     });
 
-    it("preserves publish mode, local time, and workspace timezone", () => {
-      const form = formContaining(contentSource, "/schedule`}");
-
-      expectNamedFields(form, ["publishMode", "localDateTime", "timezone"]);
-      expect(form).toContain('type="datetime-local"');
-      expect(form).toContain("value={client.timezone}");
-      expect(form).toContain('value="NOW"');
-      expect(form).toContain('value="SCHEDULED"');
-      expect(form).toContain('client.mode === "DRAFT"');
+    it("separates AI review from human approval and requires expected version on writes", () => {
+      expect(contentDetailSource).toContain('title="AI 检查"');
+      expect(contentDetailSource).toContain('title="人工审核与修改意见"');
+      expect(contentActionsSource).toContain('expectedVersionId: props.versionId');
+      expect(contentActionsSource).toContain('operation: "rewrite"');
+      expect(contentActionsSource).toContain('operation: "regenerate_platform"');
+      expect(contentActionsSource).toContain('operation: "update_draft"');
+      expect(contentActionsSource).toContain('decision: "APPROVED"');
+      expect(contentActionsSource).toContain('"changes"');
+      expect(contentActionsSource).toContain('"versions"');
+      expect(contentActionsSource).toContain('"schedule"');
+      expect(contentActionsSource).toContain('response.status === 409');
     });
 
-    it("keeps remote status lookup read-only for viewers", () => {
-      const form = formContaining(contentSource, "/query`}");
-
-      expect(form).toContain('method="post"');
-      expect(form).toContain("disabled={readOnly}");
+    it("keeps scheduling behind role, approval and workspace gates", () => {
+      expect(contentActionsSource).toContain('!props.readOnly && props.status === "APPROVED" && props.approved && props.mode !== "DRAFT"');
+      expect(contentActionsSource).toContain('type="datetime-local"');
+      expect(contentActionsSource).toContain('timezone: props.timezone');
+      expect(contentActionsSource).toContain('props.mode === "LIVE" && !liveConfirmed');
+      expect(contentDetailSource).toContain('job.status === "UNKNOWN"');
+      expect(contentDetailSource).toContain('不能盲目重试');
     });
   });
 

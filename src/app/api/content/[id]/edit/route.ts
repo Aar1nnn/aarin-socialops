@@ -12,8 +12,9 @@ export async function POST(request: Request, { params }: { params: Promise<{ id:
       text: String(body.text || ""),
       title: body.title === undefined ? undefined : String(body.title || ""),
       accountId: body.accountId ? String(body.accountId) : undefined,
+      expectedVersionId: typeof body.expectedVersionId === "string" ? body.expectedVersionId : undefined,
     });
-    return actionResponse(request, result, "/content");
+    return actionResponse(request, result, `/content/${id}`);
   } catch (error) {
     return errorResponse(error);
   }
