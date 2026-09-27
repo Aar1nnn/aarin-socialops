@@ -4,6 +4,8 @@ import { assertCanWrite, type RequestContext } from "../lib/context";
 import { db } from "../lib/db";
 import { AppError } from "../lib/errors";
 import { recordDomainEvent } from "../lib/domain-events";
+import { MUTABLE_SCHEDULED_JOB_STATUSES } from "../lib/publishing-status";
+import { cancelManualTasksForVersion } from "./manual-task-lifecycle";
 
 const requestChangesSchema = z.object({
   expectedVersionId: z.string().min(1),
@@ -62,10 +64,11 @@ export async function requestContentChanges(context: RequestContext, contentItem
       where: {
         clientId: context.clientId,
         contentVersionId: input.expectedVersionId,
-        status: { in: [PublishJobStatus.PENDING, PublishJobStatus.RETRY, PublishJobStatus.WAITING_CONFIGURATION] },
+        status: { in: MUTABLE_SCHEDULED_JOB_STATUSES },
       },
       data: { status: PublishJobStatus.CANCELLED, lastErrorCode: "APPROVAL_REVOKED" },
     });
+    await cancelManualTasksForVersion(tx, context.clientId, input.expectedVersionId);
     await tx.contentItem.update({ where: { id: item.id }, data: { status: ContentStatus.CHANGES_REQUESTED, scheduledAt: null } });
     await recordDomainEvent(context, {
       type: "CHANGES_REQUESTED",

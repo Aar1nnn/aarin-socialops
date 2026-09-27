@@ -44,7 +44,7 @@ export async function listContentOperations(context: RequestContext, filters: Co
     }),
     db.contentItem.count({ where }),
     db.product.findMany({ where: { clientId: context.clientId }, orderBy: { updatedAt: "desc" }, select: { id: true, name: true, fields: { select: { status: true, value: true } } } }),
-    db.socialAccount.findMany({ where: { clientId: context.clientId }, orderBy: [{ platform: "asc" }, { displayName: "asc" }], select: { id: true, platform: true, displayName: true, publishCapability: true, isSelected: true } }),
+    db.socialAccount.findMany({ where: { clientId: context.clientId }, orderBy: [{ platform: "asc" }, { displayName: "asc" }], select: { id: true, platform: true, displayName: true, publishCapability: true, isSelected: true, metadata: true } }),
     db.client.findUniqueOrThrow({ where: { id: context.clientId }, select: { name: true, mode: true, timezone: true } }),
   ]);
   return { items, total, products, filterAccounts, accounts: filterAccounts.filter((account) => account.isSelected), client, lane, q };
@@ -54,7 +54,7 @@ export async function getContentOperationsDetail(context: RequestContext, id: st
   return db.contentItem.findFirst({
     where: { id, clientId: context.clientId },
     include: {
-      account: { select: { id: true, displayName: true, publishCapability: true, isSelected: true } },
+      account: { select: { id: true, displayName: true, publishCapability: true, isSelected: true, metadata: true, platform: true } },
       plan: { include: { product: { include: { fields: true } }, items: { select: { id: true, platform: true, account: { select: { displayName: true } }, currentVersion: { select: { version: true } } } } } },
       currentVersion: { include: { assetLinks: { include: { asset: { select: { id: true, originalName: true, kind: true } } } }, approvals: { orderBy: { createdAt: "desc" }, include: { reviewer: { select: { displayName: true } } } } } },
       versions: { orderBy: { version: "desc" }, include: { createdBy: { select: { displayName: true } }, approvals: { orderBy: { createdAt: "desc" }, include: { reviewer: { select: { displayName: true } } } }, reviewComments: { orderBy: { createdAt: "desc" }, include: { reviewer: { select: { displayName: true } } } }, publishJobs: { orderBy: { createdAt: "desc" } } } },

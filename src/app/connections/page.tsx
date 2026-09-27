@@ -11,6 +11,7 @@ import { requirePageContext } from "@/lib/auth";
 import { db } from "@/lib/db";
 import { formatDateTime, platformLabel, statusLabel } from "@/lib/presentation/status";
 import { listPlatformConnections } from "@/services/platform-connection-service";
+import { MANUAL_PLATFORMS, manualAccountProfileUrl, resolveAccountPublishingMode } from "@/lib/manual-account";
 
 const accountTypeLabels: Record<string, string> = {
   FACEBOOK_PAGE: "Facebook Page",
@@ -48,10 +49,11 @@ export default async function ConnectionsPage() {
     db.socialAccount.findMany({
       where: { clientId: context.clientId },
       orderBy: [{ platform: "asc" }, { displayName: "asc" }],
-      select: { id: true, platform: true, displayName: true, accountType: true, isSelected: true, publishCapability: true, metricsCapability: true },
+      select: { id: true, platform: true, displayName: true, accountType: true, isSelected: true, publishCapability: true, metricsCapability: true, commentsCapability: true, metadata: true },
     }),
   ]);
   const canManageConnections = context.role === "OWNER";
+  const canCreateManual = context.role === "OWNER" || context.role === "OPERATOR";
   const hasMetaConnection = connections.some((connection) => connection.provider === "META");
 
   return (
@@ -72,7 +74,7 @@ export default async function ConnectionsPage() {
 
         {!canManageConnections ? (
           <Notice title="只读访问">
-            当前角色可查看连接和账号能力。连接、选择账号或断开授权需要工作区所有者操作。
+            Meta 连接、选择账号或断开授权需要工作区所有者操作。人工管理账号可由所有者或运营者创建。
           </Notice>
         ) : null}
 
@@ -83,19 +85,38 @@ export default async function ConnectionsPage() {
           ) : (
             <div className="table-scroll" role="region" aria-label="工作区账号列表" tabIndex={0}>
               <table>
-                <thead><tr><th>账号</th><th>平台</th><th>选择</th><th>发布能力</th><th>指标能力</th></tr></thead>
+                <thead><tr><th>账号</th><th>平台</th><th>管理方式</th><th>选择</th><th>发布能力</th><th>指标能力</th><th>互动能力</th></tr></thead>
                 <tbody>{accounts.map((account) => (
                   <tr key={account.id}>
-                    <td className="cell-title">{account.displayName}</td>
+                    <td className="cell-title">{account.displayName}{manualAccountProfileUrl(account) ? <span className="cell-meta"><a className="text-link" href={manualAccountProfileUrl(account)!} target="_blank" rel="noopener noreferrer">账号主页</a></span> : null}</td>
                     <td>{accountTypeLabel(account.accountType, account.platform)}</td>
+                    <td>{resolveAccountPublishingMode(account) === "MANUAL" ? "人工管理 · 无 API 发布能力" : "平台连接／既有账号"}</td>
                     <td>{account.isSelected ? "已选择" : "未选择"}</td>
                     <td><StatusIndicator value={account.publishCapability} compact /></td>
                     <td><StatusIndicator value={account.metricsCapability} compact /></td>
+                    <td><StatusIndicator value={account.commentsCapability} compact /></td>
                   </tr>
                 ))}</tbody>
               </table>
             </div>
           )}
+        </section>
+
+        <section className="panel" aria-label="创建人工管理账号">
+          <SectionHeader title="人工管理账号" description="用于 LinkedIn、TikTok、YouTube 的人工发布；不创建 OAuth 连接，也不表示平台 API 已接通。" />
+          {canCreateManual ? <div className="form-grid">
+            {MANUAL_PLATFORMS.map((platform) => <form key={platform} action="/api/accounts/manual" method="post" className="form-stack">
+              <input type="hidden" name="platform" value={platform} />
+              <h3>{platformLabel(platform)}</h3>
+              <label>账号名称<input name="displayName" required maxLength={200} /></label>
+              <label>账号类型<select name="accountType">{(platform === "linkedin"
+                ? [["LINKEDIN_MEMBER", "个人"], ["LINKEDIN_ORGANIZATION", "机构"]]
+                : platform === "tiktok" ? [["TIKTOK_ACCOUNT", "TikTok 账号"]] : [["YOUTUBE_CHANNEL", "YouTube 频道"]]
+              ).map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select></label>
+              <label>HTTPS 账号主页<input name="profileUrl" type="url" required placeholder="https://..." /></label>
+              <Button type="submit" variant="secondary">创建人工账号</Button>
+            </form>)}
+          </div> : <Notice title="只读访问">只有所有者和运营者可创建人工账号。</Notice>}
         </section>
 
         {connections.length === 0 ? (

@@ -1,0 +1,3 @@
+ALTER TYPE "PublishJobStatus" ADD VALUE 'MANUAL_PENDING';
+
+ALTER TABLE "ContentVersion" ALTER COLUMN "promptVersionId" DROP NOT NULL;

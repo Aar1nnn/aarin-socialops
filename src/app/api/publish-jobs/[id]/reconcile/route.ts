@@ -8,7 +8,7 @@ export async function POST(request: Request, { params }: { params: Promise<{ id:
     const context = await requireContext();
     const { id } = await params;
     const result = await reconcileUnknownPublish(context, id, await requestData(request));
-    return actionResponse(request, result, "/");
+    return actionResponse(request, result, "/publishing");
   } catch (error) {
     return errorResponse(error);
   }

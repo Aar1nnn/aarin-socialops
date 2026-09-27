@@ -10,7 +10,12 @@ export async function POST(request: Request) {
     const ids = Array.isArray(body.contentItemIds)
       ? body.contentItemIds.map(String)
       : String(body.contentItemIds || body.contentItemId || "").split(",").filter(Boolean);
-    const result = await rescheduleCalendarItems(context, { contentItemIds: ids, scheduledAt: body.scheduledAt });
+    const result = await rescheduleCalendarItems(context, {
+      contentItemIds: ids,
+      scheduledAt: body.scheduledAt,
+      localDateTime: body.localDateTime,
+      timezone: body.timezone,
+    });
     return actionResponse(request, result, "/calendar");
   } catch (error) {
     return errorResponse(error);

@@ -18,6 +18,9 @@ import { releaseUsage, reserveUsage, settleUsage } from "./usage-service";
 import { prepareAIContentPipelineInput, runPreparedAIContentPipeline } from "./ai-content-pipeline-service";
 import { selectStrategyForGeneration, strategyModelContext, strategyProvenanceFacts } from "./social-strategy-service";
 import { getPlatformRegistry, resolveLivePublishingTarget } from "./platform-registry-service";
+import { resolveAccountPublishingMode } from "../lib/manual-account";
+import { CONFLICT_JOB_STATUSES, MUTABLE_SCHEDULED_JOB_STATUSES, OPEN_MANUAL_TASK_STATUSES } from "../lib/publishing-status";
+import { cancelManualTasksForVersion } from "./manual-task-lifecycle";
 
 const platforms = ["facebook", "instagram", "tiktok", "linkedin"] as const;
 const generateInputSchema = z.object({
@@ -243,6 +246,17 @@ export async function generateContentPlan(context: RequestContext, raw: unknown,
   return { ...result, generation: { simulated: generated.simulated, provider: generated.provider, ...strategyProvenanceFacts(strategyBinding) } };
 }
 
+async function assertNoUnresolvedManualPublish(tx: Prisma.TransactionClient, clientId: string, contentVersionId: string | null) {
+  if (!contentVersionId) return;
+  const unresolved = await tx.publishJob.findFirst({
+    where: { clientId, contentVersionId, adapter: "manual", status: PublishJobStatus.UNKNOWN },
+    select: { id: true },
+  });
+  if (unresolved) {
+    throw new AppError("人工发布结果仍不确定；先核实外部平台并在发布中心对账。", 409, "MANUAL_RECONCILIATION_REQUIRED");
+  }
+}
+
 export async function submitForReview(context: RequestContext, contentItemId: string, expectedVersionId?: string) {
   assertCanWrite(context);
   const item = await getScopedItem(context, contentItemId);
@@ -256,15 +270,17 @@ export async function submitForReview(context: RequestContext, contentItemId: st
     await tx.$queryRaw`SELECT "id" FROM "ContentItem" WHERE "id" = ${item.id} FOR UPDATE`;
     const liveItem = await tx.contentItem.findUniqueOrThrow({ where: { id: item.id } });
     if (liveItem.status === ContentStatus.RUNNING) throw new AppError("发布已经开始，必须等待结果或执行远端对账。", 409, "PUBLISH_IN_PROGRESS");
+    await assertNoUnresolvedManualPublish(tx, context.clientId, liveItem.currentVersionId);
     if (liveItem.currentVersionId !== item.currentVersionId || (expectedVersionId && liveItem.currentVersionId !== expectedVersionId)) throw new AppError("内容已被其他操作更新，请刷新后重试。", 409, "VERSION_CONFLICT");
     await tx.publishJob.updateMany({
       where: {
         clientId: context.clientId,
         contentVersionId: item.currentVersionId!,
-        status: { in: [PublishJobStatus.PENDING, PublishJobStatus.RETRY, PublishJobStatus.WAITING_CONFIGURATION] },
+        status: { in: MUTABLE_SCHEDULED_JOB_STATUSES },
       },
       data: { status: PublishJobStatus.CANCELLED, lastErrorCode: "APPROVAL_REOPENED" },
     });
+    await cancelManualTasksForVersion(tx, context.clientId, item.currentVersionId!);
     const updated = await tx.contentItem.update({ where: { id: item.id }, data: { status: ContentStatus.REVIEW_PENDING, scheduledAt: null } });
     await tx.auditLog.create({
       data: { clientId: context.clientId, userId: context.userId, action: "CONTENT_SUBMITTED_FOR_REVIEW", entityType: "ContentItem", entityId: item.id },
@@ -288,11 +304,14 @@ export async function editContentVersion(
     generator?: string;
     generationLabel?: string;
     sourceFacts?: Prisma.InputJsonValue;
+    promptVersionId?: string | null;
     expectedStrategyId?: string | null;
     expectedClientMode?: ClientMode;
   },
 ) {
   assertCanWrite(context);
+  const aiEdit = input.source === "AI_REWRITE" || input.source === "AI_REGENERATE";
+  if (aiEdit && !input.promptVersionId) throw new AppError("AI 内容版本必须记录实际使用的 PromptVersion。", 409, "PROMPT_VERSION_REQUIRED");
   const item = await getScopedItem(context, contentItemId);
   if (!item.currentVersion) throw new AppError("内容版本缺失。", 409, "VERSION_MISSING");
   const accountId = input.accountId || item.accountId;
@@ -308,7 +327,12 @@ export async function editContentVersion(
     await tx.$queryRaw`SELECT "id" FROM "ContentItem" WHERE "id" = ${item.id} FOR UPDATE`;
     const liveItem = await tx.contentItem.findUniqueOrThrow({ where: { id: item.id } });
     if (liveItem.status === ContentStatus.RUNNING) throw new AppError("发布已经开始，不能编辑；请等待结果或执行远端对账。", 409, "PUBLISH_IN_PROGRESS");
+    await assertNoUnresolvedManualPublish(tx, context.clientId, liveItem.currentVersionId);
     if (liveItem.currentVersionId !== item.currentVersionId) throw new AppError("内容已被其他操作更新，请刷新后重试。", 409, "STALE_OPERATION");
+    if (aiEdit) {
+      const usedPrompt = await tx.promptVersion.findFirst({ where: { id: input.promptVersionId!, clientId: context.clientId } });
+      if (!usedPrompt) throw new AppError("使用的 PromptVersion 不属于当前客户。", 409, "PROMPT_VERSION_INVALID");
+    }
     if (input.expectedStrategyId !== undefined) {
       await tx.$queryRaw`SELECT "id" FROM "Client" WHERE "id" = ${context.clientId} FOR UPDATE`;
       const livePlan = await tx.contentPlan.findUniqueOrThrow({ where: { id: item.planId }, select: { socialStrategyId: true } });
@@ -332,7 +356,7 @@ export async function editContentVersion(
         title: input.title === undefined ? item.currentVersion!.title : input.title,
         text: input.text,
         productDataVersion: item.currentVersion!.productDataVersion,
-        promptVersionId: item.currentVersion!.promptVersionId,
+        promptVersionId: input.promptVersionId === undefined ? item.currentVersion!.promptVersionId : input.promptVersionId,
         generator: input.generator || "operator-edit",
         simulated: item.currentVersion!.simulated,
         generationLabel: input.generationLabel || "人工编辑版本",
@@ -348,10 +372,11 @@ export async function editContentVersion(
       where: {
         clientId: context.clientId,
         contentVersionId: item.currentVersion!.id,
-        status: { in: [PublishJobStatus.PENDING, PublishJobStatus.RETRY, PublishJobStatus.WAITING_CONFIGURATION] },
+        status: { in: MUTABLE_SCHEDULED_JOB_STATUSES },
       },
       data: { status: PublishJobStatus.CANCELLED, lastErrorCode: "SUPERSEDED_VERSION" },
     });
+    await cancelManualTasksForVersion(tx, context.clientId, item.currentVersion!.id);
     await tx.contentItem.update({
       where: { id: item.id },
       data: { currentVersionId: version.id, accountId, platform: account.platform, status: ContentStatus.DRAFT, scheduledAt: null },
@@ -403,10 +428,11 @@ export async function reviewContent(
       where: {
         clientId: context.clientId,
         contentVersionId: item.currentVersion!.id,
-        status: { in: [PublishJobStatus.PENDING, PublishJobStatus.RETRY, PublishJobStatus.WAITING_CONFIGURATION] },
+        status: { in: MUTABLE_SCHEDULED_JOB_STATUSES },
       },
       data: { status: PublishJobStatus.CANCELLED, lastErrorCode: decision === ApprovalDecision.APPROVED ? "RESCHEDULE_REQUIRED" : "APPROVAL_REVOKED" },
     });
+    await cancelManualTasksForVersion(tx, context.clientId, item.currentVersion!.id);
     await tx.contentItem.update({
       where: { id: item.id },
       data: { status: decision === ApprovalDecision.APPROVED ? ContentStatus.APPROVED : ContentStatus.CHANGES_REQUESTED, scheduledAt: null },
@@ -432,7 +458,6 @@ export type SchedulePublicationInput = Date | {
 };
 
 const conflictItemStatuses: ContentStatus[] = [ContentStatus.SCHEDULED];
-const conflictJobStatuses: PublishJobStatus[] = [PublishJobStatus.PENDING, PublishJobStatus.RETRY, PublishJobStatus.WAITING_CONFIGURATION, PublishJobStatus.RUNNING];
 
 class PublicationGateError extends AppError {
   constructor(
@@ -493,7 +518,7 @@ export async function findScheduleConflictsInTransaction(
       ...(excludedIds.length ? { id: { notIn: excludedIds } } : {}),
       OR: [
         { status: { in: conflictItemStatuses }, scheduledAt: { gte: from, lte: to } },
-        { currentVersion: { publishJobs: { some: { clientId: input.clientId, status: { in: conflictJobStatuses }, nextAttemptAt: { gte: from, lte: to } } } } },
+        { currentVersion: { publishJobs: { some: { clientId: input.clientId, status: { in: CONFLICT_JOB_STATUSES }, nextAttemptAt: { gte: from, lte: to } } } } },
       ],
     },
     select: { id: true, status: true, scheduledAt: true, accountId: true, platform: true },
@@ -546,9 +571,15 @@ export async function validatePublicationInTransaction(
     } },
   });
   const isDemo = client.mode === ClientMode.DEMO;
+  const manualPublish = client.mode === ClientMode.LIVE && (existing
+    ? existing.adapter === "manual"
+    : resolveAccountPublishingMode(item.account) === "MANUAL");
+  if (manualPublish && !item.account.isSelected) {
+    throw new AppError("人工管理账号尚未选中。", 409, "MANUAL_ACCOUNT_NOT_SELECTED");
+  }
   const platformConnection = item.account.platformConnection;
   const registration = getPlatformRegistry().getByPlatform(item.platform);
-  const liveTarget = client.mode === ClientMode.LIVE
+  const liveTarget = client.mode === ClientMode.LIVE && !manualPublish
     ? resolveLivePublishingTarget({
         platform: item.platform,
         accountType: item.account.accountType,
@@ -572,7 +603,7 @@ export async function validatePublicationInTransaction(
           : null,
       })
     : null;
-  if (!registration || (!isDemo && !liveTarget)) {
+  if (!registration || (!isDemo && !manualPublish && !liveTarget)) {
     throw new PublicationGateError(
       "正式模式只允许已验证且已选择的社媒账号进入真实发布队列。",
       "LIVE_CONNECTION_REQUIRED",
@@ -581,6 +612,14 @@ export async function validatePublicationInTransaction(
       "在平台连接页完成 OAuth、账号选择和发布能力验证。",
     );
   }
+  if (manualPublish) {
+    const media = registration.definition.media;
+    const links = item.currentVersion.assetLinks;
+    if (links.length < media.minItems || links.length > media.maxItems
+      || links.some((link) => !media.kinds.includes(link.asset.kind as "IMAGE" | "VIDEO"))) {
+      throw new AppError("人工发布内容的素材数量或类型不符合目标平台要求。", 409, "MANUAL_MEDIA_REQUIRED");
+    }
+  }
   return {
     item,
     currentVersionId,
@@ -588,7 +627,8 @@ export async function validatePublicationInTransaction(
     scheduledAt,
     existing,
     provider: registration.definition.provider,
-    adapterName: isDemo ? "mock-social" : liveTarget!.adapterName,
+    adapterName: manualPublish ? "manual" : isDemo ? "mock-social" : liveTarget!.adapterName,
+    manualPublish,
     isDemo,
   };
 }
@@ -600,8 +640,8 @@ export async function schedulePublicationInTransaction(
   scheduleInput?: SchedulePublicationInput,
 ) {
   const validated = await validatePublicationInTransaction(tx, context, contentItemId, scheduleInput);
-  const { item, currentVersionId, scheduledAt, existing, provider, adapterName, isDemo } = validated;
-  const status = PublishJobStatus.PENDING;
+  const { item, currentVersionId, scheduledAt, existing, provider, adapterName, isDemo, manualPublish } = validated;
+  const status = manualPublish ? PublishJobStatus.MANUAL_PENDING : PublishJobStatus.PENDING;
   if (existing) {
     if (existing.status === PublishJobStatus.CANCELLED && existing.attemptCount === 0) {
       const conflict = await findScheduleConflictsInTransaction(tx, {
@@ -619,6 +659,7 @@ export async function schedulePublicationInTransaction(
         where: { id: item.id },
         data: { scheduledAt, status: ContentStatus.SCHEDULED },
       });
+      if (manualPublish) await ensureManualPublicationTask(tx, context, item.id, item.accountId, revived.id, currentVersionId, scheduledAt);
       await tx.auditLog.create({
         data: { clientId: context.clientId, userId: context.userId, action: "PUBLICATION_SCHEDULED", entityType: "PublishJob", entityId: revived.id, metadata: { simulated: revived.simulated, scheduledAt: scheduledAt.toISOString(), revived: true } },
       });
@@ -652,10 +693,40 @@ export async function schedulePublicationInTransaction(
     where: { id: item.id },
     data: { scheduledAt, status: ContentStatus.SCHEDULED },
   });
+  if (manualPublish) await ensureManualPublicationTask(tx, context, item.id, item.accountId, job.id, currentVersionId, scheduledAt);
   await tx.auditLog.create({
     data: { clientId: context.clientId, userId: context.userId, action: "PUBLICATION_SCHEDULED", entityType: "PublishJob", entityId: job.id, metadata: { simulated: job.simulated, scheduledAt: scheduledAt.toISOString() } },
   });
   return { job, scheduledAt, changed: true };
+}
+
+async function ensureManualPublicationTask(
+  tx: Prisma.TransactionClient,
+  context: RequestContext,
+  contentItemId: string,
+  accountId: string,
+  publishJobId: string,
+  contentVersionId: string,
+  scheduledAt: Date,
+) {
+  const open = await tx.manualTask.findFirst({
+    where: { clientId: context.clientId, publishJobId, status: { in: [...OPEN_MANUAL_TASK_STATUSES] } },
+  });
+  if (open) return open;
+  return tx.manualTask.create({
+    data: {
+      clientId: context.clientId,
+      contentItemId,
+      accountId,
+      publishJobId,
+      triggerReason: "人工平台发布",
+      suggestedDueAt: scheduledAt,
+      sourceMaterial: { kind: "MANUAL_PUBLISH", contentVersionId, accountId },
+      requiredAction: "在目标平台人工发布当前获批版本，并在发布中心记录结果。",
+      completionCriteria: "已确认外部帖子及 URL、时间、证据；无法确认时记录 UNKNOWN。",
+      continuationStep: "在发布中心完成证据记录与人工对账。",
+    },
+  });
 }
 
 export async function persistPublicationGateTask(clientId: string, error: unknown) {

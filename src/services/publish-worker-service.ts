@@ -314,6 +314,7 @@ export async function reconcileUnknownPublish(context: RequestContext, jobId: st
   const input = reconciliationSchema.parse(raw);
   const job = await db.publishJob.findFirst({ where: { id: jobId, clientId: context.clientId }, include: { contentVersion: { select: { contentItemId: true, clientId: true, item: { select: { clientId: true, currentVersionId: true } } } }, account: { select: { clientId: true } } } });
   if (!job) throw new AppError("发布任务不存在或无权访问。", 404, "PUBLISH_JOB_NOT_FOUND");
+  if (job.adapter === "manual") throw new AppError("人工发布结果必须通过人工证据流程对账。", 409, "MANUAL_RECONCILIATION_REQUIRED");
   if (job.contentVersion.clientId !== context.clientId || job.contentVersion.item.clientId !== context.clientId || job.account.clientId !== context.clientId) throw new AppError("发布任务关联实体的客户范围不一致。", 409, "TENANT_SCOPE_MISMATCH");
   if (job.status !== PublishJobStatus.UNKNOWN) throw new AppError("只有结果未知的任务可以人工对账。", 409, "JOB_NOT_UNKNOWN");
   if (input.outcome === "KEEP_UNKNOWN") return job;
