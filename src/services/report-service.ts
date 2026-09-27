@@ -1,6 +1,8 @@
-import { DataAvailability, DataKind } from "@prisma/client";
+import { DataAvailability, DataKind, Prisma } from "@prisma/client";
 import { db } from "../lib/db";
 import { assertCanWrite, type RequestContext } from "../lib/context";
+import { MonthlyReviewFactsV1Schema, type MonthlyReviewFactsV1 } from "../lib/monthly-review-contract";
+import { buildMonthlyReviewFactsV1 } from "./monthly-review-service";
 
 export async function createMockMetricSnapshots(context: RequestContext) {
   assertCanWrite(context);
@@ -97,4 +99,83 @@ export async function generateOperationReport(context: RequestContext, start?: D
       simulated,
     },
   });
+}
+
+/** Immutable monthly report. All fact reads and the insert share one database snapshot. */
+export async function generateMonthlyOperationReport(context: RequestContext, month: string, asOf = new Date()) {
+  assertCanWrite(context);
+  return db.$transaction(async (tx) => {
+    const client = await tx.client.findUniqueOrThrow({
+      where: { id: context.clientId },
+      select: { id: true, timezone: true, targetMarkets: true },
+    });
+    const facts = MonthlyReviewFactsV1Schema.parse(await buildMonthlyReviewFactsV1(tx, client, month, asOf));
+    const report = await tx.operationReport.create({
+      data: {
+        clientId: context.clientId,
+        periodStart: new Date(facts.period.startUtc),
+        periodEnd: new Date(facts.period.endUtc),
+        facts: facts as Prisma.InputJsonValue,
+        dataLimitations: facts.limitations,
+        hypotheses: [],
+        recommendations: deriveMonthlyReviewNextActions(facts),
+        simulated: containsSimulatedMonthlyData(facts),
+      },
+    });
+    await tx.auditLog.create({
+      data: {
+        clientId: context.clientId,
+        userId: context.userId,
+        action: "MONTHLY_REVIEW_GENERATED",
+        entityType: "OperationReport",
+        entityId: report.id,
+        metadata: { schemaVersion: "MONTHLY_V1", month: facts.period.month, asOf: facts.period.asOf },
+      },
+    });
+    return report;
+  }, { isolationLevel: Prisma.TransactionIsolationLevel.RepeatableRead });
+}
+
+export function containsSimulatedMonthlyData(facts: MonthlyReviewFactsV1): boolean {
+  return facts.publishing.simulated.total > 0 ||
+    facts.publishing.createdCohort.simulated.total > 0 ||
+    facts.metrics.mockRawSnapshotCount > 0;
+}
+
+/** Operational checks prompted by recorded gaps; these are not performance hypotheses. */
+export function deriveMonthlyReviewNextActions(facts: MonthlyReviewFactsV1): string[] {
+  const actions: string[] = [];
+  if (facts.metrics.accountCoverage.missingRealMetricsApiAccountCount > 0) {
+    actions.push("核查当前已选且具备 METRICS 路径的 API 账号的真实指标连接、权限和本月采集覆盖，再决定能否比较表现。");
+  }
+  if (facts.metrics.syncHealth.counts.FAILED > 0) {
+    actions.push("核查当前 API 账号指标同步失败记录；同步失败是采集状态，不代表内容表现。");
+  }
+  if (facts.metrics.syncHealth.counts.SYNCING > 0) {
+    actions.push("等待正在进行的指标同步完成，再核对本月数据覆盖；进行中不视为失败。");
+  }
+  if (facts.publishing.createdCohort.real.statuses.UNKNOWN > 0) {
+    actions.push("到发布中心逐条核对真实 UNKNOWN 任务的外部证据；不把不确定结果当作失败或重新发布依据。");
+  }
+  if (facts.publishing.createdCohort.real.statuses.WAITING_CONFIGURATION > 0) {
+    actions.push("核查真实 WAITING_CONFIGURATION 任务的连接和权限要求，再按现有发布流程处理。");
+  }
+  if (facts.interactions.lateImportedForMonth > 0) {
+    actions.push("核对较晚导入互动的发生时间与导入时间，并记录采集延迟对本月覆盖的影响。");
+  }
+  if (facts.leads.recordsCreatedInMonth > 0 && facts.leads.handoffStatusesAsOf.WAITING_FEEDBACK > 0) {
+    actions.push("向客户跟进本月创建且仍在等待反馈的 Lead 记录，补全人工核实结论。");
+  }
+  if (actions.length === 0) actions.push("核查本月数据覆盖与客户反馈；若发现可检验的问题，再提出下月假设。");
+  return actions;
+}
+
+export function classifyOperationReportFacts(raw: unknown):
+  | { kind: "MONTHLY_V1"; facts: MonthlyReviewFactsV1 }
+  | { kind: "LEGACY" | "UNSUPPORTED" } {
+  const record = raw && typeof raw === "object" && !Array.isArray(raw) ? raw as Record<string, unknown> : null;
+  if (record?.schemaVersion === undefined) return { kind: "LEGACY" };
+  if (record.schemaVersion !== "MONTHLY_V1") return { kind: "UNSUPPORTED" };
+  const parsed = MonthlyReviewFactsV1Schema.safeParse(raw);
+  return parsed.success ? { kind: "MONTHLY_V1", facts: parsed.data } : { kind: "UNSUPPORTED" };
 }

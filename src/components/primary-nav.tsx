@@ -5,6 +5,10 @@ import { usePathname } from "next/navigation";
 
 const NAV_GROUPS = [
   { label: "工作台", items: [{ href: "/", label: "总览", icon: "overview" }] },
+  { label: "客户运营", items: [
+    { href: "/readiness", label: "运营准备度", icon: "overview" },
+    { href: "/reviews/monthly", label: "月度复盘", icon: "analytics" },
+  ] },
   { label: "运营", items: [
     { href: "/content", label: "内容中心", icon: "content" },
     { href: "/strategy", label: "运营策略", icon: "brand" },
