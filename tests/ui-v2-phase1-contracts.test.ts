@@ -38,6 +38,17 @@ describe("UI V2 Phase 1 route contracts", () => {
     expect(source("../src/app/connections/page.tsx")).toContain('title="连接与授权"');
   });
 
+  it("opens manual content creation from a manual account without changing the AI create link", () => {
+    const operations = source("../src/services/account-operations-view.ts");
+    const content = source("../src/app/content/page.tsx");
+    expect(operations).toContain('nextHref: "/content?manual=1#manual-content"');
+    expect(operations).not.toContain('nextHref: "/content?create=1#new-content"');
+    expect(content).toContain('const manualCreateRequested = first(params.manual) === "1"');
+    expect(content).toContain('id="manual-content" open={manualCreateRequested}');
+    expect(content).toContain('id="new-content" open={createRequested || total === 0}');
+    expect(content).toContain('href="/content?create=1#new-content"');
+  });
+
   it("keeps canonical navigation grouped and the alias active", () => {
     const nav = source("../src/components/primary-nav.tsx");
     for (const label of ["工作台", "运营", "资产", "互动与分析", "系统"]) {

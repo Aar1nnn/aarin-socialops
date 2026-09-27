@@ -6,7 +6,7 @@ import { formatDateTime, platformLabel } from "@/lib/presentation/status";
 import { contentLanes, listContentOperations } from "@/services/content-operations-view";
 import { resolveAccountPublishingMode } from "@/lib/manual-account";
 
-type Params = { q?: string | string[]; status?: string | string[]; platform?: string | string[]; accountId?: string | string[]; productId?: string | string[]; create?: string | string[] };
+type Params = { q?: string | string[]; status?: string | string[]; platform?: string | string[]; accountId?: string | string[]; productId?: string | string[]; create?: string | string[]; manual?: string | string[] };
 const first = (value: string | string[] | undefined) => Array.isArray(value) ? value[0] : value;
 const preview = (value: string) => value.replace(/\s+/g, " ").trim().slice(0, 135);
 
@@ -22,6 +22,7 @@ export default async function ContentPage({ searchParams }: { searchParams: Prom
   const aiAccounts = accounts.filter((account) => account.platform !== "youtube");
   const assets = manualAccounts.length ? await db.asset.findMany({ where: { clientId: context.clientId }, orderBy: { createdAt: "desc" }, take: 100, select: { id: true, originalName: true, kind: true } }) : [];
   const createRequested = first(params.create) === "1";
+  const manualCreateRequested = first(params.manual) === "1";
   const searchUrl = (status: string) => {
     const query = new URLSearchParams();
     for (const [key, value] of Object.entries({ ...filters, status })) if (value && value !== "all") query.set(key, value);
@@ -48,7 +49,7 @@ export default async function ContentPage({ searchParams }: { searchParams: Prom
             <div><Button type="submit" disabled={eligibleProducts.length === 0 || aiAccounts.length === 0 || strategyRequired}>生成草稿</Button></div>
           </form>
         </details> : null}
-        {!readOnly ? <details className="disclosure" id="manual-content">
+        {!readOnly ? <details className="disclosure" id="manual-content" open={manualCreateRequested}>
           <summary>人工创建内容</summary>
           <form action="/api/content/manual" method="post" className="disclosure-body form-stack form-width">
             <p className="field-helper">为人工管理账号创建正式内容版本；仍须提交并获得有效人工批准。此操作不调用 AI，缺少 SocialStrategy 不会阻止人工创建。</p>

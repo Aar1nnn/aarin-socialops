@@ -10,10 +10,16 @@ import { safeErrorMessage, TokenVault, type EncryptedSecret } from "../lib/token
 import { getPlatformRegistry } from "./platform-registry-service";
 
 const OAUTH_STATE_TTL_MS = 10 * 60 * 1000;
-const ACTIVE_API_JOB_STATUSES: PublishJobStatus[] = [
+const DESTRUCTIVE_CHANGE_BLOCKED_API_JOB_STATUSES: PublishJobStatus[] = [
   PublishJobStatus.PENDING,
   PublishJobStatus.RETRY,
   PublishJobStatus.WAITING_CONFIGURATION,
+  PublishJobStatus.RUNNING,
+  PublishJobStatus.UNKNOWN,
+];
+const REAUTHORIZATION_BLOCKED_API_JOB_STATUSES: PublishJobStatus[] = [
+  PublishJobStatus.PENDING,
+  PublishJobStatus.RETRY,
   PublishJobStatus.RUNNING,
   PublishJobStatus.UNKNOWN,
 ];
@@ -47,7 +53,12 @@ async function lockAccountIds(tx: Prisma.TransactionClient, clientId: string, id
   `;
 }
 
-async function assertNoActiveApiJobs(tx: Prisma.TransactionClient, clientId: string, accountIds: string[]) {
+async function assertNoActiveApiJobs(
+  tx: Prisma.TransactionClient,
+  clientId: string,
+  accountIds: string[],
+  statuses = DESTRUCTIVE_CHANGE_BLOCKED_API_JOB_STATUSES,
+) {
   if (!accountIds.length) return;
   const blocked = await tx.publishJob.findFirst({
     where: {
@@ -56,7 +67,7 @@ async function assertNoActiveApiJobs(tx: Prisma.TransactionClient, clientId: str
       adapter: { not: "manual" },
       environment: "LIVE",
       simulated: false,
-      status: { in: ACTIVE_API_JOB_STATUSES },
+      status: { in: statuses },
     },
     select: { status: true },
   });
@@ -157,13 +168,57 @@ export async function completePlatformConnection(
             ...discovery.accounts.map((account) => ({ platform: account.platform, externalAccountId: account.externalAccountId })),
           ],
         },
-        select: { id: true },
+        select: {
+          id: true, platform: true, externalAccountId: true, isSelected: true,
+          publishCapability: true, metricsCapability: true, commentsCapability: true,
+        },
       });
       await lockAccountIds(tx, context.clientId, affectedAccounts.map((account) => account.id));
-      await assertNoActiveApiJobs(tx, context.clientId, affectedAccounts.map((account) => account.id));
+      await assertNoActiveApiJobs(tx, context.clientId, affectedAccounts.map((account) => account.id), REAUTHORIZATION_BLOCKED_API_JOB_STATUSES);
+      const waitingJobs = await tx.publishJob.findMany({
+        where: {
+          clientId: context.clientId,
+          accountId: { in: affectedAccounts.map((account) => account.id) },
+          adapter: { not: "manual" }, environment: "LIVE", simulated: false,
+          status: PublishJobStatus.WAITING_CONFIGURATION,
+        },
+        select: { accountId: true },
+      });
+      const waitingAccountIds = new Set(waitingJobs.map((job) => job.accountId));
       const missingScopes = REQUIRED_META_CONNECTION_SCOPES.filter(
         (scope) => !discovery.grantedScopes.includes(scope),
       );
+      const accountIdentity = (platform: string, externalAccountId: string) => `${platform}\u0000${externalAccountId}`;
+      const discoveredByIdentity = new Map(discovery.accounts.map((account) => [
+        accountIdentity(account.platform, account.externalAccountId), account,
+      ]));
+      const existingByIdentity = new Map(affectedAccounts.filter((account) => account.externalAccountId).map((account) => [
+        accountIdentity(account.platform, account.externalAccountId!), account,
+      ]));
+      const restoredWaitingCapabilities = new Map<string, ReturnType<typeof selectedCapabilityData>>();
+      // Reauthorization may repair a waiting job, but it must not erase or
+      // downgrade the account to which that job is already bound.
+      for (const account of affectedAccounts.filter((entry) => waitingAccountIds.has(entry.id))) {
+        const discovered = account.externalAccountId
+          ? discoveredByIdentity.get(accountIdentity(account.platform, account.externalAccountId)) : undefined;
+        if (!discovered || missingScopes.length || !discovered.accessToken) {
+          throw new AppError("重新授权未能恢复等待中的发布账号及必要权限；请先核对 Meta 账号和授权，现有任务保持不变。", 409, "ACCOUNT_ACTIVE_PUBLISH_JOBS");
+        }
+        const restored = selectedCapabilityData(provider, {
+          platform: discovered.platform,
+          providerCapabilities: discovered.capabilities as Prisma.JsonValue,
+        });
+        if ([
+          [account.publishCapability, restored.publishCapability],
+          [account.metricsCapability, restored.metricsCapability],
+          [account.commentsCapability, restored.commentsCapability],
+        ].some(([current, next]) =>
+          (current === CapabilityStatus.VERIFIED && next !== CapabilityStatus.VERIFIED)
+          || (current !== CapabilityStatus.UNSUPPORTED && next === CapabilityStatus.UNSUPPORTED))) {
+          throw new AppError("重新授权会降低等待中账号的能力；请先核对 Meta 权限，现有任务保持不变。", 409, "ACCOUNT_ACTIVE_PUBLISH_JOBS");
+        }
+        restoredWaitingCapabilities.set(account.id, restored);
+      }
       const connectionData = {
         externalPrincipalId: discovery.externalPrincipalId,
         ...connectionTokenData(accessSecret, refreshSecret),
@@ -230,6 +285,9 @@ export async function completePlatformConnection(
 
       for (const account of discovery.accounts) {
         const accountSecret = vault.encrypt(account.accessToken);
+        const existingAccount = existingByIdentity.get(accountIdentity(account.platform, account.externalAccountId));
+        const waitingAccount = existingAccount && waitingAccountIds.has(existingAccount.id) ? existingAccount : null;
+        const restored = waitingAccount?.isSelected ? restoredWaitingCapabilities.get(waitingAccount.id) : null;
         await tx.socialAccount.upsert({
           where: {
             clientId_platform_externalAccountId: {
@@ -263,14 +321,18 @@ export async function completePlatformConnection(
             username: account.username,
             metadata: account.metadata as Prisma.InputJsonValue,
             providerCapabilities: account.capabilities as Prisma.InputJsonValue,
-            isSelected: false,
+            isSelected: waitingAccount?.isSelected ?? false,
             ...accountTokenData(accountSecret, account.accessTokenExpiresAt || tokenSet.accessTokenExpiresAt),
-            publishCapability: CapabilityStatus.UNVERIFIED,
-            metricsCapability: CapabilityStatus.UNVERIFIED,
-            commentsCapability: CapabilityStatus.UNVERIFIED,
-            messagesCapability: CapabilityStatus.UNSUPPORTED,
-            groupsCapability: CapabilityStatus.UNSUPPORTED,
-            verifiedAt: null,
+            ...(waitingAccount
+              ? restored ?? {}
+              : {
+                publishCapability: CapabilityStatus.UNVERIFIED,
+                metricsCapability: CapabilityStatus.UNVERIFIED,
+                commentsCapability: CapabilityStatus.UNVERIFIED,
+                messagesCapability: CapabilityStatus.UNSUPPORTED,
+                groupsCapability: CapabilityStatus.UNSUPPORTED,
+                verifiedAt: null,
+              }),
           },
         });
       }

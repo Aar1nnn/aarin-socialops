@@ -62,7 +62,7 @@ export async function listAccountOperations(context: RequestContext): Promise<Ac
       health: "MANUAL" as const,
       issue: "发布需由运营人员在外部平台执行并回填结果；平台 API 能力未接通。",
       nextAction: "创建人工内容",
-      nextHref: "/content?create=1#new-content",
+      nextHref: "/content?manual=1#manual-content",
     };
     if (!account.isSelected) return {
       ...base,

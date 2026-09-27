@@ -2,9 +2,11 @@ import { randomUUID } from "node:crypto";
 import { afterAll, afterEach, beforeEach, describe, expect, it } from "vitest";
 import type { RequestContext } from "../src/lib/context";
 import type { PlatformAuthAdapter } from "../src/lib/adapters/platform-auth";
+import { REQUIRED_META_CONNECTION_SCOPES } from "../src/lib/adapters/meta-auth";
 import { db } from "../src/lib/db";
 import { TokenVault } from "../src/lib/token-vault";
 import { listAccountOperations } from "../src/services/account-operations-view";
+import { claimPublishJob } from "../src/services/publish-worker-service";
 import {
   completePlatformConnection,
   disconnectPlatformConnection,
@@ -93,7 +95,7 @@ describe("account operations", () => {
     expect((concurrent.find((result) => result.status === "rejected") as PromiseRejectedResult).reason).toMatchObject({ code: "ACCOUNT_SELECTION_CONFLICT" });
   });
 
-  it("protects every active API status before selection, reconnect, local clear or remote revoke", async () => {
+  it("protects every active API status before selection, local clear or remote revoke, and blocks unsafe reconnect", async () => {
     const input = await fixture();
     const job = await makeJob(input);
     let revokeCalls = 0;
@@ -118,17 +120,123 @@ describe("account operations", () => {
     const priorRedirect = process.env.META_REDIRECT_URI;
     process.env.META_REDIRECT_URI = "https://app.example.test/api/connections/meta/callback";
     try {
-      const start = await startPlatformConnection(input.context, "META", "/connections", adapter);
-      const state = new URL(start.authorizationUrl).searchParams.get("state")!;
-      await expect(completePlatformConnection(input.context, "META", { code: "reconnect", state }, { adapter, vault: input.vault })).rejects.toMatchObject({ code: "ACCOUNT_ACTIVE_PUBLISH_JOBS", status: 409 });
-      expect(revokeCalls).toBe(0);
-      expect((await db.socialAccount.findUniqueOrThrow({ where: { id: input.selected.id } })).isSelected).toBe(true);
+      for (const status of ["PENDING", "RETRY", "RUNNING", "UNKNOWN"] as const) {
+        await db.publishJob.update({ where: { id: job.id }, data: { status } });
+        const start = await startPlatformConnection(input.context, "META", "/connections", adapter);
+        const state = new URL(start.authorizationUrl).searchParams.get("state")!;
+        await expect(completePlatformConnection(input.context, "META", { code: "reconnect", state }, { adapter, vault: input.vault })).rejects.toMatchObject({ code: "ACCOUNT_ACTIVE_PUBLISH_JOBS", status: 409 });
+        expect(revokeCalls).toBe(0);
+        expect(await db.platformConnection.findUniqueOrThrow({ where: { id: input.connection.id } })).toMatchObject({ accessTokenCiphertext: input.secret.ciphertext });
+        expect((await db.socialAccount.findUniqueOrThrow({ where: { id: input.selected.id } })).isSelected).toBe(true);
+      }
     } finally {
       if (priorRedirect === undefined) delete process.env.META_REDIRECT_URI;
       else process.env.META_REDIRECT_URI = priorRedirect;
     }
     await db.publishJob.update({ where: { id: job.id }, data: { status: "PUBLISHED" } });
     await expect(selectPlatformAccounts(input.context, input.connection.id, [input.other.id], [input.selected.id])).resolves.toMatchObject({ id: input.connection.id });
+  });
+
+  it("restores a WAITING_CONFIGURATION account through reauthorization without dispatching its job", async () => {
+    const input = await fixture();
+    await db.client.update({ where: { id: input.client.id }, data: { mode: "LIVE" } });
+    const job = await makeJob(input);
+    await db.publishJob.update({ where: { id: job.id }, data: { status: "WAITING_CONFIGURATION" } });
+    await db.platformConnection.update({ where: { id: input.connection.id }, data: {
+      status: "PERMISSION_MISSING", accessTokenCiphertext: null, accessTokenIv: null, accessTokenAuthTag: null,
+      lastErrorCode: "PERMISSION_MISSING",
+    } });
+    await db.socialAccount.update({ where: { id: input.selected.id }, data: {
+      accessTokenCiphertext: null, accessTokenIv: null, accessTokenAuthTag: null,
+      publishCapability: "UNVERIFIED", verifiedAt: null,
+    } });
+    const adapter: PlatformAuthAdapter = {
+      provider: "META",
+      buildAuthorizationUrl(request) { return new URL(`https://www.facebook.com/dialog/oauth?state=${request.state}`); },
+      async exchangeCode() { return { accessToken: "restored-user-token", scopes: [...REQUIRED_META_CONNECTION_SCOPES] }; },
+      async discoverAccounts() { return {
+        externalPrincipalId: input.connection.externalPrincipalId!,
+        grantedScopes: [...REQUIRED_META_CONNECTION_SCOPES],
+        accounts: [{
+          externalAccountId: input.selected.externalAccountId!, platform: "facebook", accountType: "FACEBOOK_PAGE",
+          displayName: "Selected Page", accessToken: "restored-page-token",
+          capabilities: { canPublish: true }, metadata: {},
+        }],
+      }; },
+    };
+    const priorRedirect = process.env.META_REDIRECT_URI;
+    process.env.META_REDIRECT_URI = "https://app.example.test/api/connections/meta/callback";
+    try {
+      const start = await startPlatformConnection(input.context, "META", "/connections", adapter);
+      const state = new URL(start.authorizationUrl).searchParams.get("state")!;
+      await expect(completePlatformConnection(input.context, "META", { code: "reconnect", state }, { adapter, vault: input.vault })).resolves.toEqual({
+        connectionId: input.connection.id, returnTo: "/connections",
+      });
+    } finally {
+      if (priorRedirect === undefined) delete process.env.META_REDIRECT_URI;
+      else process.env.META_REDIRECT_URI = priorRedirect;
+    }
+    const connection = await db.platformConnection.findUniqueOrThrow({ where: { id: input.connection.id } });
+    const account = await db.socialAccount.findUniqueOrThrow({ where: { id: input.selected.id } });
+    expect(connection).toMatchObject({ status: "CONNECTED", lastErrorCode: null });
+    expect(input.vault.decrypt({
+      ciphertext: connection.accessTokenCiphertext!, iv: connection.accessTokenIv!,
+      authTag: connection.accessTokenAuthTag!, keyVersion: connection.tokenKeyVersion,
+    })).toBe("restored-user-token");
+    expect(account).toMatchObject({ isSelected: true, publishCapability: "VERIFIED" });
+    expect(input.vault.decrypt({
+      ciphertext: account.accessTokenCiphertext!, iv: account.accessTokenIv!,
+      authTag: account.accessTokenAuthTag!, keyVersion: connection.tokenKeyVersion,
+    })).toBe("restored-page-token");
+    expect(await claimPublishJob(job.id, "reauth-must-not-dispatch")).toBeNull();
+    expect(await db.publishJob.findUniqueOrThrow({ where: { id: job.id } })).toMatchObject({
+      status: "WAITING_CONFIGURATION", attemptCount: 0, lockedAt: null, lockedBy: null,
+    });
+    expect(await db.publishAttempt.count({ where: { publishJobId: job.id } })).toBe(0);
+  });
+
+  it("rejects WAITING_CONFIGURATION reauthorization when the account is absent or publishing permission is downgraded", async () => {
+    const input = await fixture();
+    const job = await makeJob(input);
+    await db.publishJob.update({ where: { id: job.id }, data: { status: "WAITING_CONFIGURATION" } });
+    const priorRedirect = process.env.META_REDIRECT_URI;
+    process.env.META_REDIRECT_URI = "https://app.example.test/api/connections/meta/callback";
+    try {
+      for (const scenario of ["missing-account", "downgraded-capability"] as const) {
+        const adapter: PlatformAuthAdapter = {
+          provider: "META",
+          buildAuthorizationUrl(request) { return new URL(`https://www.facebook.com/dialog/oauth?state=${request.state}`); },
+          async exchangeCode() { return { accessToken: "unsafe-user-token", scopes: [...REQUIRED_META_CONNECTION_SCOPES] }; },
+          async discoverAccounts() { return {
+            externalPrincipalId: input.connection.externalPrincipalId!,
+            grantedScopes: [...REQUIRED_META_CONNECTION_SCOPES],
+            accounts: scenario === "missing-account" ? [] : [{
+              externalAccountId: input.selected.externalAccountId!, platform: "facebook", accountType: "FACEBOOK_PAGE",
+              displayName: "Selected Page", accessToken: "unsafe-page-token",
+              capabilities: { canPublish: false }, metadata: {},
+            }],
+          }; },
+        };
+        const start = await startPlatformConnection(input.context, "META", "/connections", adapter);
+        const state = new URL(start.authorizationUrl).searchParams.get("state")!;
+        await expect(completePlatformConnection(input.context, "META", { code: scenario, state }, { adapter, vault: input.vault })).rejects.toMatchObject({
+          code: "ACCOUNT_ACTIVE_PUBLISH_JOBS", status: 409,
+        });
+        expect(await db.platformConnection.findUniqueOrThrow({ where: { id: input.connection.id } })).toMatchObject({
+          status: "CONNECTED", accessTokenCiphertext: input.secret.ciphertext,
+        });
+        expect(await db.socialAccount.findUniqueOrThrow({ where: { id: input.selected.id } })).toMatchObject({
+          isSelected: true, accessTokenCiphertext: input.secret.ciphertext, publishCapability: "VERIFIED",
+        });
+        expect(await db.publishJob.findUniqueOrThrow({ where: { id: job.id } })).toMatchObject({
+          status: "WAITING_CONFIGURATION", lockedAt: null, lockedBy: null,
+        });
+        expect(await db.publishAttempt.count({ where: { publishJobId: job.id } })).toBe(0);
+      }
+    } finally {
+      if (priorRedirect === undefined) delete process.env.META_REDIRECT_URI;
+      else process.env.META_REDIRECT_URI = priorRedirect;
+    }
   });
 
   it("does not treat DEMO/mock-social jobs as real LIVE API dispatches", async () => {
