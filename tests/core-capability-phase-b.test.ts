@@ -1,12 +1,15 @@
 import { randomUUID } from "node:crypto";
 import type { Client, Prisma, SocialAccount } from "@prisma/client";
-import { afterAll, afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { POST as setAssetTagsHttp } from "../src/app/api/assets/[id]/tags/route";
 import type { RequestContext } from "../src/lib/context";
 import { db } from "../src/lib/db";
 import {
   classifyMediaAvailability,
+  attachAssetToProduct,
   detectDuplicateAsset,
   getAssetUsage,
+  listAssetLibraryPage,
   searchAssets,
   setAssetTags,
 } from "../src/services/asset-library-service";
@@ -23,6 +26,8 @@ type Fixture = { client: Client; account: SocialAccount; context: RequestContext
 const clientIds: string[] = [];
 const userIds: string[] = [];
 let fixture: Fixture;
+
+vi.mock("@/lib/auth", () => ({ requireContext: async () => fixture.context }));
 
 async function makeFixture(): Promise<Fixture> {
   const suffix = randomUUID();
@@ -72,7 +77,7 @@ afterAll(async () => { await db.$disconnect(); });
 describe("asset library", () => {
   it("searches and filters tenant assets with scoped tags", async () => {
     const asset = await makeAsset(fixture, "primary", { width: 1200, height: 630 });
-    const tags = await setAssetTags(fixture.context, asset.id, { tags: ["Product", "Launch"] });
+    const tags = await setAssetTags(fixture.context, asset.id, { tags: ["Product", "Launch"], expectedTagIds: [] });
     const results = await searchAssets(fixture.context, { query: "chair", tagIds: [tags[0].id], kind: "IMAGE" });
     expect(results).toHaveLength(1);
     expect(results[0]).toMatchObject({
@@ -83,8 +88,54 @@ describe("asset library", () => {
       externalRead: { ready: false, externalValidation: "NOT_EXTERNALLY_VERIFIED", reason: "LOCAL_STORAGE" },
     });
     const other = await makeFixture();
-    await expect(setAssetTags(other.context, asset.id, { tags: ["Forbidden"] })).rejects.toMatchObject({ code: "ASSET_NOT_FOUND" });
+    await expect(setAssetTags(other.context, asset.id, { tags: ["Forbidden"], expectedTagIds: [] })).rejects.toMatchObject({ code: "ASSET_NOT_FOUND" });
     expect(await searchAssets(other.context, { query: "chair" })).toHaveLength(0);
+  });
+
+  it("compares tag expectations as normalized sets and rejects a stale editor", async () => {
+    const asset = await makeAsset();
+    const first = await setAssetTags(fixture.context, asset.id, { tags: ["Alpha", "Beta"], expectedTagIds: [] });
+    const compatibilityId = first[0].id.replace(/[a-z0-9]/g, (character) => String.fromCharCode(character.charCodeAt(0) + 0xfee0));
+    const second = await setAssetTags(fixture.context, asset.id, {
+      tags: ["Alpha", "Beta", "Gamma"], expectedTagIds: [first[1].id, compatibilityId, first[0].id],
+    });
+    expect(second).toHaveLength(3);
+    await expect(setAssetTags(fixture.context, asset.id, { tags: ["Stale"], expectedTagIds: [first[0].id, first[1].id] })).rejects.toMatchObject({ code: "ASSET_TAG_CONFLICT", status: 409 });
+    expect(await db.assetTagLink.count({ where: { assetId: asset.id, clientId: fixture.client.id } })).toBe(3);
+    await expect(setAssetTags({ ...fixture.context, role: "VIEWER" }, asset.id, { tags: [], expectedTagIds: [] })).rejects.toMatchObject({ code: "FORBIDDEN" });
+  });
+
+  it("returns 400 for missing or invalid tag expectations at service and HTTP boundaries", async () => {
+    const asset = await makeAsset();
+    await expect(setAssetTags(fixture.context, asset.id, { tags: ["Launch"] })).rejects.toMatchObject({ code: "ASSET_TAG_INPUT_INVALID", status: 400 });
+    await expect(setAssetTags(fixture.context, asset.id, { tags: ["Launch"], expectedTagIds: "not-an-array" })).rejects.toMatchObject({ code: "ASSET_TAG_INPUT_INVALID", status: 400 });
+    const request = new Request(`http://localhost/api/assets/${asset.id}/tags`, {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ tags: ["Launch"] }),
+    });
+    const response = await setAssetTagsHttp(request, { params: Promise.resolve({ id: asset.id }) });
+    expect(response.status).toBe(400);
+    expect(await response.json()).toMatchObject({ error: "ASSET_TAG_INPUT_INVALID" });
+    expect(await db.assetTagLink.count({ where: { assetId: asset.id } })).toBe(0);
+    const tags = await setAssetTags(fixture.context, asset.id, { tags: ["Launch"], expectedTagIds: [] });
+    const stale = new Request(`http://localhost/api/assets/${asset.id}/tags`, {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ tags: ["Stale"], expectedTagIds: [] }),
+    });
+    const staleResponse = await setAssetTagsHttp(stale, { params: Promise.resolve({ id: asset.id }) });
+    expect(staleResponse.status).toBe(409);
+    expect(await staleResponse.json()).toMatchObject({ error: "ASSET_TAG_CONFLICT" });
+    expect(tags).toHaveLength(1);
+  });
+
+  it("attaches an existing asset to a same-client product once and audits it", async () => {
+    const asset = await makeAsset();
+    expect(await attachAssetToProduct(fixture.context, asset.id, { productId: fixture.productId })).toMatchObject({ linked: true });
+    expect(await attachAssetToProduct(fixture.context, asset.id, { productId: fixture.productId })).toMatchObject({ linked: false });
+    expect(await db.productAsset.count({ where: { assetId: asset.id } })).toBe(1);
+    expect(await db.auditLog.count({ where: { clientId: fixture.client.id, action: "ASSET_PRODUCT_LINKED", entityId: asset.id } })).toBe(1);
+    const other = await makeFixture();
+    await expect(attachAssetToProduct(fixture.context, asset.id, { productId: other.productId })).rejects.toMatchObject({ code: "PRODUCT_NOT_FOUND" });
+    await expect(attachAssetToProduct(other.context, asset.id, { productId: other.productId })).rejects.toMatchObject({ code: "ASSET_NOT_FOUND" });
+    await expect(attachAssetToProduct({ ...fixture.context, role: "VIEWER" }, asset.id, { productId: fixture.productId })).rejects.toMatchObject({ code: "FORBIDDEN" });
   });
 
   it("detects duplicate fingerprints without deleting the existing asset", async () => {
@@ -103,6 +154,41 @@ describe("asset library", () => {
     expect(usage.linkedProducts).toEqual([{ id: fixture.productId, name: "Test product" }]);
     expect(usage.usageCount).toBe(1);
     expect(usage.platformUsage).toEqual([{ platform: "facebook", count: 1 }]);
+  });
+
+  it("keeps the existing full usage response while the new detail view reads only 20 recent links", async () => {
+    const asset = await makeAsset();
+    const item = await createItem(fixture, false);
+    const versions = Array.from({ length: 21 }, (_, index) => ({
+      id: randomUUID(), clientId: fixture.client.id, contentItemId: item.id, version: index + 2,
+      text: `Historical version ${index + 2}`, generator: "TEST", generationLabel: "test", sourceFacts: {},
+      createdAt: new Date(Date.parse("2026-09-25T00:00:00.000Z") + index * 1000),
+    }));
+    await db.contentVersion.createMany({ data: versions });
+    await db.contentVersionAsset.createMany({ data: versions.map((version) => ({ clientId: fixture.client.id, contentVersionId: version.id, assetId: asset.id })) });
+    const complete = await getAssetUsage(fixture.context, asset.id);
+    expect(complete.linkedContent).toHaveLength(21);
+    expect(complete.recentUsage).toHaveLength(20);
+    expect(complete.usageCount).toBe(21);
+    const detail = await getAssetUsage(fixture.context, asset.id, { recentOnly: true });
+    expect(detail.linkedContent).toHaveLength(20);
+    expect(detail.recentUsage).toHaveLength(20);
+    expect(detail.usageCount).toBe(21);
+  });
+
+  it("does not show mismatched historical relations in asset usage or listing counts", async () => {
+    const asset = await makeAsset();
+    const other = await makeFixture();
+    const otherItem = await createItem(other, false);
+    await db.productAsset.create({ data: { clientId: fixture.client.id, productId: other.productId, assetId: asset.id } });
+    await db.contentVersionAsset.create({ data: { clientId: fixture.client.id, contentVersionId: otherItem.currentVersionId!, assetId: asset.id } });
+    const usage = await getAssetUsage(fixture.context, asset.id);
+    expect(usage.linkedProducts).toEqual([]);
+    expect(usage.usageCount).toBe(0);
+    expect(usage.linkedContent).toEqual([]);
+    const listed = await listAssetLibraryPage(fixture.context, { query: asset.originalName });
+    expect(listed.items[0].productLinks).toEqual([]);
+    expect(listed.items[0]._count.contentLinks).toBe(0);
   });
 
   it("classifies local, private, public, signed and unavailable media", async () => {
@@ -126,6 +212,53 @@ describe("asset library", () => {
       availability: "PUBLIC_HTTPS",
       externalRead: { ready: true, externalValidation: "NOT_EXTERNALLY_VERIFIED", reason: "READY_CANDIDATE" },
     });
+  });
+
+  it("uses the last scanned database row for sparse availability page cursors", async () => {
+    const base = Date.parse("2026-09-25T00:00:00.000Z");
+    const locals = Array.from({ length: 200 }, (_, index) => ({
+      id: randomUUID(), clientId: fixture.client.id, kind: "IMAGE" as const, originalName: `local-${index}.jpg`, mimeType: "image/jpeg",
+      byteSize: 10, storageProvider: "local", storageKey: `sparse/${index}`, checksum: `sparse-${index}`,
+      createdAt: new Date(base - index * 1000),
+    }));
+    await db.asset.createMany({ data: locals });
+    const publicAsset = await makeAsset(fixture, "sparse-public", { publicUrl: "https://cdn.example.test/sparse-public.jpg" });
+    await db.asset.update({ where: { id: publicAsset.id }, data: { createdAt: new Date(base - 201_000) } });
+    const first = await listAssetLibraryPage(fixture.context, { availability: "PUBLIC_HTTPS", limit: 1 });
+    expect(first).toMatchObject({ items: [], scanned: 200, nextCursor: locals[199].id });
+    const second = await listAssetLibraryPage(fixture.context, { availability: "PUBLIC_HTTPS", limit: 1, cursor: first.nextCursor });
+    expect(second.items.map((asset) => asset.id)).toEqual([publicAsset.id]);
+    expect(second.nextCursor).toBeNull();
+  });
+
+  it("orders equal timestamps by id and does not skip a match after a partial batch", async () => {
+    const createdAt = new Date("2026-09-25T00:00:00.000Z");
+    const prefix = `tie-${randomUUID()}`;
+    const [firstId, secondId, thirdId] = [`${prefix}-a`, `${prefix}-b`, `${prefix}-c`];
+    for (const [id, metadata] of [[firstId, {}], [secondId, { publicUrl: "https://cdn.example.test/b.jpg" }], [thirdId, { publicUrl: "https://cdn.example.test/c.jpg" }]] as const) {
+      await db.asset.create({ data: { id, clientId: fixture.client.id, kind: "IMAGE", originalName: `${id}.jpg`, mimeType: "image/jpeg", byteSize: 10,
+        storageProvider: "local", storageKey: `tie/${id}`, checksum: id, metadata, createdAt } });
+    }
+    const first = await listAssetLibraryPage(fixture.context, { availability: "PUBLIC_HTTPS", limit: 1 });
+    expect(first.items.map((asset) => asset.id)).toEqual([secondId]);
+    expect(first.nextCursor).toBe(secondId);
+    const second = await listAssetLibraryPage(fixture.context, { availability: "PUBLIC_HTTPS", limit: 1, cursor: first.nextCursor });
+    expect(second.items.map((asset) => asset.id)).toEqual([thirdId]);
+    expect(second.nextCursor).toBeNull();
+  });
+
+  it("projects inspected video media and omits signed URLs from presentations", async () => {
+    const asset = await makeAsset(fixture, "inspection", {
+      inspection: { width: 1920, height: 1080, durationSeconds: 42, signedUrl: "https://signed.example.test/nested?token=secret" },
+      signedUrl: "https://signed.example.test/private?token=secret", nested: { token: "nested-secret" },
+    });
+    const listed = await searchAssets(fixture.context, { query: "inspection" });
+    expect(listed[0]).toMatchObject({ id: asset.id, width: 1920, height: 1080, duration: 42 });
+    expect(listed[0].availability).toBe("SIGNED_HTTPS");
+    expect(JSON.stringify(listed[0])).not.toContain("signed.example.test");
+    expect(JSON.stringify(listed[0])).not.toContain("nested-secret");
+    expect(JSON.stringify((await getAssetUsage(fixture.context, asset.id)).asset)).not.toContain("signed.example.test");
+    expect(JSON.stringify((await detectDuplicateAsset(fixture.context, asset.checksum)).asset)).not.toContain("signed.example.test");
   });
 });
 

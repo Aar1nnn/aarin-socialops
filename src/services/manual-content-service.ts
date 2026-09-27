@@ -25,7 +25,7 @@ export async function createManualContent(context: RequestContext, raw: unknown)
     const [client, account, product, assets, strategy] = await Promise.all([
       tx.client.findUniqueOrThrow({ where: { id: context.clientId } }),
       tx.socialAccount.findFirst({ where: { id: input.accountId, clientId: context.clientId } }),
-      input.productId ? tx.product.findFirst({ where: { id: input.productId, clientId: context.clientId }, include: { fields: true } }) : Promise.resolve(null),
+      input.productId ? tx.product.findFirst({ where: { id: input.productId, clientId: context.clientId }, include: { fields: { where: { clientId: context.clientId } } } }) : Promise.resolve(null),
       tx.asset.findMany({ where: { id: { in: assetIds }, clientId: context.clientId }, include: { productLinks: true } }),
       tx.socialStrategy.findFirst({ where: { clientId: context.clientId, status: "CONFIRMED" } }),
     ]);

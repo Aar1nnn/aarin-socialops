@@ -69,6 +69,7 @@ export async function OperatorShell({ context, children }: { context: RequestCon
                 <div className="toolbar-menu-content">
                   <a href="/content?create=1#new-content">创建内容</a>
                   <a href="/products?create=1#create-product">创建产品</a>
+                  <a href="/assets#upload-asset">上传素材</a>
                 </div>
               </details>
             ) : null}

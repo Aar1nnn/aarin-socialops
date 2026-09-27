@@ -23,6 +23,8 @@ function expectNamedFields(form: string, names: string[]) {
 }
 
 const connectionsSource = readSource("../src/app/connections/page.tsx");
+const accountSelectionFormSource = readSource("../src/app/connections/account-selection-form.tsx");
+const accountSelectionRouteSource = readSource("../src/app/api/connections/[id]/select-accounts/route.ts");
 const contentSource = readSource("../src/app/content/page.tsx");
 const contentDetailSource = readSource("../src/app/content/[id]/page.tsx");
 const contentActionsSource = readSource("../src/components/content-actions.tsx");
@@ -62,13 +64,22 @@ describe("pilot operator UI form contracts", () => {
       expect(connectionsSource).toContain('const canManageConnections = context.role === "OWNER"');
     });
 
-    it("submits repeated accountIds only when account selection is allowed", () => {
-      const form = formContaining(connectionsSource, "/select-accounts`}");
-
-      expect(form).toContain('name="accountIds"');
-      expect(form).toContain("value={account.id}");
-      expect(form).toContain("disabled={!canSelectAccounts}");
+    it("submits repeated accountIds and expected selection through the role-aware form", () => {
+      expect(connectionsSource).toContain('<AccountSelectionForm connectionId={connection.id}>');
+      expect(accountSelectionFormSource).toContain('const action = `/api/connections/${connectionId}/select-accounts`');
+      expect(accountSelectionFormSource).toContain('<form action={action} method="post"');
+      expect(accountSelectionFormSource).toContain("new FormData(event.currentTarget)");
+      expect(connectionsSource).toContain('name="accountIds"');
+      expect(connectionsSource).toContain('name="selectionSnapshotPresent" value="yes"');
+      expect(connectionsSource).toContain('name="expectedSelectedAccountIds" value={account.id}');
+      expect(connectionsSource).toContain("value={account.id}");
+      expect(connectionsSource).toContain("disabled={!canSelectAccounts}");
       expect(connectionsSource).toContain("canManageConnections && connectionReady");
+      expect(accountSelectionRouteSource).toContain('form.getAll("accountIds")');
+      expect(accountSelectionRouteSource).toContain('form.getAll("expectedSelectedAccountIds")');
+      expect(accountSelectionRouteSource).toContain('form.get("selectionSnapshotPresent") !== "yes"');
+      expect(accountSelectionFormSource).toContain('result.error === "ACCOUNT_SELECTION_CONFLICT"');
+      expect(accountSelectionFormSource).toContain('刷新页面');
     });
 
     it("requires an explicit confirmation before disconnecting credentials", () => {

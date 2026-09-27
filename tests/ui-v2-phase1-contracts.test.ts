@@ -10,9 +10,12 @@ function source(relativePath: string) {
 describe("UI V2 Phase 1 route contracts", () => {
   it("keeps the legacy connections route and action targets available", () => {
     const page = source("../src/app/connections/page.tsx");
+    const selectionForm = source("../src/app/connections/account-selection-form.tsx");
     expect(page).toContain('action="/api/connections/meta/start"');
     expect(page).toContain('name="returnTo" value="/connections"');
-    expect(page).toContain("/select-accounts`}");
+    expect(page).toContain('<AccountSelectionForm connectionId={connection.id}>');
+    expect(selectionForm).toContain('const action = `/api/connections/${connectionId}/select-accounts`');
+    expect(selectionForm).toContain('<form action={action} method="post"');
     expect(page).toContain("/disconnect`}");
   });
 
@@ -25,10 +28,25 @@ describe("UI V2 Phase 1 route contracts", () => {
     expect(selection).toContain('"/connections"');
   });
 
-  it("provides an account-first canonical route without removing the alias", () => {
+  it("provides an account-first canonical route without removing connection management", () => {
     const canonicalPath = fileURLToPath(new URL("../src/app/accounts/page.tsx", import.meta.url));
     expect(existsSync(canonicalPath)).toBe(true);
-    expect(source("../src/app/accounts/page.tsx")).toContain('from "../connections/page"');
+    const accounts = source("../src/app/accounts/page.tsx");
+    expect(accounts).toContain("listAccountOperations(context)");
+    expect(accounts).toContain('href="/connections"');
+    expect(accounts).toContain('title="平台与账号"');
+    expect(source("../src/app/connections/page.tsx")).toContain('title="连接与授权"');
+  });
+
+  it("opens manual content creation from a manual account without changing the AI create link", () => {
+    const operations = source("../src/services/account-operations-view.ts");
+    const content = source("../src/app/content/page.tsx");
+    expect(operations).toContain('nextHref: "/content?manual=1#manual-content"');
+    expect(operations).not.toContain('nextHref: "/content?create=1#new-content"');
+    expect(content).toContain('const manualCreateRequested = first(params.manual) === "1"');
+    expect(content).toContain('id="manual-content" open={manualCreateRequested}');
+    expect(content).toContain('id="new-content" open={createRequested || total === 0}');
+    expect(content).toContain('href="/content?create=1#new-content"');
   });
 
   it("keeps canonical navigation grouped and the alias active", () => {

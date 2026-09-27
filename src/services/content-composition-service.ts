@@ -51,7 +51,7 @@ async function getCompositionItem(context: RequestContext, contentItemId: string
     where: { id: contentItemId, clientId: context.clientId },
     include: {
       account: true,
-      plan: { include: { product: { include: { fields: true } } } },
+      plan: { include: { product: { include: { fields: { where: { clientId: context.clientId } } } } } },
       currentVersion: { include: { assetLinks: true } },
     },
   });

@@ -262,6 +262,7 @@ describe("approval and persistent publishing", () => {
     const job = await schedulePublication(fixture.context, item.id);
     await updateProductFacts(fixture.context, fixture.product.id, {
       name: fixture.product.name,
+      expectedDataVersion: fixture.product.dataVersion,
       fields: [{ key: "material", value: "confirmed aluminum", status: "CONFIRMED", source: "revised customer sheet" }],
     });
     expect((await db.publishJob.findUniqueOrThrow({ where: { id: job.id } })).status).toBe("CANCELLED");
@@ -277,6 +278,11 @@ describe("approval and persistent publishing", () => {
     expect(claimed?.id).toBe(scheduled.id);
     const result = await processPublishJob(scheduled.id, new MockSocialPublishAdapter("unknown"));
     expect(result.status).toBe("UNKNOWN");
+    await expect(updateProductFacts(fixture.context, fixture.product.id, {
+      name: fixture.product.name, expectedDataVersion: fixture.product.dataVersion,
+      fields: [{ key: "material", value: "new steel", status: "CONFIRMED", source: "revised sheet" }],
+    })).rejects.toMatchObject({ code: "PUBLISH_RECONCILIATION_REQUIRED" });
+    expect((await db.contentItem.findUniqueOrThrow({ where: { id: item.id } })).status).toBe("UNKNOWN");
     expect(await claimNextJob("test-worker-2")).toBeNull();
     expect(await db.inAppNotification.findFirst({ where: { clientId: fixture.client.id, relatedType: "PublishJob", relatedId: scheduled.id } })).toMatchObject({ eventType: "PUBLISH_UNKNOWN", severity: "URGENT" });
     expect(await db.auditLog.findFirst({ where: { clientId: fixture.client.id, action: "PUBLISH_UNKNOWN", entityId: scheduled.id } })).not.toBeNull();
@@ -926,7 +932,7 @@ describe("v2 connection layer boundaries", () => {
       expect(connection.accounts).toHaveLength(3);
       expect(connection.accounts.every((account) => !account.isSelected)).toBe(true);
       const facebook = connection.accounts.find((account) => account.externalAccountId === "page-test")!;
-      const selected = await selectPlatformAccounts(fixture.context, connection.id, [facebook.id]);
+      const selected = await selectPlatformAccounts(fixture.context, connection.id, [facebook.id], []);
       expect(selected.accounts.find((account) => account.id === facebook.id)).toMatchObject({
         isSelected: true,
         publishCapability: "VERIFIED",
@@ -934,7 +940,7 @@ describe("v2 connection layer boundaries", () => {
       });
       expect(JSON.stringify(selected)).not.toMatch(/Ciphertext|AuthTag|page-secret-token|user-secret-token/);
       const instagram = connection.accounts.find((account) => account.externalAccountId === "instagram-test")!;
-      const selectedInstagram = await selectPlatformAccounts(fixture.context, connection.id, [instagram.id]);
+      const selectedInstagram = await selectPlatformAccounts(fixture.context, connection.id, [instagram.id], [facebook.id]);
       expect(selectedInstagram.accounts.find((account) => account.id === instagram.id)).toMatchObject({
         isSelected: true,
         publishCapability: "VERIFIED",
@@ -944,7 +950,11 @@ describe("v2 connection layer boundaries", () => {
       await expect(completePlatformConnection(fixture.context, "META", { code: "replay", state }, { adapter, vault })).rejects.toMatchObject({ code: "OAUTH_STATE_INVALID" });
       await expect(disconnectPlatformConnection(fixture.context, connection.id, { adapter, vault })).resolves.toEqual({
         disconnected: true,
+        revokeAttempted: true,
         remoteRevokeConfirmed: true,
+      });
+      expect(await db.auditLog.findFirst({ where: { clientId: fixture.client.id, action: "PLATFORM_REMOTE_REVOKE_RESULT", entityId: connection.id } })).toMatchObject({
+        metadata: { revokeAttempted: true, remoteRevokeConfirmed: true },
       });
       const disconnected = await db.platformConnection.findUniqueOrThrow({ where: { id: connection.id }, include: { accounts: true } });
       expect(disconnected).toMatchObject({ status: "DISCONNECTED", accessTokenCiphertext: null, refreshTokenCiphertext: null });
@@ -988,6 +998,6 @@ describe("v2 connection layer boundaries", () => {
   it("does not let another client select accounts from a foreign connection", async () => {
     const second = await makeFixture();
     const connection = await db.platformConnection.create({ data: { clientId: fixture.client.id, provider: "META", connectedByUserId: fixture.context.userId } });
-    await expect(selectPlatformAccounts(second.context, connection.id, [fixture.accounts[0].id])).rejects.toMatchObject({ code: "PLATFORM_CONNECTION_NOT_FOUND" });
+    await expect(selectPlatformAccounts(second.context, connection.id, [fixture.accounts[0].id], [])).rejects.toMatchObject({ code: "PLATFORM_CONNECTION_NOT_FOUND" });
   });
 });

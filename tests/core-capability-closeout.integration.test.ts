@@ -92,6 +92,7 @@ async function createConfirmedProduct(target = fixture) {
   });
   return updateProductFacts(target.context, product.id, {
     name: product.name,
+    expectedDataVersion: product.dataVersion,
     fields: [
       { key: "material", value: "confirmed recycled steel", status: "CONFIRMED", source: "customer specification" },
     ],
