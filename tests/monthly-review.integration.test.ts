@@ -230,6 +230,53 @@ describe("MONTHLY_V1 facts", () => {
     expect(result.limitations.join(" ")).toContain("MOCK");
   });
 
+  it("excludes selected Instagram API accounts without METRICS from real metric coverage", async () => {
+    const base = await fixture();
+    await db.socialAccount.update({ where: { id: base.account.id }, data: { isSelected: false } });
+    await db.socialAccount.create({
+      data: { clientId: base.client.id, platform: "instagram", displayName: "Instagram without metrics" },
+    });
+    const result = await facts(base.client);
+    expect(result.metrics.accountCoverage).toMatchObject({
+      selectedAccountCount: 1, selectedApiAccountCount: 1, selectedManualAccountCount: 0,
+      selectedMetricsApiAccountCount: 0, missingRealMetricsApiAccountCount: 0,
+    });
+    expect(result.metrics.syncHealth.accounts).toEqual([]);
+    expect(result.limitations.join(" ")).not.toContain("API 指标账号覆盖不完整");
+  });
+
+  it("counts only Facebook in real metric coverage when Instagram has no METRICS path", async () => {
+    const base = await fixture();
+    await db.socialAccount.create({
+      data: { clientId: base.client.id, platform: "instagram", displayName: "Instagram without metrics" },
+    });
+    await db.metricSnapshot.create({
+      data: {
+        clientId: base.client.id, accountId: base.account.id, metricKey: "reach", numericValue: 10,
+        availability: "AVAILABLE", dataKind: "REAL", fetchedAt: new Date("2026-08-15T08:00:00Z"), source: "test",
+      },
+    });
+    const result = await facts(base.client);
+    expect(result.metrics.accountCoverage).toMatchObject({
+      selectedApiAccountCount: 2, selectedMetricsApiAccountCount: 1,
+      missingRealMetricsApiAccountCount: 0,
+    });
+    expect(result.limitations.join(" ")).not.toContain("API 指标账号覆盖不完整");
+  });
+
+  it("counts missing Facebook coverage once without counting Instagram", async () => {
+    const base = await fixture();
+    await db.socialAccount.create({
+      data: { clientId: base.client.id, platform: "instagram", displayName: "Instagram without metrics" },
+    });
+    const result = await facts(base.client);
+    expect(result.metrics.accountCoverage).toMatchObject({
+      selectedApiAccountCount: 2, selectedMetricsApiAccountCount: 1,
+      missingRealMetricsApiAccountCount: 1,
+    });
+    expect(result.limitations.join(" ")).toContain("API 指标账号覆盖不完整");
+  });
+
   it("does not treat manual accounts as missing API metric coverage", async () => {
     const { client, account } = await fixture();
     await db.socialAccount.create({
@@ -247,7 +294,8 @@ describe("MONTHLY_V1 facts", () => {
     const result = await facts(client);
     expect(result.metrics.accountCoverage).toEqual({
       selectedAccountCount: 2, selectedApiAccountCount: 1, selectedManualAccountCount: 1,
-      realAccountCount: 1, mockAccountCount: 0, missingRealApiAccountCount: 0,
+      selectedMetricsApiAccountCount: 1, realAccountCount: 1, mockAccountCount: 0,
+      missingRealMetricsApiAccountCount: 0,
     });
     expect(result.limitations.join(" ")).not.toContain("API 指标账号覆盖不完整");
   });
@@ -374,7 +422,8 @@ describe("MONTHLY_V1 facts", () => {
     expect(result.metrics.mock.samples.find((sample) => sample.key === "impressions")?.value).toBe("999");
     expect(result.metrics.accountCoverage).toEqual({
       selectedAccountCount: 3, selectedApiAccountCount: 3, selectedManualAccountCount: 0,
-      realAccountCount: 1, mockAccountCount: 1, missingRealApiAccountCount: 2,
+      selectedMetricsApiAccountCount: 3, realAccountCount: 1, mockAccountCount: 1,
+      missingRealMetricsApiAccountCount: 2,
     });
     expect(result.metrics.excludedNonCanonicalCount).toBe(1);
     expect(result.metrics.mockRawSnapshotCount).toBe(2);

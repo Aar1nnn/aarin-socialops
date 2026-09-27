@@ -272,9 +272,10 @@ export async function buildMonthlyReviewFactsV1(
       selectedAccountCount: selectedAccountIds.size,
       selectedApiAccountCount: selectedApiAccountIds.size,
       selectedManualAccountCount: selectedAccountIds.size - selectedApiAccountIds.size,
+      selectedMetricsApiAccountCount: selectedMetricsAccounts.length,
       realAccountCount: realAccountIds.size,
       mockAccountCount: mockAccountIds.size,
-      missingRealApiAccountCount: [...selectedApiAccountIds].filter((id) => !realAccountIds.has(id)).length,
+      missingRealMetricsApiAccountCount: selectedMetricsAccounts.filter((account) => !realAccountIds.has(account.id)).length,
     },
     syncHealth: {
       asOf: asOf.toISOString(), scope: "metrics" as const,
@@ -290,8 +291,8 @@ export async function buildMonthlyReviewFactsV1(
   if (syncCounts.SYNCING) limitations.push("部分已选 API 指标账号当前正在同步；本报告不把同步中解释为已完成采集。");
   if (syncCounts.MISSING) limitations.push("部分已选 API 指标账号没有 metrics 同步状态记录；MISSING 不等于 FAILED。");
   if (!metrics.real.samples.length) limitations.push("本月没有可用的 REAL canonical metric 样本；缺失不等于 0。");
-  if (metrics.accountCoverage.missingRealApiAccountCount) {
-    limitations.push("生成时部分当前已选 API 账号没有本月 REAL canonical metric 样本；API 指标账号覆盖不完整，人工账号不计入期望分母。");
+  if (metrics.accountCoverage.missingRealMetricsApiAccountCount) {
+    limitations.push("生成时部分具备 METRICS 路径的已选 API 账号没有本月 REAL canonical metric 样本；API 指标账号覆盖不完整。");
   }
   if (metrics.real.samples.some((sample) => sample.availability !== "AVAILABLE" || sample.value === null)) {
     limitations.push("部分指标样本不可用或读取失败，其值保留为 null，不按 0 处理。");

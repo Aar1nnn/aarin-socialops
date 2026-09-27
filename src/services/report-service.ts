@@ -145,8 +145,8 @@ export function containsSimulatedMonthlyData(facts: MonthlyReviewFactsV1): boole
 /** Operational checks prompted by recorded gaps; these are not performance hypotheses. */
 export function deriveMonthlyReviewNextActions(facts: MonthlyReviewFactsV1): string[] {
   const actions: string[] = [];
-  if (facts.metrics.accountCoverage.selectedApiAccountCount > 0 && (facts.metrics.real.samples.length === 0 || facts.metrics.accountCoverage.missingRealApiAccountCount > 0)) {
-    actions.push("核查当前已选账号的真实指标连接、权限和本月采集覆盖，再决定能否比较表现。");
+  if (facts.metrics.accountCoverage.missingRealMetricsApiAccountCount > 0) {
+    actions.push("核查当前已选且具备 METRICS 路径的 API 账号的真实指标连接、权限和本月采集覆盖，再决定能否比较表现。");
   }
   if (facts.metrics.syncHealth.counts.FAILED > 0) {
     actions.push("核查当前 API 账号指标同步失败记录；同步失败是采集状态，不代表内容表现。");

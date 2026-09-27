@@ -89,9 +89,10 @@ export const MonthlyReviewFactsV1Schema = z.object({
       selectedAccountCount: count,
       selectedApiAccountCount: count,
       selectedManualAccountCount: count,
+      selectedMetricsApiAccountCount: count,
       realAccountCount: count,
       mockAccountCount: count,
-      missingRealApiAccountCount: count,
+      missingRealMetricsApiAccountCount: count,
     }).strict(),
     syncHealth: z.object({
       asOf: instant,

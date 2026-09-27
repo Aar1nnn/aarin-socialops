@@ -12,7 +12,7 @@ const clients: string[] = [];
 const users: string[] = [];
 const asOf = new Date("2026-09-20T00:00:00.000Z");
 
-async function fixture(role: RequestContext["role"] = "OWNER") {
+async function fixture(role: RequestContext["role"] = "OWNER", platform = "facebook") {
   const unique = randomUUID();
   const client = await db.client.create({
     data: { slug: `monthly-report-${unique}`, name: `Monthly report ${unique}`, mode: "DRAFT", isDemo: false, timezone: "Asia/Shanghai" },
@@ -21,7 +21,7 @@ async function fixture(role: RequestContext["role"] = "OWNER") {
   const user = await db.user.create({ data: { email: `monthly-report-${unique}@example.local`, displayName: "Monthly tester", passwordHash: "test-only" } });
   users.push(user.id);
   await db.clientMembership.create({ data: { clientId: client.id, userId: user.id, role } });
-  const account = await db.socialAccount.create({ data: { clientId: client.id, platform: "facebook", displayName: "Fixture page", createdAt: new Date("2026-09-01T00:00:00.000Z") } });
+  const account = await db.socialAccount.create({ data: { clientId: client.id, platform, displayName: "Fixture page", createdAt: new Date("2026-09-01T00:00:00.000Z") } });
   const context: RequestContext = { clientId: client.id, userId: user.id, role };
   return { client, account, context };
 }
@@ -151,6 +151,21 @@ describe("MONTHLY_V1 OperationReport persistence", () => {
     expect(containsSimulatedMonthlyData(simulatedOnly)).toBe(true);
     expect(simulatedOnly.publishing.createdCohort.simulated.statuses.UNKNOWN).toBe(1);
     expect(simulatedOnly.publishing.createdCohort.real.statuses.UNKNOWN).toBe(0);
+  });
+
+  it("does not suggest API metric connection checks when the only selected API account lacks a METRICS path", async () => {
+    const { context } = await fixture("OWNER", "instagram");
+    const report = await generateMonthlyOperationReport(context, "2026-09", asOf);
+    const facts = MonthlyReviewFactsV1Schema.parse(report.facts);
+    expect(facts.metrics.accountCoverage).toMatchObject({
+      selectedApiAccountCount: 1,
+      selectedMetricsApiAccountCount: 0,
+      missingRealMetricsApiAccountCount: 0,
+    });
+    expect(facts.metrics.syncHealth.accounts).toEqual([]);
+    expect(facts.limitations.join(" ")).not.toContain("API 指标账号覆盖不完整");
+    expect(deriveMonthlyReviewNextActions(facts).join(" ")).not.toContain("真实指标连接");
+    expect((report.recommendations as string[]).join(" ")).not.toContain("真实指标连接");
   });
 
   it("separates failed/in-progress sync health from metric sample freshness in suggested checks", async () => {
