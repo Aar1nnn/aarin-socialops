@@ -6,7 +6,7 @@ import { db } from "../src/lib/db";
 import { MonthlyReviewFactsV1Schema } from "../src/lib/monthly-review-contract";
 import { AppError } from "../src/lib/errors";
 import type { RequestContext } from "../src/lib/context";
-import { classifyOperationReportFacts, deriveMonthlyReviewNextActions, generateMonthlyOperationReport } from "../src/services/report-service";
+import { classifyOperationReportFacts, containsSimulatedMonthlyData, deriveMonthlyReviewNextActions, generateMonthlyOperationReport } from "../src/services/report-service";
 
 const clients: string[] = [];
 const users: string[] = [];
@@ -113,7 +113,11 @@ describe("MONTHLY_V1 OperationReport persistence", () => {
         ...facts.publishing,
         createdCohort: {
           ...facts.publishing.createdCohort,
-          statuses: { ...facts.publishing.createdCohort.statuses, UNKNOWN: 1, WAITING_CONFIGURATION: 1 },
+          real: {
+            ...facts.publishing.createdCohort.real,
+            total: 2,
+            statuses: { ...facts.publishing.createdCohort.real.statuses, UNKNOWN: 1, WAITING_CONFIGURATION: 1 },
+          },
         },
       },
     };
@@ -121,6 +125,52 @@ describe("MONTHLY_V1 OperationReport persistence", () => {
     expect(actions.join(" ")).toContain("UNKNOWN");
     expect(actions.join(" ")).toContain("WAITING_CONFIGURATION");
     expect(actions.join(" ")).not.toContain("表现提升");
+  });
+
+  it("does not propose real external reconciliation for simulated-only UNKNOWN or configuration jobs", async () => {
+    const { context } = await fixture();
+    const report = await generateMonthlyOperationReport(context, "2026-09", asOf);
+    const facts = MonthlyReviewFactsV1Schema.parse(report.facts);
+    const simulatedOnly = MonthlyReviewFactsV1Schema.parse({
+      ...facts,
+      publishing: {
+        ...facts.publishing,
+        createdCohort: {
+          ...facts.publishing.createdCohort,
+          simulated: {
+            ...facts.publishing.createdCohort.simulated,
+            total: 2,
+            statuses: { ...facts.publishing.createdCohort.simulated.statuses, UNKNOWN: 1, WAITING_CONFIGURATION: 1 },
+          },
+        },
+      },
+    });
+    const actions = deriveMonthlyReviewNextActions(simulatedOnly);
+    expect(actions.join(" ")).not.toContain("UNKNOWN");
+    expect(actions.join(" ")).not.toContain("WAITING_CONFIGURATION");
+    expect(containsSimulatedMonthlyData(simulatedOnly)).toBe(true);
+    expect(simulatedOnly.publishing.createdCohort.simulated.statuses.UNKNOWN).toBe(1);
+    expect(simulatedOnly.publishing.createdCohort.real.statuses.UNKNOWN).toBe(0);
+  });
+
+  it("separates failed/in-progress sync health from metric sample freshness in suggested checks", async () => {
+    const { context } = await fixture();
+    const report = await generateMonthlyOperationReport(context, "2026-09", asOf);
+    const facts = MonthlyReviewFactsV1Schema.parse(report.facts);
+    const unhealthy = MonthlyReviewFactsV1Schema.parse({
+      ...facts,
+      metrics: {
+        ...facts.metrics,
+        syncHealth: {
+          ...facts.metrics.syncHealth,
+          counts: { ...facts.metrics.syncHealth.counts, FAILED: 1, SYNCING: 1 },
+        },
+      },
+    });
+    const actions = deriveMonthlyReviewNextActions(unhealthy).join(" ");
+    expect(actions).toContain("同步失败");
+    expect(actions).toContain("正在进行");
+    expect(facts.metrics.real.freshness).toBe("MISSING");
   });
 
   it("rejects a future month and VIEWER generation without inserting a report", async () => {

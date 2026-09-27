@@ -8,7 +8,7 @@ import { db } from "@/lib/db";
 import { MonthlyReviewFactsV1Schema, type MonthlyReviewFactsV1 } from "@/lib/monthly-review-contract";
 import { formatDateTime } from "@/lib/presentation/status";
 import { buildMonthlyReviewFactsV1 } from "@/services/monthly-review-service";
-import { classifyOperationReportFacts, deriveMonthlyReviewNextActions } from "@/services/report-service";
+import { classifyOperationReportFacts, containsSimulatedMonthlyData, deriveMonthlyReviewNextActions } from "@/services/report-service";
 
 type Params = { month?: string | string[]; report?: string | string[] };
 type Report = Pick<OperationReport, "id" | "facts" | "generatedAt" | "periodStart" | "periodEnd" | "dataLimitations" | "hypotheses" | "recommendations" | "simulated">;
@@ -26,11 +26,22 @@ function stringList(value: unknown): string[] {
   return Array.isArray(value) ? value.filter((item): item is string => typeof item === "string") : [];
 }
 
+const leadCategories = ["PROCUREMENT", "WHOLESALE", "INQUIRY", "CATALOG_REQUEST", "SUPPLY_REQUEST", "GENERAL", "SPAM"] as const;
+const cohortStatuses = ["PENDING", "RETRY", "WAITING_CONFIGURATION", "MANUAL_PENDING", "RUNNING", "UNKNOWN", "FAILED", "PUBLISHED", "CANCELLED"] as const;
+
+function CohortPartition({ title, partition }: { title: string; partition: MonthlyReviewFactsV1["publishing"]["createdCohort"]["real"] }) {
+  const nonzero = cohortStatuses.filter((status) => partition.statuses[status] > 0);
+  return <div className="card span-6 stack-tight">
+    <strong>{title}：{partition.total} 个</strong>
+    {nonzero.length ? <ul>{nonzero.map((status) => <li key={status}><StatusIndicator value={status} compact /> {partition.statuses[status]}</li>)}</ul> : <p className="muted">本月没有此类任务。</p>}
+  </div>;
+}
+
 function MetricPartition({ partition, title, timeZone }: { partition: MonthlyReviewFactsV1["metrics"]["real"]; title: string; timeZone: string }) {
   return <div className="card span-6 stack-tight">
     <strong>{title}</strong>
     <p>{partition.samples.length} 组最新快照；其中 {partition.availableSampleCount} 组有可用值。</p>
-    <p className="muted">采集新鲜度：{partition.freshness}；最近采集：{partition.latestFetchedAt ? formatDateTime(new Date(partition.latestFetchedAt), "—", timeZone) : "未采集"}。新鲜度不代表表现。</p>
+    <p className="muted">本月样本新鲜度：{partition.freshness}；最近样本采集：{partition.latestFetchedAt ? formatDateTime(new Date(partition.latestFetchedAt), "—", timeZone) : "未采集"}。这是样本时间，不表示当前账号同步健康或内容表现。</p>
     {partition.samples.length ? <details className="technical-details"><summary>查看指标样本及覆盖范围</summary>
       <div className="table-scroll" role="region" aria-label={`${title}指标样本`} tabIndex={0}><table><thead><tr><th>账号／平台</th><th>指标</th><th>值</th><th>可用性</th><th>覆盖</th><th>采集于</th></tr></thead><tbody>
         {partition.samples.map((sample, index) => <tr key={`${sample.accountId}-${sample.key}-${sample.postId ?? "account"}-${index}`}>
@@ -44,8 +55,9 @@ function MetricPartition({ partition, title, timeZone }: { partition: MonthlyRev
 
 function MonthlyV1Summary({ facts, snapshot, hypotheses, nextActions }: { facts: MonthlyReviewFactsV1; snapshot: boolean; hypotheses: string[]; nextActions: string[] }) {
   const cohort = facts.publishing.createdCohort;
-  const mixed = facts.publishing.simulated.total > 0 || facts.metrics.mockRawSnapshotCount > 0;
-  const hasActivity = facts.publishing.real.total > 0 || facts.publishing.simulated.total > 0 || cohort.total > 0 ||
+  const cohortTotal = cohort.real.total + cohort.simulated.total;
+  const mixed = containsSimulatedMonthlyData(facts);
+  const hasActivity = facts.publishing.real.total > 0 || facts.publishing.simulated.total > 0 || cohortTotal > 0 ||
     facts.interactions.occurredInMonth > 0 || facts.interactions.importedInMonth > 0 ||
     facts.leads.recordsCreatedInMonth > 0 || facts.metrics.rawSnapshotCount > 0;
   return <div className="stack">
@@ -60,10 +72,23 @@ function MonthlyV1Summary({ facts, snapshot, hypotheses, nextActions }: { facts:
       <div className="card span-6"><h3>真实发布</h3><p className="number">{facts.publishing.real.total}</p><p className="muted">API {facts.publishing.real.api} · 人工 {facts.publishing.real.manual}；按实际 publishedAt 计入。</p></div>
       <div className="card span-6"><h3>模拟发布</h3><p className="number">{facts.publishing.simulated.total}</p><p className="muted">API {facts.publishing.simulated.api} · 人工 {facts.publishing.simulated.manual}；不计入真实发布。</p></div>
       <div className="card span-6"><h3>互动</h3><p>本月发生 {facts.interactions.occurredInMonth} · 本月导入 {facts.interactions.importedInMonth}</p><p className="muted">本月发生、较晚导入 {facts.interactions.lateImportedForMonth}；发生时间与导入时间分别统计，不相加。</p></div>
-      <div className="card span-6"><h3>线索记录</h3><p>本月创建 {facts.leads.recordsCreatedInMonth}</p><p className="muted">其中截至采集时高／紧急优先级 {facts.leads.highOrUrgentAsOf}。创建记录不等于已核实商机或成交。</p></div>
+      <div className="card span-6"><h3>Lead 记录</h3><p>本月创建 {facts.leads.recordsCreatedInMonth}</p><p className="muted">其中截至采集时高／紧急优先级 {facts.leads.highOrUrgentAsOf}；有非空销售反馈 {facts.leads.salesFeedbackPresentAsOf}。这些只描述本月创建的记录截至采集时的字段，不能表示已核实商机或成交。</p>
+        <details className="technical-details"><summary>查看 Lead 分类</summary><ul>{leadCategories.map((category) => <li key={category}><StatusIndicator value={category} compact /> {facts.leads.categoryCounts[category]}</li>)}</ul></details>
+      </div>
     </div>
-    <div className="card stack-tight"><h3>本月创建的发布任务：截至采集时状态</h3><p>任务 {cohort.total} 个；UNKNOWN {cohort.statuses.UNKNOWN} · FAILED {cohort.statuses.FAILED} · WAITING_CONFIGURATION {cohort.statuses.WAITING_CONFIGURATION}。</p><p className="muted">这反映截至 {cohort.asOf} 的任务当前状态，不代表这些状态是在本月发生的事件；与上面的实际发布时间口径不同。</p></div>
+    <div className="stack-tight"><h3>本月创建的发布任务：截至采集时状态</h3><p>共 {cohortTotal} 个；以下按真实与模拟／非 LIVE 任务分列。这是截至 {cohort.asOf} 的当前状态，不是本月状态转换次数，也不同于上面按 publishedAt 归月的已发布数。</p>
+      <div className="grid"><CohortPartition title="真实任务" partition={cohort.real} /><CohortPartition title="模拟／非 LIVE 任务" partition={cohort.simulated} /></div>
+      {cohort.simulated.statuses.UNKNOWN > 0 ? <p className="muted">模拟／非 LIVE 的 UNKNOWN 只作为模拟任务状态展示，不触发真实外部发布证据对账动作。</p> : null}
+    </div>
     <div className="grid"><MetricPartition title="真实指标" partition={facts.metrics.real} timeZone={facts.period.timeZone} /><MetricPartition title="模拟指标" partition={facts.metrics.mock} timeZone={facts.period.timeZone} /></div>
+    <div className="card stack-tight"><h3>当前 API 指标同步健康</h3>
+      <p className="muted">截至 {facts.metrics.syncHealth.asOf}，仅统计计算时当前已选、支持指标读取的 API 账号；这是连接与同步流程状态，独立于上面的本月指标样本新鲜度。</p>
+      <p>新鲜 {facts.metrics.syncHealth.counts.FRESH} · 过期 {facts.metrics.syncHealth.counts.STALE} · 同步中 {facts.metrics.syncHealth.counts.SYNCING} · 失败 {facts.metrics.syncHealth.counts.FAILED} · 无记录 {facts.metrics.syncHealth.counts.MISSING}。</p>
+      {facts.metrics.syncHealth.counts.FAILED > 0 || facts.metrics.syncHealth.counts.SYNCING > 0 ? <Notice title="同步状态限制" tone="warning">FAILED 表示指标同步失败，SYNCING 表示仍在进行；两者都不能当作内容表现、真实数值 0 或整个月的历史同步状态。</Notice> : null}
+      {facts.metrics.syncHealth.accounts.length ? <details className="technical-details"><summary>查看各账号同步状态</summary><div className="table-scroll" role="region" aria-label="账号指标同步健康" tabIndex={0}><table><thead><tr><th>账号／平台</th><th>当前状态</th><th>最近开始</th><th>最近成功</th><th>最近失败</th></tr></thead><tbody>
+        {facts.metrics.syncHealth.accounts.map((account) => <tr key={account.accountId}><td>{account.platform}<span className="cell-meta">{account.accountId}</span></td><td>{account.status}</td><td>{account.lastStartedAt ? formatDateTime(new Date(account.lastStartedAt), "—", facts.period.timeZone) : "—"}</td><td>{account.lastSucceededAt ? formatDateTime(new Date(account.lastSucceededAt), "—", facts.period.timeZone) : "—"}</td><td>{account.lastFailedAt ? formatDateTime(new Date(account.lastFailedAt), "—", facts.period.timeZone) : "—"}</td></tr>)}
+      </tbody></table></div></details> : <p className="muted">当前没有适用的 API 指标账号。</p>}
+    </div>
     <p className="muted">本次计算时当前已选账号：共 {facts.metrics.accountCoverage.selectedAccountCount} 个，API {facts.metrics.accountCoverage.selectedApiAccountCount} 个、人工 {facts.metrics.accountCoverage.selectedManualAccountCount} 个；{facts.metrics.accountCoverage.realAccountCount} 个有本月真实指标样本，{facts.metrics.accountCoverage.mockAccountCount} 个有模拟样本。缺少真实样本的 API 账号 {facts.metrics.accountCoverage.missingRealApiAccountCount} 个；人工账号不计入 API 指标缺口。账号选择状态是计算时上下文，不表示整个月的历史选择。</p>
     <p className="muted">检索到 {facts.metrics.rawSnapshotCount} 份原始指标快照，其中 MOCK {facts.metrics.mockRawSnapshotCount} 份；{facts.metrics.excludedNonCanonicalCount} 份未映射到规范指标，未混入可比样本。不同时间范围或账号的指标不直接相加。</p>
     {facts.observations.length ? <div className="card"><h3>确定性观察</h3><ul>{facts.observations.map((item, index) => <li key={index}>{item}</li>)}</ul></div> : null}

@@ -233,10 +233,13 @@ describe("client readiness projection", () => {
     expect(isolated.followUp.find((value) => value.key === "analytics-review")?.status).toBe("ATTENTION");
     expect(isolated.followUp.find((value) => value.key === "lead-handoff")?.status).toBe("READY");
 
-    const ownAccount = await db.socialAccount.create({ data: { clientId: first.context.clientId, platform: "facebook", displayName: "Own account" } });
+    const ownAccount = await db.socialAccount.create({ data: { clientId: first.context.clientId, platform: "facebook", displayName: "Own account", metricsCapability: "VERIFIED" } });
     const realMetric = await db.metricSnapshot.create({ data: {
       clientId: first.context.clientId, accountId: ownAccount.id, metricKey: "reach", numericValue: "11",
       availability: "AVAILABLE", dataKind: "REAL", fetchedAt: now, source: "test-own",
+    } });
+    await db.analyticsSyncState.create({ data: {
+      clientId: first.context.clientId, accountId: ownAccount.id, scope: "metrics", status: "FRESH", lastSucceededAt: now,
     } });
     const ownInteraction = await db.interaction.create({ data: {
       clientId: first.context.clientId, platform: "facebook", platformRecordId: randomUUID(),
@@ -252,5 +255,81 @@ describe("client readiness projection", () => {
     expect(actionable.followUp.find((value) => value.key === "lead-handoff")?.detail).toContain("1 条");
     await db.metricSnapshot.update({ where: { id: realMetric.id }, data: { fetchedAt: new Date(now.getTime() - 2 * 24 * 60 * 60 * 1000) } });
     expect((await getClientReadiness(first.context)).followUp.find((value) => value.key === "analytics-review")?.status).toBe("ATTENTION");
+  });
+
+  it("keeps selected API metric sync failures visible even when REAL data is fresh", async () => {
+    const own = await fixture();
+    const other = await fixture();
+    const selected = await db.socialAccount.create({ data: {
+      clientId: own.context.clientId, platform: "facebook", displayName: "Selected metrics account",
+      isSelected: true, metricsCapability: "VERIFIED",
+    } });
+    const unselected = await db.socialAccount.create({ data: {
+      clientId: own.context.clientId, platform: "facebook", displayName: "Unselected metrics account",
+      isSelected: false, metricsCapability: "VERIFIED",
+    } });
+    const manual = await db.socialAccount.create({ data: {
+      clientId: own.context.clientId, platform: "linkedin", displayName: "Manual metrics fixture",
+      metadata: manualAccountMetadata("https://www.linkedin.com/company/metrics-fixture"),
+      isSelected: true, metricsCapability: "VERIFIED",
+    } });
+    const now = new Date();
+    for (const accountId of [unselected.id, manual.id]) {
+      await db.metricSnapshot.create({ data: {
+        clientId: own.context.clientId, accountId, metricKey: "reach", numericValue: "9",
+        availability: "AVAILABLE", dataKind: "REAL", fetchedAt: now, source: "test-excluded",
+      } });
+      await db.analyticsSyncState.create({ data: {
+        clientId: own.context.clientId, accountId, scope: "metrics", status: "FRESH", lastSucceededAt: now,
+      } });
+    }
+    const absent = (await getClientReadiness(own.context)).followUp.find((value) => value.key === "analytics-review")!;
+    expect(absent).toMatchObject({ status: "ATTENTION", nextHref: "/insights#metrics" });
+    expect(absent.detail).toContain("无 REAL 可用样本 1 个");
+    expect(absent.detail).toContain("无同步记录 1 个");
+
+    const real = await db.metricSnapshot.create({ data: {
+      clientId: own.context.clientId, accountId: selected.id, metricKey: "reach", numericValue: "12",
+      availability: "AVAILABLE", dataKind: "REAL", fetchedAt: now, source: "test-selected",
+    } });
+    await db.analyticsSyncState.create({ data: {
+      clientId: other.context.clientId, accountId: selected.id, scope: "metrics", status: "FAILED", lastFailedAt: now,
+    } });
+    const noOwnSync = (await getClientReadiness(own.context)).followUp.find((value) => value.key === "analytics-review")!;
+    expect(noOwnSync.status).toBe("ATTENTION");
+    expect(noOwnSync.detail).toContain("近 24 小时 REAL 可用样本 1 个");
+    expect(noOwnSync.detail).toContain("无同步记录 1 个");
+    expect(noOwnSync.detail).toContain("同步失败 0 个");
+
+    const sync = await db.analyticsSyncState.create({ data: {
+      clientId: own.context.clientId, accountId: selected.id, scope: "metrics", status: "FRESH", lastSucceededAt: now,
+    } });
+    expect((await getClientReadiness(own.context)).followUp.find((value) => value.key === "analytics-review")?.status).toBe("READY");
+    await db.analyticsSyncState.update({ where: { id: sync.id }, data: { status: "STALE" } });
+    const staleSync = (await getClientReadiness(own.context)).followUp.find((value) => value.key === "analytics-review")!;
+    expect(staleSync.status).toBe("ATTENTION");
+    expect(staleSync.detail).toContain("同步状态过期 1 个");
+    expect(staleSync.detail).toContain("近 24 小时 REAL 可用样本 1 个");
+    await db.analyticsSyncState.update({ where: { id: sync.id }, data: {
+      status: "FRESH", lastSucceededAt: new Date(now.getTime() - 2 * 24 * 60 * 60 * 1000),
+    } });
+    const oldSyncSuccess = (await getClientReadiness(own.context)).followUp.find((value) => value.key === "analytics-review")!;
+    expect(oldSyncSuccess.status).toBe("ATTENTION");
+    expect(oldSyncSuccess.detail).toContain("同步状态过期 1 个");
+    expect(oldSyncSuccess.detail).toContain("近 24 小时 REAL 可用样本 1 个");
+    await db.analyticsSyncState.update({ where: { id: sync.id }, data: { status: "FAILED", lastFailedAt: now } });
+    const failed = (await getClientReadiness(own.context)).followUp.find((value) => value.key === "analytics-review")!;
+    expect(failed.status).toBe("ATTENTION");
+    expect(failed.detail).toContain("同步失败 1 个");
+    expect(failed.detail).toContain("近 24 小时 REAL 可用样本 1 个");
+    await db.analyticsSyncState.update({ where: { id: sync.id }, data: { status: "SYNCING", lastStartedAt: now } });
+    const syncing = (await getClientReadiness(own.context)).followUp.find((value) => value.key === "analytics-review")!;
+    expect(syncing.status).toBe("ATTENTION");
+    expect(syncing.detail).toContain("同步中 1 个");
+    await db.analyticsSyncState.update({ where: { id: sync.id }, data: { status: "FRESH" } });
+    await db.metricSnapshot.update({ where: { id: real.id }, data: { fetchedAt: new Date(now.getTime() - 2 * 24 * 60 * 60 * 1000) } });
+    const stale = (await getClientReadiness(own.context)).followUp.find((value) => value.key === "analytics-review")!;
+    expect(stale.status).toBe("ATTENTION");
+    expect(stale.detail).toContain("样本过期 1 个");
   });
 });

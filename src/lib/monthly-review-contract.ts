@@ -15,6 +15,8 @@ const jobStatuses = z.object({
   UNKNOWN: count,
   CANCELLED: count,
 }).strict();
+const cohortPartition = z.object({ total: count, statuses: jobStatuses }).strict();
+const syncStatus = z.enum(["FRESH", "STALE", "SYNCING", "FAILED", "MISSING"]);
 
 export const MonthlyMetricSampleV1Schema = z.object({
   accountId: z.string().min(1),
@@ -53,7 +55,11 @@ export const MonthlyReviewFactsV1Schema = z.object({
   publishing: z.object({
     real: publishingCounts,
     simulated: publishingCounts,
-    createdCohort: z.object({ asOf: instant, total: count, statuses: jobStatuses }).strict(),
+    createdCohort: z.object({
+      asOf: instant,
+      real: cohortPartition,
+      simulated: cohortPartition,
+    }).strict(),
   }).strict(),
   interactions: z.object({
     occurredInMonth: count,
@@ -63,6 +69,11 @@ export const MonthlyReviewFactsV1Schema = z.object({
   leads: z.object({
     recordsCreatedInMonth: count,
     highOrUrgentAsOf: count,
+    categoryCounts: z.object({
+      PROCUREMENT: count, WHOLESALE: count, INQUIRY: count,
+      CATALOG_REQUEST: count, SUPPLY_REQUEST: count, GENERAL: count, SPAM: count,
+    }).strict(),
+    salesFeedbackPresentAsOf: count,
     handoffStatusesAsOf: z.object({
       NEW: count, REPLIED: count, HANDED_OFF: count,
       WAITING_FEEDBACK: count, CLOSED: count, DISMISSED: count,
@@ -81,6 +92,19 @@ export const MonthlyReviewFactsV1Schema = z.object({
       realAccountCount: count,
       mockAccountCount: count,
       missingRealApiAccountCount: count,
+    }).strict(),
+    syncHealth: z.object({
+      asOf: instant,
+      scope: z.literal("metrics"),
+      accounts: z.array(z.object({
+        accountId: z.string().min(1),
+        platform: z.string().min(1),
+        status: syncStatus,
+        lastStartedAt: instant.nullable(),
+        lastSucceededAt: instant.nullable(),
+        lastFailedAt: instant.nullable(),
+      }).strict()),
+      counts: z.object({ FRESH: count, STALE: count, SYNCING: count, FAILED: count, MISSING: count }).strict(),
     }).strict(),
   }).strict(),
   limitations: z.array(z.string().min(1)),

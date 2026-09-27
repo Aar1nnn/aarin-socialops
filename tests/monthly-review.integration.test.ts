@@ -34,6 +34,26 @@ async function facts(client: Awaited<ReturnType<typeof fixture>>["client"], mont
   return db.$transaction((tx) => buildMonthlyReviewFactsV1(tx, client, month, asOf), { isolationLevel: "RepeatableRead" });
 }
 
+async function createCohortJob(base: Awaited<ReturnType<typeof fixture>>, status: "UNKNOWN" | "FAILED" | "WAITING_CONFIGURATION", environment: "LIVE" | "SIMULATED", simulated: boolean) {
+  const account = await db.socialAccount.create({
+    data: { clientId: base.client.id, platform: "facebook", displayName: `Cohort ${randomUUID()}` },
+  });
+  const originalItem = await db.contentItem.findUniqueOrThrow({ where: { id: base.version.contentItemId } });
+  const item = await db.contentItem.create({
+    data: { clientId: base.client.id, accountId: account.id, planId: originalItem.planId, platform: "facebook" },
+  });
+  const version = await db.contentVersion.create({
+    data: { clientId: base.client.id, contentItemId: item.id, version: 1, text: "Cohort", generator: "test", generationLabel: "test", sourceFacts: {} },
+  });
+  return db.publishJob.create({
+    data: {
+      clientId: base.client.id, accountId: account.id, contentVersionId: version.id,
+      idempotencyKey: `monthly-cohort-${randomUUID()}`, adapter: environment === "LIVE" ? "meta" : "mock",
+      status, environment, simulated, createdAt: new Date("2026-08-15T08:00:00Z"),
+    },
+  });
+}
+
 afterEach(async () => {
   for (const clientId of clientIds.splice(0)) await db.client.deleteMany({ where: { id: clientId } });
 });
@@ -81,7 +101,117 @@ describe("MONTHLY_V1 facts", () => {
     expect(result.publishing.real.total).toBe(0);
     expect(result.metrics.real.samples).toEqual([]);
     expect(result.metrics.real.freshness).toBe("MISSING");
+    expect(result.metrics.syncHealth.counts.MISSING).toBe(1);
+    expect(result.metrics.syncHealth.counts.FAILED).toBe(0);
+    expect(result.leads.categoryCounts).toEqual({
+      PROCUREMENT: 0, WHOLESALE: 0, INQUIRY: 0, CATALOG_REQUEST: 0,
+      SUPPLY_REQUEST: 0, GENERAL: 0, SPAM: 0,
+    });
+    expect(result.leads.salesFeedbackPresentAsOf).toBe(0);
     expect(result.limitations.join(" ")).toContain("缺失不等于 0");
+  });
+
+  it("keeps current sync health separate from metric sample freshness", async () => {
+    const base = await fixture();
+    const states = ["FAILED", "SYNCING", "MISSING", "FRESH", "STALE"] as const;
+    const accounts = [base.account];
+    for (let index = 1; index < states.length; index += 1) {
+      accounts.push(await db.socialAccount.create({
+        data: { clientId: base.client.id, platform: "facebook", displayName: `Metric account ${states[index]}` },
+      }));
+    }
+    await db.socialAccount.create({
+      data: { clientId: base.client.id, platform: "linkedin", displayName: "Manual without metrics", metadata: { managementMode: "MANUAL" } },
+    });
+    await db.socialAccount.create({
+      data: { clientId: base.client.id, platform: "instagram", displayName: "API without registry metrics" },
+    });
+    for (const [index, status] of states.entries()) {
+      if (status === "MISSING") continue;
+      await db.analyticsSyncState.create({
+        data: {
+          clientId: base.client.id, accountId: accounts[index].id, scope: "metrics", status,
+          lastStartedAt: status === "SYNCING" ? new Date() : null,
+          lastSucceededAt: status === "FRESH" ? new Date() : null,
+          lastFailedAt: status === "FAILED" ? new Date() : null,
+        },
+      });
+    }
+    await db.metricSnapshot.create({
+      data: {
+        clientId: base.client.id, accountId: accounts[0].id, metricKey: "reach", numericValue: 10,
+        availability: "AVAILABLE", dataKind: "REAL", fetchedAt: new Date(), source: "test",
+        periodStart: new Date("2026-08-01T00:00:00Z"), periodEnd: new Date("2026-08-31T00:00:00Z"),
+      },
+    });
+    const result = await facts(base.client);
+    expect(result.metrics.real.freshness).toBe("FRESH");
+    expect(result.metrics.syncHealth.scope).toBe("metrics");
+    expect(result.metrics.syncHealth.accounts).toHaveLength(5);
+    expect(result.metrics.syncHealth.counts).toEqual({ FRESH: 1, STALE: 1, SYNCING: 1, FAILED: 1, MISSING: 1 });
+    expect(result.metrics.syncHealth.accounts.find((entry) => entry.accountId === accounts[0].id)?.status).toBe("FAILED");
+    expect(result.limitations.join(" ")).toContain("FAILED");
+    expect(result.limitations.join(" ")).toContain("正在同步");
+    expect(result.limitations.join(" ")).toContain("MISSING 不等于 FAILED");
+  });
+
+  it("splits created publish cohort into real and simulated status totals", async () => {
+    const base = await fixture();
+    await createCohortJob(base, "UNKNOWN", "LIVE", false);
+    await createCohortJob(base, "FAILED", "LIVE", false);
+    await createCohortJob(base, "UNKNOWN", "SIMULATED", false);
+    await createCohortJob(base, "WAITING_CONFIGURATION", "LIVE", true);
+    const result = await facts(base.client);
+    expect(result.publishing.createdCohort.real.total).toBe(2);
+    expect(result.publishing.createdCohort.real.statuses).toMatchObject({ UNKNOWN: 1, FAILED: 1, WAITING_CONFIGURATION: 0 });
+    expect(result.publishing.createdCohort.simulated.total).toBe(2);
+    expect(result.publishing.createdCohort.simulated.statuses).toMatchObject({ UNKNOWN: 1, FAILED: 0, WAITING_CONFIGURATION: 1 });
+    expect(result.publishing.createdCohort.real.total + result.publishing.createdCohort.simulated.total).toBe(4);
+    expect(Object.values(result.publishing.createdCohort.real.statuses).reduce((sum, count) => sum + count, 0)).toBe(2);
+    expect(Object.values(result.publishing.createdCohort.simulated.statuses).reduce((sum, count) => sum + count, 0)).toBe(2);
+    expect(result.publishing.real.total).toBe(0);
+    expect(result.publishing.simulated.total).toBe(0);
+    expect(result.limitations.join(" ")).toContain("模拟发布");
+  });
+
+  it("counts seven lead categories and nonblank sales feedback within the created cohort", async () => {
+    const base = await fixture();
+    const foreign = await fixture();
+    const categories = ["PROCUREMENT", "WHOLESALE", "INQUIRY", "CATALOG_REQUEST", "SUPPLY_REQUEST", "GENERAL", "SPAM"] as const;
+    for (const [index, category] of categories.entries()) {
+      const interaction = await db.interaction.create({
+        data: {
+          clientId: base.client.id, accountId: base.account.id, platform: "facebook",
+          platformRecordId: `monthly-lead-${randomUUID()}`, interactionType: "COMMENT", body: category,
+          occurredAt: new Date("2026-08-10T08:00:00Z"), importedAt: new Date("2026-08-11T08:00:00Z"),
+        },
+      });
+      await db.lead.create({
+        data: {
+          clientId: base.client.id, interactionId: interaction.id, category, priority: "NORMAL",
+          rationale: "Test", salesFeedback: index === 0 ? "  Reviewed  " : index === 1 ? "   " : null,
+          createdAt: new Date("2026-08-12T08:00:00Z"),
+        },
+      });
+    }
+    const foreignInteraction = await db.interaction.create({
+      data: {
+        clientId: foreign.client.id, accountId: foreign.account.id, platform: "facebook",
+        platformRecordId: `monthly-foreign-lead-${randomUUID()}`, interactionType: "COMMENT", body: "Foreign",
+        occurredAt: new Date("2026-08-10T08:00:00Z"), importedAt: new Date("2026-08-11T08:00:00Z"),
+      },
+    });
+    await db.lead.create({
+      data: {
+        clientId: foreign.client.id, interactionId: foreignInteraction.id, category: "SPAM",
+        priority: "HIGH", rationale: "Other tenant", salesFeedback: "Foreign feedback",
+        createdAt: new Date("2026-08-12T08:00:00Z"),
+      },
+    });
+    const result = await facts(base.client);
+    expect(result.leads.recordsCreatedInMonth).toBe(7);
+    expect(result.leads.categoryCounts).toEqual(Object.fromEntries(categories.map((category) => [category, 1])));
+    expect(result.leads.salesFeedbackPresentAsOf).toBe(1);
   });
 
   it("retains MOCK provenance when the only mock metric is not canonical", async () => {
@@ -157,7 +287,8 @@ describe("MONTHLY_V1 facts", () => {
     const result = await facts(own.client);
     expect(result.metrics.real.samples).toEqual([]);
     expect(result.publishing.real.total).toBe(0);
-    expect(result.publishing.createdCohort.total).toBe(0);
+    expect(result.publishing.createdCohort.real.total).toBe(0);
+    expect(result.publishing.createdCohort.simulated.total).toBe(0);
     expect(result.interactions.occurredInMonth).toBe(0);
     expect(result.interactions.importedInMonth).toBe(0);
     expect(result.leads.recordsCreatedInMonth).toBe(0);
@@ -232,8 +363,9 @@ describe("MONTHLY_V1 facts", () => {
     expect(lateInteraction.id).toBeTruthy();
     expect(result.publishing.real).toEqual({ total: 1, api: 0, manual: 1 });
     expect(result.publishing.simulated).toEqual({ total: 1, api: 1, manual: 0 });
-    expect(result.publishing.createdCohort.statuses.WAITING_CONFIGURATION).toBe(1);
-    expect(result.publishing.createdCohort.total).toBe(2);
+    expect(result.publishing.createdCohort.real.statuses.WAITING_CONFIGURATION).toBe(1);
+    expect(result.publishing.createdCohort.real.total).toBe(1);
+    expect(result.publishing.createdCohort.simulated.total).toBe(1);
     expect(result.interactions).toEqual({ occurredInMonth: 1, importedInMonth: 1, lateImportedForMonth: 1 });
     expect(result.leads).toMatchObject({ recordsCreatedInMonth: 1, highOrUrgentAsOf: 1 });
     expect(result.metrics.real.samples.find((sample) => sample.key === "impressions")?.value).toBeNull();

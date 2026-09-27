@@ -1,5 +1,6 @@
-import type { Client, MetricSnapshot, Prisma, PublishJobStatus } from "@prisma/client";
-import { canonicalizeMetricKey } from "./analytics-service";
+import type { Client, LeadCategory, MetricSnapshot, Prisma, PublishJobStatus } from "@prisma/client";
+import { canonicalizeMetricKey, resolveFreshness } from "./analytics-service";
+import { getPlatformRegistry } from "./platform-registry-service";
 import { AppError } from "../lib/errors";
 import { assertValidTimeZone } from "../lib/timezone";
 import { resolveAccountPublishingMode } from "../lib/manual-account";
@@ -72,6 +73,10 @@ function countsForPublished(jobs: Array<{ adapter: string; simulated: boolean; e
 const publishStatuses: PublishJobStatus[] = [
   "PENDING", "MANUAL_PENDING", "RUNNING", "RETRY", "WAITING_CONFIGURATION",
   "PUBLISHED", "FAILED", "UNKNOWN", "CANCELLED",
+];
+const leadCategories: LeadCategory[] = [
+  "PROCUREMENT", "WHOLESALE", "INQUIRY", "CATALOG_REQUEST",
+  "SUPPLY_REQUEST", "GENERAL", "SPAM",
 ];
 
 type MetricRow = MetricSnapshot & { account: { clientId: string; platform: string } };
@@ -151,7 +156,7 @@ export async function buildMonthlyReviewFactsV1(
 ): Promise<MonthlyReviewFactsV1> {
   const period = resolveMonthlyReviewPeriod(month, client.timezone, asOf);
   const window = { gte: period.start, lt: period.effectiveEnd };
-  const [published, cohort, occurredInMonth, importedInMonth, lateImportedForMonth, leads, metricRows, selectedAccounts] = await Promise.all([
+  const [published, cohort, occurredInMonth, importedInMonth, lateImportedForMonth, leads, metricRows, selectedAccounts, syncStates] = await Promise.all([
     tx.publishJob.findMany({
       where: {
         clientId: client.id, account: { clientId: client.id }, contentVersion: { clientId: client.id },
@@ -164,7 +169,7 @@ export async function buildMonthlyReviewFactsV1(
         clientId: client.id, account: { clientId: client.id },
         contentVersion: { clientId: client.id }, createdAt: window,
       },
-      select: { status: true },
+      select: { status: true, environment: true, simulated: true },
     }),
     tx.interaction.count({
       where: {
@@ -193,7 +198,7 @@ export async function buildMonthlyReviewFactsV1(
           OR: [{ accountId: null }, { account: { clientId: client.id } }],
         },
       },
-      select: { priority: true, handoffStatus: true },
+      select: { priority: true, handoffStatus: true, category: true, salesFeedback: true },
     }),
     tx.metricSnapshot.findMany({
       where: {
@@ -211,15 +216,29 @@ export async function buildMonthlyReviewFactsV1(
       where: { clientId: client.id, isSelected: true, createdAt: { lte: asOf } },
       select: { id: true, platform: true, metadata: true },
     }),
+    tx.analyticsSyncState.findMany({
+      where: {
+        clientId: client.id, scope: "metrics", accountId: { not: null },
+        createdAt: { lte: asOf }, updatedAt: { lte: asOf },
+      },
+      orderBy: [{ updatedAt: "desc" }, { id: "desc" }],
+    }),
   ]);
   const publishingCounts = countsForPublished(published);
-  const statuses = Object.fromEntries(publishStatuses.map((status) => [status, 0])) as Record<PublishJobStatus, number>;
-  for (const job of cohort) statuses[job.status] += 1;
+  const realCohortStatuses = Object.fromEntries(publishStatuses.map((status) => [status, 0])) as Record<PublishJobStatus, number>;
+  const simulatedCohortStatuses = Object.fromEntries(publishStatuses.map((status) => [status, 0])) as Record<PublishJobStatus, number>;
+  for (const job of cohort) {
+    (job.environment === "LIVE" && !job.simulated ? realCohortStatuses : simulatedCohortStatuses)[job.status] += 1;
+  }
+  const realCohortTotal = Object.values(realCohortStatuses).reduce((sum, value) => sum + value, 0);
+  const simulatedCohortTotal = Object.values(simulatedCohortStatuses).reduce((sum, value) => sum + value, 0);
   const handoffStatuses = {
     NEW: 0, REPLIED: 0, HANDED_OFF: 0,
     WAITING_FEEDBACK: 0, CLOSED: 0, DISMISSED: 0,
   };
   for (const lead of leads) handoffStatuses[lead.handoffStatus] += 1;
+  const categoryCounts = Object.fromEntries(leadCategories.map((category) => [category, 0])) as Record<LeadCategory, number>;
+  for (const lead of leads) categoryCounts[lead.category] += 1;
   const metricSamples = monthlyMetricRows(metricRows, period);
   const selectedAccountIds = new Set(selectedAccounts.map((account) => account.id));
   const selectedApiAccountIds = new Set(selectedAccounts
@@ -227,6 +246,26 @@ export async function buildMonthlyReviewFactsV1(
     .map((account) => account.id));
   const realAccountIds = new Set(metricSamples.real.samples.map((sample) => sample.accountId).filter((id) => selectedAccountIds.has(id)));
   const mockAccountIds = new Set(metricSamples.mock.samples.map((sample) => sample.accountId).filter((id) => selectedAccountIds.has(id)));
+  const registry = getPlatformRegistry();
+  const selectedMetricsAccounts = selectedAccounts
+    .filter((account) => resolveAccountPublishingMode(account) === "API"
+      && Boolean(registry.getByPlatform(account.platform)?.definition.capabilities.includes("METRICS")))
+    .sort((left, right) => left.platform.localeCompare(right.platform) || left.id.localeCompare(right.id));
+  const syncByAccount = new Map(syncStates.filter((state) => state.accountId).map((state) => [state.accountId!, state]));
+  const syncAccounts = selectedMetricsAccounts.map((account) => {
+    const state = syncByAccount.get(account.id);
+    const status = !state ? "MISSING" as const
+      : state.status === "STALE" ? "STALE" as const
+        : resolveFreshness({ status: state.status, latestFetchedAt: state.lastSucceededAt, now: asOf }).toUpperCase() as "FRESH" | "STALE" | "SYNCING" | "FAILED";
+    return {
+      accountId: account.id, platform: account.platform, status,
+      lastStartedAt: state?.lastStartedAt?.toISOString() || null,
+      lastSucceededAt: state?.lastSucceededAt?.toISOString() || null,
+      lastFailedAt: state?.lastFailedAt?.toISOString() || null,
+    };
+  });
+  const syncCounts = { FRESH: 0, STALE: 0, SYNCING: 0, FAILED: 0, MISSING: 0 };
+  for (const account of syncAccounts) syncCounts[account.status] += 1;
   const metrics = {
     ...metricSamples,
     accountCoverage: {
@@ -237,12 +276,19 @@ export async function buildMonthlyReviewFactsV1(
       mockAccountCount: mockAccountIds.size,
       missingRealApiAccountCount: [...selectedApiAccountIds].filter((id) => !realAccountIds.has(id)).length,
     },
+    syncHealth: {
+      asOf: asOf.toISOString(), scope: "metrics" as const,
+      accounts: syncAccounts, counts: syncCounts,
+    },
   };
   const limitations: string[] = [];
   if (period.partial) limitations.push("当前月份为截至生成时间的部分月份，不能当作完整月比较。");
-  if (publishingCounts.simulated.total || metrics.mockRawSnapshotCount) {
+  if (publishingCounts.simulated.total || simulatedCohortTotal || metrics.mockRawSnapshotCount) {
     limitations.push("模拟发布与 MOCK 指标单独列示，不能当作真实平台表现。");
   }
+  if (syncCounts.FAILED) limitations.push("部分已选 API 指标账号的当前同步状态为 FAILED；这与本月指标样本的可用性和采集新鲜度分开记录。");
+  if (syncCounts.SYNCING) limitations.push("部分已选 API 指标账号当前正在同步；本报告不把同步中解释为已完成采集。");
+  if (syncCounts.MISSING) limitations.push("部分已选 API 指标账号没有 metrics 同步状态记录；MISSING 不等于 FAILED。");
   if (!metrics.real.samples.length) limitations.push("本月没有可用的 REAL canonical metric 样本；缺失不等于 0。");
   if (metrics.accountCoverage.missingRealApiAccountCount) {
     limitations.push("生成时部分当前已选 API 账号没有本月 REAL canonical metric 样本；API 指标账号覆盖不完整，人工账号不计入期望分母。");
@@ -261,9 +307,9 @@ export async function buildMonthlyReviewFactsV1(
   if (!client.targetMarkets.length) limitations.push("客户默认目标市场未设置，报告不推断市场表现。");
   const observations = [
     `本月已记录真实发布 ${publishingCounts.real.total} 条，模拟发布 ${publishingCounts.simulated.total} 条，按实际 publishedAt 归月。`,
-    `本月创建的发布任务中，生成时仍为 WAITING_CONFIGURATION ${statuses.WAITING_CONFIGURATION} 条、FAILED ${statuses.FAILED} 条、UNKNOWN ${statuses.UNKNOWN} 条；这是创建 cohort 的当前状态，不是本月状态转换次数。`,
+    `本月创建的发布任务中，真实 ${realCohortTotal} 条、模拟 ${simulatedCohortTotal} 条；生成时真实 UNKNOWN ${realCohortStatuses.UNKNOWN} 条、模拟 UNKNOWN ${simulatedCohortStatuses.UNKNOWN} 条。各状态属于创建 cohort 的当前快照，不是本月状态转换次数。`,
     `本月发生的互动 ${occurredInMonth} 条，本月导入的互动 ${importedInMonth} 条；两个口径不可相加。`,
-    `本月创建的 Lead 记录 ${leads.length} 条；记录创建数不表示合格线索或成交。`,
+    `本月创建的 Lead 记录 ${leads.length} 条，其中 ${leads.filter((lead) => Boolean(lead.salesFeedback?.trim())).length} 条截至生成时有非空销售反馈；记录创建数不表示合格线索或成交。`,
     `REAL canonical 指标有 ${metrics.real.samples.length} 个去重后的最新样本，MOCK 有 ${metrics.mock.samples.length} 个。`,
   ];
   return MonthlyReviewFactsV1Schema.parse({
@@ -275,12 +321,18 @@ export async function buildMonthlyReviewFactsV1(
     },
     publishing: {
       ...publishingCounts,
-      createdCohort: { asOf: period.asOf.toISOString(), total: cohort.length, statuses },
+      createdCohort: {
+        asOf: period.asOf.toISOString(),
+        real: { total: realCohortTotal, statuses: realCohortStatuses },
+        simulated: { total: simulatedCohortTotal, statuses: simulatedCohortStatuses },
+      },
     },
     interactions: { occurredInMonth, importedInMonth, lateImportedForMonth },
     leads: {
       recordsCreatedInMonth: leads.length,
       highOrUrgentAsOf: leads.filter((lead) => lead.priority === "HIGH" || lead.priority === "URGENT").length,
+      categoryCounts,
+      salesFeedbackPresentAsOf: leads.filter((lead) => Boolean(lead.salesFeedback?.trim())).length,
       handoffStatusesAsOf: handoffStatuses,
     },
     metrics,

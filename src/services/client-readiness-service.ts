@@ -3,6 +3,7 @@ import type { RequestContext } from "../lib/context";
 import { assessAssetExternalRead } from "../lib/adapters/storage";
 import { db } from "../lib/db";
 import { resolveAccountPublishingMode } from "../lib/manual-account";
+import { resolveFreshness } from "./analytics-service";
 import { getPlatformRegistry, resolveLivePublishingTarget } from "./platform-registry-service";
 
 export type ReadinessStatus = "READY" | "ATTENTION" | "BLOCKED" | "NOT_APPLICABLE";
@@ -65,7 +66,7 @@ const unresolvedJobStatuses = [PublishJobStatus.UNKNOWN, PublishJobStatus.WAITIN
 /** A read-only, client-scoped projection of current capabilities and unresolved work. */
 export async function getClientReadiness(context: RequestContext): Promise<ClientReadiness> {
   const assessedAt = new Date();
-  const [client, strategy, products, accounts, prompt, textIntegration, mediaAssets, activeContent, unresolvedJobs, latestRealMetric, openLeadRows] = await Promise.all([
+  const [client, strategy, products, accounts, prompt, textIntegration, mediaAssets, activeContent, unresolvedJobs, openLeadRows] = await Promise.all([
     db.client.findUniqueOrThrow({
       where: { id: context.clientId },
       select: { name: true, mode: true, timezone: true, targetMarkets: true, brandGuidelines: true, brandProfile: true },
@@ -127,14 +128,6 @@ export async function getClientReadiness(context: RequestContext): Promise<Clien
         contentVersion: { is: { clientId: context.clientId } },
       },
       select: { id: true, accountId: true, adapter: true, status: true },
-    }),
-    db.metricSnapshot.findFirst({
-      where: {
-        clientId: context.clientId, dataKind: "REAL", availability: "AVAILABLE", numericValue: { not: null },
-        account: { is: { clientId: context.clientId } },
-      },
-      orderBy: [{ fetchedAt: "desc" }, { id: "desc" }],
-      select: { fetchedAt: true },
     }),
     db.lead.findMany({
       where: {
@@ -236,18 +229,62 @@ export async function getClientReadiness(context: RequestContext): Promise<Clien
       waitingJobs.length ? "查看原因与下一步" : null, waitingJobs.length ? "/publishing?status=WAITING_CONFIGURATION" : null),
   ];
 
-  const realMetricFresh = latestRealMetric
-    && assessedAt.getTime() - latestRealMetric.fetchedAt.getTime() <= 24 * 60 * 60 * 1000;
+  const registry = getPlatformRegistry();
+  const analyticsAccounts = accounts.filter((account) => account.isSelected
+    && resolveAccountPublishingMode(account) === "API"
+    && registry.getByPlatform(account.platform)?.definition.capabilities.includes("METRICS"));
+  const analyticsAccountIds = analyticsAccounts.map((account) => account.id);
+  const [realMetricDates, metricSyncStates] = await Promise.all([
+    db.metricSnapshot.groupBy({
+      by: ["accountId"],
+      where: {
+        clientId: context.clientId, accountId: { in: analyticsAccountIds },
+        account: { is: { clientId: context.clientId } },
+        dataKind: "REAL", availability: "AVAILABLE", numericValue: { not: null },
+      },
+      _max: { fetchedAt: true },
+    }),
+    db.analyticsSyncState.findMany({
+      where: { clientId: context.clientId, scope: "metrics", accountId: { in: analyticsAccountIds } },
+      select: { accountId: true, status: true, lastSucceededAt: true },
+    }),
+  ]);
+  const latestRealByAccount = new Map(realMetricDates.map((row) => [row.accountId, row._max.fetchedAt]));
+  const syncByAccount = new Map(metricSyncStates.map((row) => [row.accountId, row]));
+  const analyticsHealth = { fresh: 0, stale: 0, syncStale: 0, syncing: 0, failed: 0, noData: 0, noSync: 0, capabilityUnverified: 0 };
+  for (const account of analyticsAccounts) {
+    const latestFetchedAt = latestRealByAccount.get(account.id) ?? null;
+    const syncState = syncByAccount.get(account.id) ?? null;
+    if (!latestFetchedAt) analyticsHealth.noData += 1;
+    if (!syncState) analyticsHealth.noSync += 1;
+    if (account.metricsCapability !== "VERIFIED") analyticsHealth.capabilityUnverified += 1;
+    // Data freshness and sync health are independent: a failed/syncing attempt
+    // must not erase an already collected REAL sample.
+    if (latestFetchedAt) {
+      if (resolveFreshness({ latestFetchedAt, now: assessedAt }) === "fresh") analyticsHealth.fresh += 1;
+      else analyticsHealth.stale += 1;
+    }
+    const syncHealth = syncState && resolveFreshness({
+      status: syncState.status, latestFetchedAt: syncState.lastSucceededAt, now: assessedAt,
+    });
+    if (syncHealth === "failed") analyticsHealth.failed += 1;
+    else if (syncHealth === "syncing") analyticsHealth.syncing += 1;
+    else if (syncState && (syncState.status === "STALE" || syncHealth === "stale")) analyticsHealth.syncStale += 1;
+  }
+  const analyticsReady = analyticsAccounts.length > 0
+    && analyticsHealth.failed === 0 && analyticsHealth.syncing === 0
+    && analyticsHealth.noData === 0 && analyticsHealth.noSync === 0
+    && analyticsHealth.stale === 0 && analyticsHealth.syncStale === 0
+    && analyticsHealth.capabilityUnverified === 0;
   const pendingLeadCount = openLeadRows.filter((lead) => lead.handoffStatus === "NEW" || lead.handoffStatus === "WAITING_FEEDBACK").length;
   const ongoingLeadCount = openLeadRows.length - pendingLeadCount;
   const followUp: ReadinessCheck[] = [
-    check("analytics-review", "Analytics Review", realMetricFresh ? "READY" : "ATTENTION",
-      !latestRealMetric
-        ? "当前没有可用 REAL 指标快照；缺失不能解释为 0，也不会阻断内容或发布运营。"
-        : realMetricFresh
-          ? "存在近 24 小时采集的可用 REAL 指标；数据新鲜度不表示表现好坏，复盘仍需检查覆盖范围。"
-          : "最近可用 REAL 指标已超过 24 小时；可继续运营，但复盘需要标明数据过期。",
-      "查看指标与数据范围", "/analytics"),
+    check("analytics-review", "Analytics Review", analyticsReady ? "READY" : "ATTENTION",
+      analyticsAccounts.length === 0
+        ? "当前没有已选且有 API METRICS 路径的账号；人工账号与未选账号的指标不作为此项就绪依据。缺失不等于 0，也不阻断内容或发布。"
+        : `当前 ${analyticsAccounts.length} 个已选 API 指标账号：近 24 小时 REAL 可用样本 ${analyticsHealth.fresh} 个、样本过期 ${analyticsHealth.stale} 个、无 REAL 可用样本 ${analyticsHealth.noData} 个；同步状态过期 ${analyticsHealth.syncStale} 个、同步失败 ${analyticsHealth.failed} 个、同步中 ${analyticsHealth.syncing} 个、无同步记录 ${analyticsHealth.noSync} 个、指标能力未验证 ${analyticsHealth.capabilityUnverified} 个。${analyticsHealth.failed ? "已有数据仍可查看，但当前指标同步失败。" : analyticsHealth.syncing ? "当前指标正在同步；已有数据仍可查看，不能据此判断同步失败。" : ""}已有 REAL 样本继续保留，同步状态不能解释为表现变化；这些维度可重叠，不阻断内容或发布。`,
+      analyticsAccounts.length === 0 ? "查看平台与账号" : "查看指标与同步状态",
+      analyticsAccounts.length === 0 ? "/accounts" : "/insights#metrics"),
     check("lead-handoff", "Lead Handoff", openLeadRows.length ? "ATTENTION" : "READY",
       openLeadRows.length
         ? `当前线索记录中 ${pendingLeadCount} 条处于 NEW / WAITING_FEEDBACK，${ongoingLeadCount} 条处于 REPLIED / HANDED_OFF；这些是交接状态，不代表商机质量。`
@@ -255,7 +292,6 @@ export async function getClientReadiness(context: RequestContext): Promise<Clien
       openLeadRows.length ? "处理线索" : null, openLeadRows.length ? "/insights#leads" : null),
   ];
 
-  const registry = getPlatformRegistry();
   const accountRows: AccountReadiness[] = accounts.map((account) => {
     const mode = resolveAccountPublishingMode(account);
     const definition = registry.getByPlatform(account.platform)?.definition;

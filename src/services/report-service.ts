@@ -119,7 +119,7 @@ export async function generateMonthlyOperationReport(context: RequestContext, mo
         dataLimitations: facts.limitations,
         hypotheses: [],
         recommendations: deriveMonthlyReviewNextActions(facts),
-        simulated: facts.publishing.simulated.total > 0 || facts.metrics.mockRawSnapshotCount > 0,
+        simulated: containsSimulatedMonthlyData(facts),
       },
     });
     await tx.auditLog.create({
@@ -136,17 +136,29 @@ export async function generateMonthlyOperationReport(context: RequestContext, mo
   }, { isolationLevel: Prisma.TransactionIsolationLevel.RepeatableRead });
 }
 
+export function containsSimulatedMonthlyData(facts: MonthlyReviewFactsV1): boolean {
+  return facts.publishing.simulated.total > 0 ||
+    facts.publishing.createdCohort.simulated.total > 0 ||
+    facts.metrics.mockRawSnapshotCount > 0;
+}
+
 /** Operational checks prompted by recorded gaps; these are not performance hypotheses. */
 export function deriveMonthlyReviewNextActions(facts: MonthlyReviewFactsV1): string[] {
   const actions: string[] = [];
   if (facts.metrics.accountCoverage.selectedApiAccountCount > 0 && (facts.metrics.real.samples.length === 0 || facts.metrics.accountCoverage.missingRealApiAccountCount > 0)) {
     actions.push("核查当前已选账号的真实指标连接、权限和本月采集覆盖，再决定能否比较表现。");
   }
-  if (facts.publishing.createdCohort.statuses.UNKNOWN > 0) {
-    actions.push("到发布中心逐条核对 UNKNOWN 任务的外部证据；不把不确定结果当作失败或重新发布依据。");
+  if (facts.metrics.syncHealth.counts.FAILED > 0) {
+    actions.push("核查当前 API 账号指标同步失败记录；同步失败是采集状态，不代表内容表现。");
   }
-  if (facts.publishing.createdCohort.statuses.WAITING_CONFIGURATION > 0) {
-    actions.push("核查 WAITING_CONFIGURATION 任务的连接和权限要求，再按现有发布流程处理。");
+  if (facts.metrics.syncHealth.counts.SYNCING > 0) {
+    actions.push("等待正在进行的指标同步完成，再核对本月数据覆盖；进行中不视为失败。");
+  }
+  if (facts.publishing.createdCohort.real.statuses.UNKNOWN > 0) {
+    actions.push("到发布中心逐条核对真实 UNKNOWN 任务的外部证据；不把不确定结果当作失败或重新发布依据。");
+  }
+  if (facts.publishing.createdCohort.real.statuses.WAITING_CONFIGURATION > 0) {
+    actions.push("核查真实 WAITING_CONFIGURATION 任务的连接和权限要求，再按现有发布流程处理。");
   }
   if (facts.interactions.lateImportedForMonth > 0) {
     actions.push("核对较晚导入互动的发生时间与导入时间，并记录采集延迟对本月覆盖的影响。");
