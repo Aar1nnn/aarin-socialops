@@ -176,6 +176,77 @@ describe("M1 manual publishing", () => {
     expect((await db.publishJob.findUniqueOrThrow({ where: { id: job.id } })).attemptCount).toBe(0);
   });
 
+  it("reconciles a started LIVE manual job after the client leaves LIVE without redispatch", async () => {
+    const f = await fixture();
+    const target = await account(f);
+    const item = await approvedContent(f, target.id);
+    const job = await schedulePublication(f.roles.OPERATOR, item.item.id, new Date(Date.now() + 86_400_000));
+    const startInput = { expectedContentVersionId: item.version.id, expectedJobStatus: "MANUAL_PENDING" };
+    await startManualPublish(f.roles.OPERATOR, job.id, startInput);
+    await db.client.update({ where: { id: f.client.id }, data: { mode: "DRAFT" } });
+    await expect(startManualPublish(f.roles.OPERATOR, job.id, startInput)).rejects.toMatchObject({ code: "LIVE_MODE_REQUIRED" });
+    const unknown = { expectedContentVersionId: item.version.id, expectedJobStatus: "RUNNING", outcome: "UNKNOWN", evidence: "External outcome still uncertain after the client mode changed." };
+    expect((await recordManualPublishResult(f.roles.OPERATOR, job.id, unknown)).status).toBe("UNKNOWN");
+    expect(await claimPublishJob(job.id, "manual-unknown-no-retry")).toBeNull();
+    await db.client.update({ where: { id: f.client.id }, data: { mode: "DEMO" } });
+    const failed = { expectedContentVersionId: item.version.id, expectedJobStatus: "UNKNOWN", outcome: "FAILED", evidence: "Operator checked the target platform and confirmed no external post was created.", confirmedNoExternalPost: true };
+    expect((await recordManualPublishResult(f.roles.OWNER, job.id, failed)).status).toBe("FAILED");
+    expect((await recordManualPublishResult(f.roles.OWNER, job.id, failed)).status).toBe("FAILED");
+    const finalJob = await db.publishJob.findUniqueOrThrow({ where: { id: job.id } });
+    expect(finalJob).toMatchObject({ status: "FAILED", adapter: "manual", environment: "LIVE", simulated: false, lockedAt: null, lockedBy: null, attemptCount: 0 });
+    expect((await db.contentItem.findUniqueOrThrow({ where: { id: item.item.id } })).status).toBe("FAILED");
+    expect(await db.manualTask.count({ where: { publishJobId: job.id, status: "COMPLETED" } })).toBe(1);
+    expect(await db.publishAttempt.count({ where: { publishJobId: job.id } })).toBe(0);
+    expect(await db.auditLog.count({ where: { clientId: f.client.id, entityId: job.id, action: "MANUAL_PUBLISH_STARTED" } })).toBe(1);
+    const resultAudits = await db.auditLog.findMany({ where: { clientId: f.client.id, entityId: job.id, action: "MANUAL_PUBLISH_RESULT_RECORDED" }, orderBy: { createdAt: "asc" } });
+    expect(resultAudits).toHaveLength(2);
+    expect(resultAudits.map((audit) => audit.metadata)).toEqual([
+      expect.objectContaining({ outcome: "UNKNOWN", previousStatus: "RUNNING" }),
+      expect.objectContaining({ outcome: "FAILED", previousStatus: "UNKNOWN", confirmedNoExternalPost: true }),
+    ]);
+  });
+
+  it.each([
+    { mode: "DRAFT" as const, outcome: "PUBLISHED" as const },
+    { mode: "DEMO" as const, outcome: "FAILED" as const },
+  ])("records direct $outcome after a started LIVE job changes to $mode", async ({ mode, outcome }) => {
+    const f = await fixture();
+    const target = await account(f);
+    const item = await approvedContent(f, target.id);
+    const job = await schedulePublication(f.roles.OPERATOR, item.item.id, new Date(Date.now() + 86_400_000));
+    await startManualPublish(f.roles.OPERATOR, job.id, { expectedContentVersionId: item.version.id, expectedJobStatus: "MANUAL_PENDING" });
+    await db.client.update({ where: { id: f.client.id }, data: { mode } });
+    const result = { expectedContentVersionId: item.version.id, expectedJobStatus: "RUNNING", outcome,
+      evidence: outcome === "PUBLISHED" ? "Operator verified the existing external post." : "Operator confirmed no external post was created.",
+      ...(outcome === "PUBLISHED" ? { publishedAt: new Date(Date.now() - 60_000).toISOString(), remotePostUrl: "https://example.test/posts/confirmed" } : { confirmedNoExternalPost: true }),
+    };
+    expect((await recordManualPublishResult(f.roles.OPERATOR, job.id, result)).status).toBe(outcome);
+    expect((await db.publishJob.findUniqueOrThrow({ where: { id: job.id } }))).toMatchObject({ environment: "LIVE", simulated: false, lockedBy: null, attemptCount: 0 });
+    expect(await db.publishAttempt.count({ where: { publishJobId: job.id } })).toBe(0);
+  });
+
+  it("rejects starting MANUAL_PENDING outside LIVE and validates the persisted result boundary", async () => {
+    const f = await fixture();
+    const target = await account(f);
+    const item = await approvedContent(f, target.id);
+    const job = await schedulePublication(f.roles.OPERATOR, item.item.id, new Date(Date.now() + 86_400_000));
+    const startInput = { expectedContentVersionId: item.version.id, expectedJobStatus: "MANUAL_PENDING" };
+    await db.client.update({ where: { id: f.client.id }, data: { mode: "DRAFT" } });
+    await expect(startManualPublish(f.roles.OPERATOR, job.id, startInput)).rejects.toMatchObject({ code: "LIVE_MODE_REQUIRED" });
+    await db.client.update({ where: { id: f.client.id }, data: { mode: "DEMO" } });
+    await expect(startManualPublish(f.roles.OPERATOR, job.id, startInput)).rejects.toMatchObject({ code: "LIVE_MODE_REQUIRED" });
+    expect((await db.publishJob.findUniqueOrThrow({ where: { id: job.id } })).status).toBe("MANUAL_PENDING");
+    expect(await db.auditLog.count({ where: { clientId: f.client.id, entityId: job.id, action: "MANUAL_PUBLISH_STARTED" } })).toBe(0);
+    await db.client.update({ where: { id: f.client.id }, data: { mode: "LIVE" } });
+    await startManualPublish(f.roles.OPERATOR, job.id, startInput);
+    const unknown = { expectedContentVersionId: item.version.id, expectedJobStatus: "RUNNING", outcome: "UNKNOWN", evidence: "Cannot confirm external outcome." };
+    await db.publishJob.update({ where: { id: job.id }, data: { environment: "SIMULATED" } });
+    await expect(recordManualPublishResult(f.roles.OPERATOR, job.id, unknown)).rejects.toMatchObject({ code: "NOT_LIVE_PUBLISH_JOB" });
+    await db.publishJob.update({ where: { id: job.id }, data: { environment: "LIVE", simulated: true } });
+    await expect(recordManualPublishResult(f.roles.OPERATOR, job.id, unknown)).rejects.toMatchObject({ code: "NOT_LIVE_PUBLISH_JOB" });
+    expect((await db.publishJob.findUniqueOrThrow({ where: { id: job.id } })).status).toBe("RUNNING");
+  });
+
   it("keeps manual dispatch immutable and uses the job adapter after account metadata changes", async () => {
     const f = await fixture();
     const target = await account(f);

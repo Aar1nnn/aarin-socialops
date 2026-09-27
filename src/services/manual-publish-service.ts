@@ -126,8 +126,7 @@ export async function recordManualPublishResult(context: RequestContext, jobId: 
   const input = manualResultSchema.parse(raw);
   return db.$transaction(async (tx) => {
     await tx.$queryRaw`SELECT "id" FROM "Client" WHERE "id" = ${context.clientId} FOR SHARE`;
-    const client = await tx.client.findUniqueOrThrow({ where: { id: context.clientId }, select: { mode: true, timezone: true } });
-    if (client.mode !== ClientMode.LIVE) throw new AppError("只有正式客户可记录真实人工发布结果。", 409, "LIVE_MODE_REQUIRED");
+    const client = await tx.client.findUniqueOrThrow({ where: { id: context.clientId }, select: { timezone: true } });
     if (input.timezone && input.timezone !== client.timezone) throw new AppError("客户时区已变化，请刷新。", 409, "SCHEDULE_TIMEZONE_MISMATCH");
     const publishedAt = input.publishedLocalDateTime
       ? zonedLocalDateTimeToUtc(input.publishedLocalDateTime, client.timezone)
@@ -136,6 +135,9 @@ export async function recordManualPublishResult(context: RequestContext, jobId: 
     const fingerprint = resultFingerprint(input, publishedAt);
 
     const job = await lockManualJob(tx, context, jobId);
+    if (job.environment !== "LIVE" || job.simulated) {
+      throw new AppError("只有真实人工发布任务可记录外部结果。", 409, "NOT_LIVE_PUBLISH_JOB");
+    }
     if (job.contentVersionId !== input.expectedContentVersionId) {
       throw new AppError("发布内容版本已变化，请刷新。", 409, "VERSION_CONFLICT");
     }
