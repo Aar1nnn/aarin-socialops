@@ -1,0 +1,21 @@
+.filters { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 12px; align-items: end; }
+.header { min-width: 0; overflow-wrap: anywhere; }
+.filters > * { min-width: 0; }
+.tiles { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(100%, 230px), 1fr)); gap: 14px; }
+.tile { display: grid; grid-template-rows: 150px 1fr; min-width: 0; overflow: hidden; border: 1px solid var(--color-border); border-radius: var(--radius-md); background: var(--color-surface); }
+.preview { display: grid; place-items: center; overflow: hidden; background: var(--color-surface-subtle); color: var(--color-text-secondary); }
+.preview img { width: 100%; height: 100%; object-fit: cover; }
+.tileBody { display: grid; gap: 8px; min-width: 0; padding: 14px; }
+.tileBody strong, .detailName { overflow-wrap: anywhere; }
+.tileMeta { display: flex; flex-wrap: wrap; gap: 5px 10px; color: var(--color-text-secondary); font-size: 12px; }
+.detailGrid { display: grid; grid-template-columns: minmax(0, 1.5fr) minmax(260px, 1fr); gap: 18px; align-items: start; }
+.detailGrid > * { min-width: 0; }
+.detailPreview { display: grid; place-items: center; min-height: 200px; max-height: 420px; overflow: hidden; border: 1px solid var(--color-border); border-radius: var(--radius-sm); background: var(--color-surface-subtle); }
+.detailPreview img, .detailPreview video { display: block; max-width: 100%; max-height: 420px; object-fit: contain; }
+.pairs { display: grid; grid-template-columns: minmax(100px, 0.4fr) minmax(0, 1fr); gap: 8px 16px; margin: 0; }
+.pairs dt { color: var(--color-text-secondary); }
+.pairs dd { min-width: 0; margin: 0; overflow-wrap: anywhere; }
+.pager { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 12px; }
+.linkList { display: grid; gap: 8px; margin: 0; padding-left: 20px; overflow-wrap: anywhere; }
+@media (max-width: 1100px) { .filters { grid-template-columns: repeat(3, minmax(0, 1fr)); } }
+@media (max-width: 700px) { .filters, .detailGrid { grid-template-columns: minmax(0, 1fr); } .pairs { grid-template-columns: minmax(0, 1fr); gap: 2px; } .pairs dd { margin-bottom: 10px; } }

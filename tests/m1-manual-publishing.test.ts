@@ -267,7 +267,7 @@ describe("M1 manual publishing", () => {
     await expect(editContentVersion(f.roles.OPERATOR, item.item.id, { expectedVersionId: item.version.id, text: "Unsafe replacement" })).rejects.toMatchObject({ code: "PUBLISH_IN_PROGRESS" });
     await expect(submitForReview(f.roles.OPERATOR, item.item.id, item.version.id)).rejects.toMatchObject({ code: "PUBLISH_IN_PROGRESS" });
     await expect(reviewContent(f.roles.OWNER, item.item.id, "APPROVED", "Repeat", item.version.id)).rejects.toMatchObject({ code: "NOT_REVIEW_PENDING" });
-    const productUpdate = { name: f.product.name, fields: [{ key: "material", value: "replacement", status: "CONFIRMED", source: "new sheet" }] };
+    const productUpdate = { name: f.product.name, expectedDataVersion: f.product.dataVersion, fields: [{ key: "material", value: "replacement", status: "CONFIRMED", source: "new sheet" }] };
     await expect(updateProductFacts(f.roles.OWNER, f.product.id, productUpdate)).rejects.toMatchObject({ code: "PUBLISH_IN_PROGRESS" });
     expect((await db.publishJob.findUniqueOrThrow({ where: { id: job.id } })).status).toBe("RUNNING");
     expect((await db.contentItem.findUniqueOrThrow({ where: { id: item.item.id } })).status).toBe("RUNNING");

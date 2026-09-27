@@ -15,7 +15,7 @@ export async function buildBrandContext(context: RequestContext) {
 export async function buildProductContext(context: RequestContext, productId: string) {
   const product = await db.product.findFirst({
     where: { id: productId, clientId: context.clientId },
-    include: { fields: true },
+    include: { fields: { where: { clientId: context.clientId } } },
   });
   if (!product) throw new AppError("产品不存在或无权访问。", 404, "PRODUCT_NOT_FOUND");
   return {

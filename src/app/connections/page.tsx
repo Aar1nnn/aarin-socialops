@@ -12,6 +12,7 @@ import { db } from "@/lib/db";
 import { formatDateTime, platformLabel, statusLabel } from "@/lib/presentation/status";
 import { listPlatformConnections } from "@/services/platform-connection-service";
 import { MANUAL_PLATFORMS, manualAccountProfileUrl, resolveAccountPublishingMode } from "@/lib/manual-account";
+import { AccountSelectionForm } from "./account-selection-form";
 
 const accountTypeLabels: Record<string, string> = {
   FACEBOOK_PAGE: "Facebook Page",
@@ -60,15 +61,18 @@ export default async function ConnectionsPage() {
     <OperatorShell context={context}>
       <div className="page">
         <PageHeader
-          title="平台与账号"
-          description="查看账号可用性，并管理平台连接与授权。"
+          title="连接与授权"
+          description="管理 Meta 授权、账号发现和选择；账号运营状态请在账号页查看。"
           action={(
-            <form action="/api/connections/meta/start" method="post">
-              <input type="hidden" name="returnTo" value="/connections" />
-              <Button disabled={!canManageConnections} title={!canManageConnections ? "只有工作区所有者可管理平台连接" : undefined}>
-                {hasMetaConnection ? "重新连接 Meta" : "连接 Meta"}
-              </Button>
-            </form>
+            <div className="actions">
+              <a href="/accounts" className="button button-secondary button-md">账号运营视图</a>
+              <form action="/api/connections/meta/start" method="post">
+                <input type="hidden" name="returnTo" value="/connections" />
+                <Button disabled={!canManageConnections} title={!canManageConnections ? "只有工作区所有者可管理平台连接" : undefined}>
+                  {hasMetaConnection ? "重新连接 Meta" : "连接 Meta"}
+                </Button>
+              </form>
+            </div>
           )}
         />
 
@@ -165,7 +169,11 @@ export default async function ConnectionsPage() {
                       description="请检查 Meta 授权范围、Page 角色和应用模式后重新连接。"
                     />
                   ) : (
-                    <form action={`/api/connections/${connection.id}/select-accounts`} method="post" className="stack">
+                    <AccountSelectionForm connectionId={connection.id}>
+                      <input type="hidden" name="selectionSnapshotPresent" value="yes" />
+                      {connection.accounts.filter((account) => account.isSelected).map((account) => (
+                        <input key={`expected-${account.id}`} type="hidden" name="expectedSelectedAccountIds" value={account.id} />
+                      ))}
                       {connection.accounts.map((account) => (
                         <label className="account-option" key={account.id}>
                           <input
@@ -209,7 +217,7 @@ export default async function ConnectionsPage() {
                       <div className="actions">
                         <Button type="submit" size="sm" disabled={!canSelectAccounts}>保存账号选择</Button>
                       </div>
-                    </form>
+                    </AccountSelectionForm>
                   )}
                 </div>
 
@@ -334,7 +342,7 @@ export default async function ConnectionsPage() {
         </section>
 
         <Notice title="当前能力范围">
-          Meta 已支持授权、Facebook Page 与关联 Instagram 账号发现，以及 Facebook Page 发布和数据同步。Instagram 发布、自动回复和私信仍未开放。
+          Meta 已支持授权及 Facebook Page、关联 Instagram 账号发现。发布、指标和互动请分别查看账号能力状态；自动回复和私信仍未开放。
         </Notice>
       </div>
     </OperatorShell>

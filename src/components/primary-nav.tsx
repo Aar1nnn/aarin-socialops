@@ -13,7 +13,8 @@ const NAV_GROUPS = [
   ] },
   { label: "资产", items: [
     { href: "/brand", label: "品牌与知识", icon: "brand" },
-    { href: "/products", label: "产品与素材", icon: "products" },
+    { href: "/products", label: "产品", icon: "products" },
+    { href: "/assets", label: "素材库", icon: "assets" },
   ] },
   { label: "互动与分析", items: [
     { href: "/insights", label: "互动与线索", icon: "data" },
@@ -34,6 +35,7 @@ function NavIcon({ name }: { name: NavIconName }) {
   if (name === "calendar") return <svg {...common} aria-hidden="true"><path d="M5 4h14a2 2 0 0 1 2 2v14H3V6a2 2 0 0 1 2-2ZM3 9h18M8 2v4M16 2v4" /></svg>;
   if (name === "publishing") return <svg {...common} aria-hidden="true"><path d="M4 5h16v14H4zM7 9h10M7 13h7M7 17h5" /></svg>;
   if (name === "products") return <svg {...common} aria-hidden="true"><path d="m4 7 8-4 8 4-8 4zM4 7v10l8 4 8-4V7M12 11v10" /></svg>;
+  if (name === "assets") return <svg {...common} aria-hidden="true"><rect x="3" y="4" width="18" height="16" rx="2" /><circle cx="8" cy="9" r="1.5" /><path d="m4 17 5-5 3 3 3-4 5 6" /></svg>;
   if (name === "brand") return <svg {...common} aria-hidden="true"><path d="M12 3 4 7v10l8 4 8-4V7l-8-4ZM8 11h8M8 15h5" /></svg>;
   if (name === "analytics") return <svg {...common} aria-hidden="true"><path d="M4 20V10M10 20V4M16 20v-7M22 20H2" /></svg>;
   if (name === "data") return <svg {...common} aria-hidden="true"><path d="M4 19V9M10 19V5M16 19v-7M22 19H2" /></svg>;

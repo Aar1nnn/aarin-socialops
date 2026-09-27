@@ -41,7 +41,7 @@ export async function generateContentPlan(context: RequestContext, raw: unknown,
   const requestedAccountIds = input.accountIds ? [...new Set(input.accountIds)] : undefined;
   const product = await db.product.findFirst({
     where: { id: input.productId, clientId: context.clientId },
-    include: { fields: true, assetLinks: true },
+    include: { fields: { where: { clientId: context.clientId } }, assetLinks: true },
   });
   if (!product) throw new AppError("产品不存在或无权访问。", 404, "PRODUCT_NOT_FOUND");
   const assetIds = input.assetIds.length ? input.assetIds : product.assetLinks.map((link) => link.assetId);
@@ -858,7 +858,7 @@ async function getScopedItem(
     where: { id: contentItemId, clientId: context.clientId },
     include: {
       account: { include: { facebookConnection: true, platformConnection: true } },
-      plan: { include: { product: { include: { fields: true } } } },
+      plan: { include: { product: { include: { fields: { where: { clientId: context.clientId } } } } } },
       currentVersion: {
         include: { assetLinks: { include: { asset: { include: { productLinks: true } } } } },
       },

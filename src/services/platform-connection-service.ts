@@ -1,5 +1,5 @@
 import { randomBytes } from "node:crypto";
-import { CapabilityStatus, type Prisma, type Provider } from "@prisma/client";
+import { CapabilityStatus, Prisma, PublishJobStatus, type Provider } from "@prisma/client";
 import { createMetaAuthAdapter, REQUIRED_META_CONNECTION_SCOPES } from "../lib/adapters/meta-auth";
 import { PlatformAuthError, type PlatformAuthAdapter } from "../lib/adapters/platform-auth";
 import { assertOwner, type RequestContext } from "../lib/context";
@@ -10,6 +10,64 @@ import { safeErrorMessage, TokenVault, type EncryptedSecret } from "../lib/token
 import { getPlatformRegistry } from "./platform-registry-service";
 
 const OAUTH_STATE_TTL_MS = 10 * 60 * 1000;
+const ACTIVE_API_JOB_STATUSES: PublishJobStatus[] = [
+  PublishJobStatus.PENDING,
+  PublishJobStatus.RETRY,
+  PublishJobStatus.WAITING_CONFIGURATION,
+  PublishJobStatus.RUNNING,
+  PublishJobStatus.UNKNOWN,
+];
+
+export function normalizeAccountIdSet(values: string[]): string[] {
+  return [...new Set(values.map((value) => value.normalize("NFKC").trim()).filter(Boolean))].sort();
+}
+
+async function lockClient(tx: Prisma.TransactionClient, clientId: string) {
+  const rows = await tx.$queryRaw<Array<{ id: string }>>`
+    SELECT "id" FROM "Client" WHERE "id" = ${clientId} FOR UPDATE
+  `;
+  if (!rows.length) throw new AppError("客户不存在或无权访问。", 404, "CLIENT_NOT_FOUND");
+}
+
+async function lockConnection(tx: Prisma.TransactionClient, clientId: string, connectionId: string) {
+  const rows = await tx.$queryRaw<Array<{ id: string }>>`
+    SELECT "id" FROM "PlatformConnection"
+    WHERE "id" = ${connectionId} AND "clientId" = ${clientId} FOR UPDATE
+  `;
+  if (!rows.length) throw new AppError("平台连接不存在或无权访问。", 404, "PLATFORM_CONNECTION_NOT_FOUND");
+  return tx.platformConnection.findUniqueOrThrow({ where: { id: connectionId } });
+}
+
+async function lockAccountIds(tx: Prisma.TransactionClient, clientId: string, ids: string[]) {
+  if (!ids.length) return;
+  await tx.$queryRaw`
+    SELECT "id" FROM "SocialAccount"
+    WHERE "clientId" = ${clientId} AND "id" IN (${Prisma.join(ids)})
+    ORDER BY "id" FOR UPDATE
+  `;
+}
+
+async function assertNoActiveApiJobs(tx: Prisma.TransactionClient, clientId: string, accountIds: string[]) {
+  if (!accountIds.length) return;
+  const blocked = await tx.publishJob.findFirst({
+    where: {
+      clientId,
+      accountId: { in: accountIds },
+      adapter: { not: "manual" },
+      environment: "LIVE",
+      simulated: false,
+      status: { in: ACTIVE_API_JOB_STATUSES },
+    },
+    select: { status: true },
+  });
+  if (blocked) {
+    throw new AppError(
+      `受影响账号仍有 ${blocked.status} API 发布任务。请先在发布中心处理现有任务，再修改账号连接或选择。`,
+      409,
+      "ACCOUNT_ACTIVE_PUBLISH_JOBS",
+    );
+  }
+}
 
 export async function startPlatformConnection(
   context: RequestContext,
@@ -80,6 +138,29 @@ export async function completePlatformConnection(
     const accessSecret = vault.encrypt(tokenSet.accessToken);
     const refreshSecret = tokenSet.refreshToken ? vault.encrypt(tokenSet.refreshToken) : null;
     const connection = await db.$transaction(async (tx) => {
+      await lockClient(tx, context.clientId);
+      const existing = await tx.platformConnection.findUnique({
+        where: {
+          clientId_provider_externalPrincipalId: {
+            clientId: context.clientId,
+            provider,
+            externalPrincipalId: discovery.externalPrincipalId,
+          },
+        },
+      });
+      if (existing) await lockConnection(tx, context.clientId, existing.id);
+      const affectedAccounts = await tx.socialAccount.findMany({
+        where: {
+          clientId: context.clientId,
+          OR: [
+            ...(existing ? [{ platformConnectionId: existing.id }] : []),
+            ...discovery.accounts.map((account) => ({ platform: account.platform, externalAccountId: account.externalAccountId })),
+          ],
+        },
+        select: { id: true },
+      });
+      await lockAccountIds(tx, context.clientId, affectedAccounts.map((account) => account.id));
+      await assertNoActiveApiJobs(tx, context.clientId, affectedAccounts.map((account) => account.id));
       const missingScopes = REQUIRED_META_CONNECTION_SCOPES.filter(
         (scope) => !discovery.grantedScopes.includes(scope),
       );
@@ -222,17 +303,45 @@ export async function completePlatformConnection(
   }
 }
 
-export async function selectPlatformAccounts(context: RequestContext, connectionId: string, accountIds: string[]) {
+export async function selectPlatformAccounts(
+  context: RequestContext,
+  connectionId: string,
+  accountIds: string[],
+  expectedSelectedAccountIds: string[],
+) {
   assertOwner(context);
-  const uniqueIds = [...new Set(accountIds)];
+  const uniqueIds = normalizeAccountIdSet(accountIds);
   if (!uniqueIds.length) throw new AppError("至少选择一个账号。", 400, "ACCOUNT_SELECTION_REQUIRED");
-  const connection = await requireScopedConnection(context, connectionId);
-  const accounts = await db.socialAccount.findMany({
-    where: { id: { in: uniqueIds }, clientId: context.clientId, platformConnectionId: connection.id },
-  });
-  if (accounts.length !== uniqueIds.length) throw new AppError("包含不存在或其他客户的账号。", 403, "ACCOUNT_SCOPE_VIOLATION");
-
   await db.$transaction(async (tx) => {
+    await lockClient(tx, context.clientId);
+    const connection = await lockConnection(tx, context.clientId, connectionId);
+    if (connection.status !== "CONNECTED") {
+      throw new AppError("平台连接当前不可用，请重新连接后再选择账号。", 409, "PLATFORM_CONNECTION_NOT_READY");
+    }
+    const accounts = await tx.socialAccount.findMany({
+      where: { clientId: context.clientId, platformConnectionId: connection.id },
+      orderBy: { id: "asc" },
+    });
+    await lockAccountIds(tx, context.clientId, accounts.map((account) => account.id));
+    const currentSelected = normalizeAccountIdSet(accounts.filter((account) => account.isSelected).map((account) => account.id));
+    if (currentSelected.join("\u0000") !== normalizeAccountIdSet(expectedSelectedAccountIds).join("\u0000")) {
+      throw new AppError("账号选择已被其他人更新，请刷新页面后重试。", 409, "ACCOUNT_SELECTION_CONFLICT");
+    }
+    if (uniqueIds.some((id) => !accounts.some((account) => account.id === id))) {
+      throw new AppError("包含不存在或其他客户的账号。", 403, "ACCOUNT_SCOPE_VIOLATION");
+    }
+    const selectedSet = new Set(uniqueIds);
+    const affectedIds = accounts.filter((account) => {
+      if (!selectedSet.has(account.id)) return account.isSelected
+        || account.publishCapability !== CapabilityStatus.UNVERIFIED
+        || account.metricsCapability !== CapabilityStatus.UNVERIFIED
+        || account.commentsCapability !== CapabilityStatus.UNVERIFIED;
+      const capability = selectedCapabilityData(connection.provider, account);
+      return (account.publishCapability === CapabilityStatus.VERIFIED && capability.publishCapability !== CapabilityStatus.VERIFIED)
+        || (account.metricsCapability === CapabilityStatus.VERIFIED && capability.metricsCapability !== CapabilityStatus.VERIFIED)
+        || (account.commentsCapability === CapabilityStatus.VERIFIED && capability.commentsCapability !== CapabilityStatus.VERIFIED);
+    }).map((account) => account.id);
+    await assertNoActiveApiJobs(tx, context.clientId, affectedIds);
     await tx.socialAccount.updateMany({
       where: { clientId: context.clientId, platformConnectionId: connection.id, id: { notIn: uniqueIds } },
       data: {
@@ -242,33 +351,12 @@ export async function selectPlatformAccounts(context: RequestContext, connection
         commentsCapability: CapabilityStatus.UNVERIFIED,
       },
     });
-    for (const account of accounts) {
-      const capabilities = (account.providerCapabilities || {}) as Record<string, unknown>;
-      const definition = getPlatformRegistry().get(connection.provider, account.platform).definition;
-      const publishingImplemented = definition.capabilities.includes("PUBLISH");
-      const metricsImplemented = definition.capabilities.includes("METRICS");
-      const commentsImplemented = definition.capabilities.includes("COMMENTS");
-      const publishVerified = publishingImplemented && capabilities.canPublish === true;
+    for (const account of accounts.filter((account) => selectedSet.has(account.id))) {
       await tx.socialAccount.update({
         where: { id: account.id },
         data: {
           isSelected: true,
-          publishCapability: publishVerified
-            ? CapabilityStatus.VERIFIED
-            : publishingImplemented
-              ? CapabilityStatus.UNVERIFIED
-              : CapabilityStatus.UNSUPPORTED,
-          metricsCapability: metricsImplemented
-            ? capabilities.canReadMetrics === true
-              ? CapabilityStatus.VERIFIED
-              : CapabilityStatus.UNVERIFIED
-            : CapabilityStatus.UNSUPPORTED,
-          commentsCapability: commentsImplemented
-            ? capabilities.canReadComments === true
-              ? CapabilityStatus.VERIFIED
-              : CapabilityStatus.UNVERIFIED
-            : CapabilityStatus.UNSUPPORTED,
-          verifiedAt: publishVerified ? new Date() : null,
+          ...selectedCapabilityData(connection.provider, account),
         },
       });
     }
@@ -283,7 +371,22 @@ export async function selectPlatformAccounts(context: RequestContext, connection
       },
     });
   });
-  return listScopedConnection(context, connection.id);
+  return listScopedConnection(context, connectionId);
+}
+
+function selectedCapabilityData(provider: Provider, account: { platform: string; providerCapabilities: Prisma.JsonValue | null }) {
+  const capabilities = (account.providerCapabilities || {}) as Record<string, unknown>;
+  const definition = getPlatformRegistry().get(provider, account.platform).definition;
+  const publishingImplemented = definition.capabilities.includes("PUBLISH");
+  const metricsImplemented = definition.capabilities.includes("METRICS");
+  const commentsImplemented = definition.capabilities.includes("COMMENTS");
+  const publishVerified = publishingImplemented && capabilities.canPublish === true;
+  return {
+    publishCapability: publishVerified ? CapabilityStatus.VERIFIED : publishingImplemented ? CapabilityStatus.UNVERIFIED : CapabilityStatus.UNSUPPORTED,
+    metricsCapability: metricsImplemented ? capabilities.canReadMetrics === true ? CapabilityStatus.VERIFIED : CapabilityStatus.UNVERIFIED : CapabilityStatus.UNSUPPORTED,
+    commentsCapability: commentsImplemented ? capabilities.canReadComments === true ? CapabilityStatus.VERIFIED : CapabilityStatus.UNVERIFIED : CapabilityStatus.UNSUPPORTED,
+    verifiedAt: publishVerified ? new Date() : null,
+  };
 }
 
 export async function disconnectPlatformConnection(
@@ -292,26 +395,17 @@ export async function disconnectPlatformConnection(
   overrides: { adapter?: PlatformAuthAdapter; vault?: TokenVault } = {},
 ) {
   assertOwner(context);
-  const connection = await requireScopedConnection(context, connectionId);
-  let revokeWarning: string | null = null;
-  if (connection.accessTokenCiphertext && connection.accessTokenIv && connection.accessTokenAuthTag) {
-    try {
-      const vault = overrides.vault || TokenVault.fromEnvironment();
-      const token = vault.decrypt({
-        ciphertext: connection.accessTokenCiphertext,
-        iv: connection.accessTokenIv,
-        authTag: connection.accessTokenAuthTag,
-        keyVersion: connection.tokenKeyVersion,
-      });
-      const adapter = overrides.adapter || getAuthAdapter(connection.provider);
-      if (adapter.revoke) await adapter.revoke(token);
-    } catch (error) {
-      revokeWarning = normalizeAuthFailure(error).code;
-    }
-  }
-  await db.$transaction([
-    db.platformConnection.update({
-      where: { id: connection.id },
+  const connection = await db.$transaction(async (tx) => {
+    await lockClient(tx, context.clientId);
+    const scoped = await lockConnection(tx, context.clientId, connectionId);
+    const accounts = await tx.socialAccount.findMany({
+      where: { clientId: context.clientId, platformConnectionId: connectionId },
+      select: { id: true },
+    });
+    await lockAccountIds(tx, context.clientId, accounts.map((account) => account.id));
+    await assertNoActiveApiJobs(tx, context.clientId, accounts.map((account) => account.id));
+    await tx.platformConnection.update({
+      where: { id: scoped.id },
       data: {
         status: "DISCONNECTED",
         accessTokenCiphertext: null,
@@ -320,12 +414,12 @@ export async function disconnectPlatformConnection(
         refreshTokenCiphertext: null,
         refreshTokenIv: null,
         refreshTokenAuthTag: null,
-        lastErrorCode: revokeWarning,
-        lastErrorMessage: revokeWarning ? "远端撤销未确认；本地凭据已清除。" : null,
+        lastErrorCode: null,
+        lastErrorMessage: null,
       },
-    }),
-    db.socialAccount.updateMany({
-      where: { clientId: context.clientId, platformConnectionId: connection.id },
+    });
+    await tx.socialAccount.updateMany({
+      where: { clientId: context.clientId, platformConnectionId: scoped.id },
       data: {
         isSelected: false,
         accessTokenCiphertext: null,
@@ -336,19 +430,64 @@ export async function disconnectPlatformConnection(
         commentsCapability: CapabilityStatus.UNVERIFIED,
         verifiedAt: null,
       },
-    }),
-    db.auditLog.create({
+    });
+    await tx.auditLog.create({
       data: {
         clientId: context.clientId,
         userId: context.userId,
         action: "PLATFORM_CONNECTION_DISCONNECTED",
         entityType: "PlatformConnection",
-        entityId: connection.id,
-        metadata: { provider: connection.provider, remoteRevokeConfirmed: revokeWarning === null },
+        entityId: scoped.id,
+        metadata: { provider: scoped.provider, localCredentialsCleared: true },
       },
-    }),
-  ]);
-  return { disconnected: true, remoteRevokeConfirmed: revokeWarning === null };
+    });
+    return scoped;
+  });
+
+  const hasRevokeToken = Boolean(connection.accessTokenCiphertext && connection.accessTokenIv && connection.accessTokenAuthTag);
+  let revokeAttempted = false;
+  let revokeWarning: string | null = hasRevokeToken ? null : "REMOTE_REVOKE_NOT_ATTEMPTED";
+  if (connection.accessTokenCiphertext && connection.accessTokenIv && connection.accessTokenAuthTag) {
+    try {
+      const vault = overrides.vault || TokenVault.fromEnvironment();
+      const token = vault.decrypt({
+        ciphertext: connection.accessTokenCiphertext,
+        iv: connection.accessTokenIv,
+        authTag: connection.accessTokenAuthTag,
+        keyVersion: connection.tokenKeyVersion,
+      });
+      const adapter = overrides.adapter || getAuthAdapter(connection.provider);
+      if (!adapter.revoke) throw new AppError("该平台适配器不支持远端撤销；本地凭据已清除。", 409, "REMOTE_REVOKE_UNSUPPORTED");
+      revokeAttempted = true;
+      await adapter.revoke(token);
+    } catch (error) {
+      revokeWarning = normalizeAuthFailure(error).code;
+    }
+  }
+  const remoteRevokeConfirmed = revokeAttempted && revokeWarning === null;
+  try {
+    await db.$transaction(async (tx) => {
+      if (revokeWarning) {
+        await tx.platformConnection.updateMany({
+          where: { id: connection.id, clientId: context.clientId, status: "DISCONNECTED" },
+          data: { lastErrorCode: revokeWarning, lastErrorMessage: revokeAttempted ? "远端撤销未确认；本地凭据已清除。" : "远端撤销未执行；本地凭据已清除。" },
+        });
+      }
+      await tx.auditLog.create({
+        data: {
+          clientId: context.clientId,
+          userId: context.userId,
+          action: "PLATFORM_REMOTE_REVOKE_RESULT",
+          entityType: "PlatformConnection",
+          entityId: connection.id,
+          metadata: { provider: connection.provider, revokeAttempted, remoteRevokeConfirmed, warningCode: revokeWarning },
+        },
+      });
+    });
+  } catch {
+    console.warn("Could not persist platform remote revoke result audit", connection.id);
+  }
+  return { disconnected: true, revokeAttempted, remoteRevokeConfirmed };
 }
 
 export async function refreshPlatformConnection(

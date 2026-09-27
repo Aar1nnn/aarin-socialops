@@ -26,7 +26,7 @@ export async function POST(request: Request) {
     const file = form.get("file");
     if (!(file instanceof File)) return Response.json({ error: "FILE_REQUIRED", message: "请选择文件。" }, { status: 400 });
     const asset = await uploadAsset(context, { file, productId: String(form.get("productId") || "") || undefined });
-    return actionResponse(request, asset, "/products");
+    return actionResponse(request, asset, form.get("returnTo") === "/assets" ? "/assets" : "/products");
   } catch (error) {
     return errorResponse(error);
   }
