@@ -71,42 +71,12 @@ function asRecord(value: unknown): Record<string, unknown> | null {
     : null;
 }
 
-function asFiniteNumber(value: unknown): number | null {
-  return typeof value === "number" && Number.isFinite(value) ? value : null;
-}
-
 function reportSummary(value: unknown) {
   const facts = asRecord(value);
   if (!facts) return "暂无可展示的业务摘要。";
-
-  const parts: string[] = [];
-  const publishedPosts = asRecord(facts.publishedPosts);
-  const publishedTotal = asFiniteNumber(publishedPosts?.total);
-  const importedInteractions = asFiniteNumber(facts.importedInteractions);
-  const qualifiedLeadRecords = asFiniteNumber(facts.qualifiedLeadRecords);
-  const metricSnapshots = asFiniteNumber(facts.metricSnapshots);
-
-  if (publishedTotal !== null) parts.push(`发布 ${publishedTotal} 条`);
-  if (importedInteractions !== null) parts.push(`导入互动 ${importedInteractions} 条`);
-  if (qualifiedLeadRecords !== null) parts.push(`识别线索 ${qualifiedLeadRecords} 条`);
-  if (metricSnapshots !== null) parts.push(`指标快照 ${metricSnapshots} 份`);
-
-  const availableMetrics = Array.isArray(facts.availableMetrics)
-    ? facts.availableMetrics
-        .map(asRecord)
-        .filter((metric): metric is Record<string, unknown> => metric !== null)
-        .flatMap((metric) => {
-          if (typeof metric.key !== "string") return [];
-          const metricValue = typeof metric.value === "string" || typeof metric.value === "number"
-            ? String(metric.value)
-            : null;
-          return metricValue === null ? [] : [`${metricLabel(metric.key)} ${metricValue}`];
-        })
-        .slice(0, 3)
-    : [];
-
-  if (availableMetrics.length) parts.push(`可用指标：${availableMetrics.join("、")}`);
-  return parts.length ? `${parts.join("；")}。` : "暂无可展示的业务摘要。";
+  if (facts.schemaVersion === "MONTHLY_V1") return "这份报告按 MONTHLY_V1 月度口径生成；请在月度运营复盘页查看分项事实和数据局限。";
+  if (facts.schemaVersion !== undefined) return "该报告使用尚未支持的版本；请在月度运营复盘页查看版本状态。";
+  return "旧版未版本化报告；字段和统计口径保留原样，不按 MONTHLY_V1 解释。请在月度运营复盘页查看原始记录。";
 }
 
 export default async function InsightsPage() {
@@ -539,11 +509,9 @@ export default async function InsightsPage() {
         <section className="section" id="reports">
           <SectionHeader
             title="复盘"
-            description="基于已保存数据整理局限、假设和下一步行动。"
+            description="月度报告按客户时区生成，历史报告保留各自原有口径。"
             action={(
-              <form action="/api/reports" method="post">
-                <Button type="submit" size="sm" disabled={!hasWriteAccess}>生成复盘</Button>
-              </form>
+              <a className="button button-primary button-sm" href="/reviews/monthly">查看月度复盘</a>
             )}
           />
           {reports.length === 0 ? (
@@ -562,19 +530,19 @@ export default async function InsightsPage() {
                         数据周期：{formatDateTime(report.periodStart, "—", client.timezone)} 至 {formatDateTime(report.periodEnd, "—", client.timezone)}
                       </div>
                     </div>
-                    <StatusIndicator
-                      value={report.simulated ? "MOCK" : "REAL"}
-                      label={report.simulated ? "含模拟数据" : "仅真实数据"}
-                      compact
-                    />
+                    <div className="actions">
+                      <StatusIndicator label={asRecord(report.facts)?.schemaVersion === "MONTHLY_V1" ? "MONTHLY_V1" : asRecord(report.facts)?.schemaVersion === undefined ? "旧版报告" : "未知版本"} tone={asRecord(report.facts)?.schemaVersion === "MONTHLY_V1" ? "info" : "warning"} compact />
+                      <StatusIndicator value={report.simulated ? "MOCK" : "REAL"} label={report.simulated ? "含模拟数据" : "未标记模拟数据"} compact />
+                    </div>
                   </div>
+                  {asRecord(report.facts)?.schemaVersion === undefined ? <Notice title="旧口径提示" tone="warning">旧报告里的 Lead 字段不能视为已核实合格线索；原始字段只按生成当时的语义保留。</Notice> : null}
                   <div><strong>业务摘要</strong><p>{reportSummary(report.facts)}</p></div>
-                  <div><strong>数据局限</strong><p>{jsonList(report.dataLimitations).join("；") || "当前记录未发现覆盖缺口。"}</p></div>
+                  <div><strong>数据局限</strong><p>{jsonList(report.dataLimitations).join("；") || "未记录明确局限；仍需核查数据覆盖。"}</p></div>
                   <div><strong>分析假设</strong><p>{jsonList(report.hypotheses).join("；") || "暂无。"}</p></div>
                   <div><strong>建议行动</strong><p>{jsonList(report.recommendations).join("；") || "暂无。"}</p></div>
                   <details className="technical-details">
                     <summary>高级详情：程序计算事实</summary>
-                    <pre>{JSON.stringify(report.facts, null, 2)}</pre>
+                    <pre style={{ maxWidth: "100%", overflowX: "auto" }}>{JSON.stringify(report.facts, null, 2)}</pre>
                   </details>
                 </article>
               ))}
